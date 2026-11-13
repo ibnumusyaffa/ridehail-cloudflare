@@ -1,0 +1,9 @@
+node_modules
+dist
+.turbo
+.wrangler
+.dev.vars
+*.log
+videos
+test-results
+playwright-report

@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gojek-clone-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "gojek-clone",
+      // replace with `wrangler d1 create gojek-clone` output before deploying
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "ZONE", "class_name": "ZoneDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ZoneDO"] }],
+  "vars": {
+    // geohash length of one zone actor (<= 5 so a zone always covers whole search cells)
+    "ZONE_PRECISION": "5",
+    "COMMISSION_RATE": "0.2",
+    "DRIVER_MIN_BALANCE": "-50000",
+    "OFFER_TIMEOUT_MS": "15000",
+    "RESERVE_TTL_MS": "20000",
+    "SEARCH_TIMEOUT_MS": "120000",
+    "RESEARCH_DELAY_MS": "5000",
+    "TOPUP_MAX": "1000000"
+  }
+  // JWT_SECRET: `wrangler secret put JWT_SECRET` (local: .dev.vars)
+}

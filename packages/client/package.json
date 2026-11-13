@@ -1,0 +1,32 @@
+{
+  "name": "@gojek/client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./protocol": "./src/protocol.ts",
+    "./api": "./src/api.ts",
+    "./socket": "./src/socket.ts",
+    "./presets": "./src/presets.ts",
+    "./react": "./src/react/index.ts",
+    "./styles.css": "./src/react/styles.css",
+    "./route": "./src/route.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@gojek/core": "workspace:*"
+  },
+  "peerDependencies": {
+    "maplibre-gl": "^6.18.0",
+    "react": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "maplibre-gl": "^6.18.0",
+    "react": "^19.3.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.8"
+  }
+}
