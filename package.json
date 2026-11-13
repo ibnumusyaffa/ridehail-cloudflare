@@ -7,7 +7,6 @@
     "dev": "turbo run dev --filter=@gojek/api --filter=@gojek/simulator-customer --filter=@gojek/simulator-driver",
     "test": "turbo run test",
     "typecheck": "turbo run typecheck",
-    "dev:fleet": "pnpm --filter @gojek/sim sim",
     "e2e": "pnpm --filter @gojek/e2e e2e",
     "demo:live": "pnpm --filter @gojek/e2e demo:live",
     "demo:record": "pnpm --filter @gojek/e2e demo:record"

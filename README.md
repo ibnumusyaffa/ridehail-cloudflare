@@ -10,7 +10,6 @@ apps/api                   Worker (Hono REST + WebSocket gateway) + ZoneDO (zone
 apps/simulator-customer    customer web app (Vite + React + MapLibre/OpenFreeMap)   :5173
 apps/simulator-driver      driver web app with autopilot driving                    :5174
 apps/e2e                   Playwright: e2e tests + live demo driving both apps
-apps/sim                   headless fake driver fleet + CLI demo customer
 ```
 
 ## Quick start
@@ -40,7 +39,6 @@ press Tiba → Mulai → Selesai. Speed slider and autopilot toggle are on the d
 pnpm demo:live                      # Playwright opens both windows and plays a full wallet ride, slowly
 pnpm demo:live -- --trip gbk-blokm  # other preset: monas-hi | gbk-blokm | kota-ancol | kuningan-senopati
 pnpm demo:record                    # same, saves videos to apps/e2e/videos/
-pnpm dev:fleet -- --n 50            # optional: 50 headless drivers competing for orders
 pnpm e2e                            # Playwright e2e on an isolated stack (ports 8788/5273/5274, fresh DB)
 ```
 
@@ -54,13 +52,6 @@ Road routes: both apps draw routes and the driver autopilot follows streets via 
 (`packages/client/src/route.ts`, default public server `router.project-osrm.org`, falls back to a straight
 line on error). Override with `VITE_OSRM_URL=<your osrm>`, or `VITE_OSRM_URL=off` (used by `pnpm e2e`).
 The backend fare still uses straight-line distance × 1.3 (PLAN §5.5).
-
-### Headless CLI simulator
-```sh
-cd apps/sim
-pnpm sim -- --n 50 --accept 0.7 --speed 15   # 50 fake drivers around Jakarta
-pnpm demo -- --pay WALLET                    # one customer orders a ride and prints every event
-```
 
 Deploy: `wrangler d1 create gojek-clone` → put the id in `apps/api/wrangler.jsonc`,
 `wrangler secret put JWT_SECRET`, `pnpm db:migrate:remote`, `pnpm deploy`.
@@ -128,5 +119,4 @@ Messages follow PLAN §9.2, plus:
   driver reject → NO_DRIVER, customer cancel during offer, driver page reload mid-ride resumes, insufficient balance.
 
 ## Next steps (out of POC scope)
-Real payment gateway & driver withdrawal, OTP login, surge/promo, chat, KYC, batch matching, OSRM road ETA,
-load test with 1k simulated drivers (`pnpm sim -- --n 1000`).
+Real payment gateway & driver withdrawal, OTP login, surge/promo, chat, KYC, batch matching, OSRM road ETA, load test.

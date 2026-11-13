@@ -1,222 +1,103 @@
-# Arsitektur — Ride-Hailing POC (Cloudflare)
+# Arsitektur (versi singkat)
 
-Gambaran teknis implementasi [PLAN.md](PLAN.md) di stack Cloudflare. Cara menjalankan ada di [README.md](README.md).
+Detail kebutuhan ada di [PLAN.md](PLAN.md), cara menjalankan di [README.md](README.md).
 
-## 1. Gambaran besar
+## 1. Satu gambar
 
 ```mermaid
 flowchart LR
-  subgraph Clients
-    C[simulator-customer<br/>React + MapLibre]
-    D[simulator-driver<br/>React + MapLibre]
-    S[apps/sim<br/>headless fleet]
-    A[Android app<br/>next step]
-  end
-
-  subgraph Cloudflare
-    W[Worker - Hono<br/>REST + WS gateway + JWT]
-    subgraph Zones[ZoneDO - 1 Durable Object per geohash zone]
-      Z1[ZoneDO qqguy]
-      Z2[ZoneDO qqguw]
-      Z3[ZoneDO ...]
-    end
-    DB[(D1<br/>cold store)]
-  end
-
-  OSRM[OSRM<br/>road routing]
-
-  C & D & S & A -- HTTPS REST --> W
-  C & D & S & A -- WebSocket --> W
-  W -- "fetch (WS upgrade) / RPC" --> Zones
-  Z1 <-- "RPC: nearest / reserveAndOffer / release / acceptOffer" --> Z2
-  W --> DB
-  Zones -- write-through + settlement --> DB
-  C & D -. route geometry .-> OSRM
+  C[App Customer] --> W
+  D[App Driver] --> W
+  W[Worker<br/>pintu masuk API] --> Z[Zone<br/>pengatur per wilayah]
+  W --> DB[(Database D1)]
+  Z --> DB
 ```
 
-| Peran (PLAN §7) | Implementasi | Lokasi |
+Hanya ada **3 bagian** di server:
+
+| Bagian | Analogi | Tugas |
 |---|---|---|
-| API Gateway | Cloudflare Worker + Hono: auth JWT, validasi, routing WebSocket ke zona | `apps/api/src/index.ts` |
-| Zone Actor / Dispatcher | `ZoneDO` — Durable Object per zona geohash, single writer | `apps/api/src/zone.ts` |
-| Hot store | SQLite di dalam tiap ZoneDO (driver, ride aktif, timer, idempotency) | `ZoneDO.initSchema()` |
-| Cold store | D1: users, vehicles, rides, wallets, wallet_transactions, zones | `apps/api/migrations/` |
-| Timer | Satu DO alarm per zona, multiplexing tabel `timers` | `ZoneDO.alarm()` |
-| WebSocket | DO Hibernation API (`acceptWebSocket`, tag `user:<id>`, auto-response ping) | `ZoneDO.fetch()` |
-| Logika murni | geohash, haversine, matcher, state machine, tarif, settlement | `packages/core` |
-| Kontrak client | tipe pesan, REST client, WS client (reconnect + zone hand-over), routing OSRM | `packages/client` |
+| **Worker** | resepsionis | cek login, terima request, arahkan ke zona yang tepat |
+| **Zone** (Durable Object) | dispatcher wilayah | tahu posisi semua driver di wilayahnya, cari driver, kirim tawaran, pantau perjalanan |
+| **D1** | arsip | simpan user, riwayat ride, saldo wallet |
 
-## 2. Monorepo (Turborepo + pnpm)
+## 2. Kenapa dibagi per zona?
 
-```
-packages/core      ← tanpa I/O, dipakai backend & frontend
-   ▲      ▲
-   │      └──────────── packages/client  ← protocol types, ApiClient, RideSocket, route, React UI
-   │                        ▲      ▲      ▲
-apps/api ───────────────────┘      │      │   (api hanya import protocol types)
-apps/simulator-customer ───────────┘      │
-apps/simulator-driver ────────────────────┘
-apps/sim   (headless fleet, pakai core)
-apps/e2e   (Playwright, mengendalikan kedua simulator)
-```
+Jakarta dibagi jadi kotak-kotak ±5 km (pakai *geohash*). **Tiap kotak punya satu "dispatcher" sendiri** (satu Durable Object).
 
-Turbo task: `typecheck`, `test`, `build`, `dev`. `pnpm dev` = API + dua simulator; `pnpm test` = unit core + integrasi API (workerd sungguhan); `pnpm e2e` = Playwright.
+- Dispatcher bekerja **satu per satu** (tidak paralel di dalam dirinya), jadi satu driver tidak mungkin dapat dua order sekaligus. Tanpa perlu lock.
+- Kota makin ramai → kotak diperkecil → dispatcher bertambah. Itu cara scale-nya.
+- ID ride menyimpan nama zonanya (`qqguy_…`), jadi server langsung tahu dispatcher mana yang pegang ride itu.
 
-## 3. Zona & sharding
-
-- Bumi dibagi ke sel geohash. **Satu zona = satu `ZoneDO`**, nama DO = geohash dengan presisi `ZONE_PRECISION` (default 5 ≈ 4,9 × 4,9 km).
-- **ID ride membawa zonanya**: `<zone>_<uuid>` (mis. `qqguy_9572…`). Komponen mana pun bisa langsung route ke pemilik ride tanpa lookup.
-- Zona yang pernah aktif dicatat di D1 `zones` (untuk ops dan dev reset).
-- Scale-out = tambah presisi zona (lebih banyak actor, masing-masing lebih sedikit driver). Target ~1–3k driver/zona.
-
-### Siapa tinggal di zona mana
-
-| Kondisi | Socket & record driver ada di |
-|---|---|
-| Driver OFFLINE/AVAILABLE/RESERVED | zona tempat lokasinya berada |
-| Driver ON_RIDE | **zona ride** (zona titik jemput) sampai ride selesai |
-| Customer dengan ride aktif | zona ride |
-
-Jadi selama ride aktif, **customer, driver, dan state ride ada di satu actor** → event perjalanan & stream lokasi tidak perlu lompat antar-DO.
+## 3. Alur satu perjalanan
 
 ```mermaid
 sequenceDiagram
-  participant Drv as Driver app
-  participant B as ZoneDO B (lokasi driver)
-  participant A as ZoneDO A (zona ride)
-  Drv->>B: offer.accept {rideId}
-  B->>A: RPC acceptOffer(rideId, driverInfo)
-  A-->>B: ok + ride (A: ride ACCEPTED, driver ON_RIDE di A)
-  B->>B: hapus record driver
-  B-->>Drv: ride.status ACCEPTED + zone.moved {zone: A}
-  B--xDrv: close 4001
-  Drv->>A: reconnect /ws?zone=A → hello → resume
-```
-
-Driver AVAILABLE yang bergerak keluar zona juga menerima `zone.moved` dan reconnect berdasarkan lokasi (`RideSocket` menangani ini otomatis).
-
-## 4. Alur ride end-to-end
-
-```mermaid
-sequenceDiagram
-  autonumber
   participant Cu as Customer
-  participant W as Worker
-  participant A as ZoneDO (zona jemput)
-  participant N as ZoneDO tetangga
+  participant Z as Dispatcher zona
   participant Dr as Driver
-  participant DB as D1
-
-  Cu->>W: POST /rides {pickup, dropoff, WALLET} + Idempotency-Key
-  W->>DB: cek ride aktif, cek saldo >= tarif
-  W->>A: RPC createRide
-  A->>DB: upsert ride REQUESTED
-  A->>A: alarm dispatch:<id> (matching di luar request path)
-  W-->>Cu: 201 {rideId}
-  Cu->>A: WS /ws?rideId= → resume
-  A->>A: ring 1: sel presisi 6 + 8 tetangga
-  A->>N: RPC nearest(cells) (paralel per zona)
-  A->>N: RPC reserveAndOffer(driver, offer, ttl 20s)
-  N-->>Dr: offer {expiresAt +15s}
-  Note over A: alarm offer:<id> 15s
-  Dr->>N: offer.accept
-  N->>A: RPC acceptOffer
-  A-->>Cu: ride.status ACCEPTED (+ driver, kendaraan)
-  Dr->>A: (reconnect ke zona ride) loc tiap 1–5s
-  A-->>Cu: driver.loc (tidak dipersist)
-  Dr->>A: ride.arrived / ride.start / ride.complete
-  A->>DB: upsert status (write-through)
-  A->>DB: settleRide() — satu batch atomik
-  A-->>Cu: ride.paid {paidVia, balance}
-  A-->>Dr: ride.paid {balance}
+  Cu->>Z: Pesan ride (jemput, tujuan, bayar)
+  Z->>Z: Cari driver terdekat yang kosong
+  Z->>Dr: Tawaran (15 detik)
+  Dr->>Z: Terima
+  Z-->>Cu: Driver ditemukan
+  loop tiap detik
+    Dr->>Z: Lokasi
+    Z-->>Cu: Lokasi driver
+  end
+  Dr->>Z: Tiba → Mulai → Selesai
+  Z->>Z: Potong saldo / catat tunai
+  Z-->>Cu: Selesai + dibayar
 ```
 
-### Matching (PLAN §5)
+Kalau driver **menolak atau diam 15 detik**, tawaran pindah ke driver terdekat berikutnya. Kalau tidak ada yang mau dalam 2 menit → "Driver tidak ditemukan".
 
-1. **Ring**: sel geohash presisi 6 (~±1,2 km) + 8 tetangga; jika kosong, presisi 5 (~±5 km). Radius maks 5 km, top k = 10.
-2. Sel dikelompokkan per zona → `nearest()` ke tiap zona **paralel** (zona sendiri = panggilan lokal).
-3. Filter (`rankCandidates` di core): AVAILABLE (atau RESERVED yang reservasinya kedaluwarsa), ping < 30 s, socket terhubung, belum menolak ride ini.
-4. **Tawaran berurutan**: `reserveAndOffer` atomik di zona driver (single writer → satu driver tidak bisa dapat dua ride). Gagal → kandidat berikutnya.
-5. Tolak/timeout 15 s → `release` → kandidat berikutnya. Antrean habis → cari ulang sekali setelah `RESEARCH_DELAY_MS` → `NO_DRIVER`. Batas total `SEARCH_TIMEOUT_MS` (2 menit).
+Status ride:
+`REQUESTED → OFFERING → ACCEPTED → ARRIVED → ON_TRIP → COMPLETED` (bisa `CANCELLED` sebelum jemput, atau `NO_DRIVER`).
 
-### State machine (PLAN §4)
+## 4. Real-time
 
-`applyRideEvent(status, event)` di `packages/core` — murni, menolak transisi tidak valid (`INVALID_TRANSITION`), dan event duplikat jadi no-op (idempotent). Status driver: `OFFLINE → AVAILABLE ⇄ RESERVED → ON_RIDE → AVAILABLE`.
+- App terhubung lewat **WebSocket** ke dispatcher zonanya.
+- Saat ride berjalan, **customer dan driver terhubung ke dispatcher yang sama**, jadi lokasi driver langsung diteruskan ke customer.
+- Kalau driver menerima order dari zona sebelah, server menyuruh app driver **pindah sambungan** ke zona ride (`zone.moved`). App melakukannya otomatis.
+- Koneksi putus → app sambung ulang sendiri dan minta status terbaru.
 
-## 5. Data
+## 5. Data disimpan di mana?
 
-### Hot store (SQLite per ZoneDO)
-
-| Tabel | Isi |
-|---|---|
-| `drivers` | lokasi, sel geohash, status, reservasi, tawaran aktif (soft state; tidak masuk D1) |
-| `rides` | ride aktif + internal dispatch (antrean kandidat, daftar penolak, tawaran berjalan) sebagai JSON |
-| `timers` | `dispatch:` `offer:` `search:` `purge:` → satu DO alarm |
-| `ride_idem`, `meta` | idempotency order, nama zona |
-
-Disimpan di SQLite (bukan memori) supaya selamat dari hibernasi/eviksi DO. Ride terminal & driver idle dibersihkan oleh timer `purge`.
-
-### Cold store (D1)
-
-`users`, `vehicles`, `rides` (write-through setiap transisi), `wallets`, `wallet_transactions` (append-only), `zones`. Skema: `apps/api/migrations/`.
-
-## 6. Wallet & settlement (PLAN §6)
-
-`settleRide()` (`apps/api/src/db.ts`) = **satu `D1.batch()`** (atomik):
-
-```
-WALLET:  INSERT RIDE_PAYMENT  … WHERE balance >= fare AND rides.paid_at IS NULL
-         UPDATE wallet customer  WHERE EXISTS(baris ledger milik run ini)
-         INSERT RIDE_EARNING     WHERE EXISTS(RIDE_PAYMENT run ini)
-         UPDATE wallet driver    WHERE EXISTS(baris ledger milik run ini)
-CASH / fallback:
-         INSERT COMMISSION       WHERE paid_at IS NULL AND tidak ada RIDE_PAYMENT
-         UPDATE wallet driver    WHERE EXISTS(baris ledger milik run ini)
-SELALU:  UPDATE rides SET paid_via, paid_at WHERE paid_at IS NULL
-```
-
-- **Idempotent**: guard `paid_at IS NULL` + `UNIQUE(ride_id, user_id, type)` → settlement dobel tidak memotong dua kali.
-- **Invariant** `wallets.balance == SUM(wallet_transactions.amount)`: setiap update saldo hanya jalan jika baris ledger run itu benar-benar masuk.
-- Saldo kurang saat selesai → otomatis **fallback CASH** (driver bayar komisi).
-- Top-up memakai `Idempotency-Key` (`UNIQUE(user_id, idempotency_key)`), pola guard yang sama.
-- Driver dengan saldo < `DRIVER_MIN_BALANCE` tidak bisa online.
-
-## 7. Protokol real-time
-
-`/ws?token=…` lalu `{ "t": "<type>", … }` (PLAN §9.2). Tambahan dari implementasi:
-
-| Pesan | Arah | Fungsi |
+| Data | Tempat | Alasan |
 |---|---|---|
-| `hello {zone, role, driverStatus?, rideId?}` | S→C | pertama setelah connect; client lalu kirim `resume` |
-| `driver.state {status, rideId}` | S→driver | status driver otoritatif |
-| `zone.moved {zone, rideId?}` | S→C | hand-over zona; client reconnect ke zona itu |
-| close code `4001` / `4002` | S→C | pindah zona / simulator di-reset (client logout) |
+| Posisi driver, ride yang sedang jalan | di dalam dispatcher zona | berubah tiap detik, harus cepat |
+| User, riwayat ride, saldo & transaksi wallet | D1 (database) | harus permanen & konsisten |
 
-`{"t":"ping"}` dijawab oleh runtime (auto-response) tanpa membangunkan DO yang sedang hibernasi.
+Lokasi driver **tidak** disimpan ke database, karena terlalu sering berubah dan tidak perlu diarsipkan.
 
-`RideSocket` (`packages/client/src/socket.ts`): reconnect exponential backoff, ikut `zone.moved`, keepalive 20 s, `onReset` untuk 4002.
+## 6. Wallet
 
-## 8. Simulator & routing
+- Saat ride **selesai**: bayar wallet → saldo customer dipotong, driver dapat tarif − komisi 20%. Bayar tunai → driver dipotong komisi.
+- Semua langkah dijalankan dalam **satu transaksi**: semua berhasil, atau tidak ada yang berubah.
+- Aman diulang: kalau proses pembayaran terpanggil dua kali, saldo **tidak** terpotong dua kali.
+- Saldo customer kurang saat selesai → otomatis dianggap bayar tunai.
 
-- **simulator-customer / simulator-driver**: dua app terpisah (port berbeda → sesi/localStorage terpisah, bisa dibuka berdampingan).
-- **Fokus peta per fase**: rencana = rute penuh; penjemputan = driver → titik jemput saja; perjalanan = driver → tujuan saja.
-- **Routing jalan**: `packages/client/src/route.ts` memanggil OSRM (default server publik, bisa diganti `VITE_OSRM_URL`, `off` untuk test). Autopilot driver bergerak sepanjang polyline jalan; fallback garis lurus bila OSRM gagal. Tarif backend tetap haversine × 1,3 (PLAN §5.5).
-- **Reset**: tombol 🔄 → `POST /dev/reset` (hanya aktif jika `DEV_RESET=1`) → kosongkan D1 + `ZoneDO.reset()` untuk setiap zona terdaftar.
-- **apps/sim**: armada driver headless (N driver, auto-accept probabilistik) untuk beban & demo.
-- **apps/e2e**: langkah UI dipakai bersama oleh test Playwright dan `demo:live` / `demo:record`.
+## 7. Kode-nya di mana
 
-## 9. Testing
+```
+packages/core       logika murni: cari driver, hitung tarif, status ride, pembagian uang
+packages/client     kode bersama untuk app: API, WebSocket, peta, rute jalan
+apps/api            server: Worker + dispatcher zona + database
+apps/simulator-*    app web customer & driver (untuk demo tanpa HP)
+apps/e2e            test otomatis yang menjalankan kedua app (Playwright)
+```
 
-| Lapisan | Alat | Cakupan |
-|---|---|---|
-| Unit | Vitest | geohash/tetangga, haversine, tarif, ranking kandidat, semua transisi state machine, settlement |
-| Integrasi | Vitest + `@cloudflare/vitest-plugin` (workerd, DO, D1 sungguhan) | alur ride penuh, timeout tawaran, rebutan driver, cross-zone hand-over, cancel, wallet idempotent & fallback, invariant ledger, reset |
-| E2E | Playwright (dua browser context) | ride wallet + rating, tolak → NO_DRIVER, cancel saat tawaran, reload driver di tengah ride, saldo kurang, reset logout jendela lain |
+## 8. Batasan POC
 
-## 10. Trade-off & batasan POC
+- Tarif dihitung dari jarak lurus × 1,3, belum jarak jalan sebenarnya.
+- Login tanpa OTP. Top-up wallet masih dummy.
+- Rute jalan di simulator pakai server OSRM publik, hanya untuk demo.
+- Belum ada payment gateway, promo, chat, atau verifikasi driver.
 
-- **Matching lintas zona = RPC** ke ≤ 9 zona per ring; latensi beberapa ms antar-DO, cukup untuk POC.
-- **Write-through ke D1 di setiap transisi** menambah satu round-trip per event; sederhana dan membuat riwayat selalu konsisten.
-- **Harga fixed upfront** dari jarak garis lurus × 1,3, bukan jarak jalan OSRM.
-- **Auth tanpa OTP**; JWT HS256 dengan `JWT_SECRET`.
-- **OSRM publik** hanya untuk demo (rate-limit, koordinat keluar ke pihak ketiga) → self-host untuk produksi.
-- Di luar scope (lihat PLAN §1): payment gateway, surge/promo, chat, KYC, batch matching.
+---
+
+**Istilah:**
+- *Durable Object*: "mini server" Cloudflare yang punya memori & penyimpanan sendiri dan menangani request satu per satu.
+- *Geohash*: cara membagi peta jadi kotak-kotak berkode huruf.
+- *D1*: database SQL Cloudflare.
