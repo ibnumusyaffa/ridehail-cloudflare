@@ -396,9 +396,25 @@ export async function listZones(sql: Sql): Promise<string[]> {
   return (await sql`SELECT zone FROM zones`).map((r) => r.zone as string);
 }
 
+// ---------------------------------------------------------------- trip route
+
+export type TrackPoint = {
+  seq: number;
+  lat: number;
+  lng: number;
+  at: number;
+};
+
+/** Append route points of a trip. Safe to repeat: a point already stored (same seq) is skipped. */
+export async function insertTrack(sql: Sql, rideId: string, points: TrackPoint[]): Promise<void> {
+  if (!points.length) return;
+  const rows = points.map((p) => ({ ride_id: rideId, seq: p.seq, lat: p.lat, lng: p.lng, at: p.at }));
+  await sql`INSERT INTO ride_track ${sql(rows, "ride_id", "seq", "lat", "lng", "at")} ON CONFLICT DO NOTHING`;
+}
+
 /** Dev only: wipe every table. */
 export async function wipeAll(sql: Sql): Promise<void> {
-  await sql`TRUNCATE wallet_holds, wallet_transactions, wallets, rides, vehicles, users, zones`;
+  await sql`TRUNCATE ride_track, wallet_holds, wallet_transactions, wallets, rides, vehicles, users, zones`;
 }
 
 export type { DriverInfo };

@@ -40,6 +40,8 @@
     // ON_TRIP driver without a location ping: ask the customer every hour, cancel by system after 3 hours
     "DRIVER_LOST_ASK_MS": "3600000",
     "DRIVER_LOST_CANCEL_MS": "10800000",
+    // ON_TRIP route: points buffered in the zone actor are sent to Postgres (ride_track) this often
+    "TRACK_FLUSH_MS": "60000",
     // location throttle (server drops pings closer together than this) and zone hand-over hysteresis
     "LOC_MIN_INTERVAL_MS": "2000",
     "LOC_MIN_INTERVAL_ON_RIDE_MS": "1000",

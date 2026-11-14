@@ -20,6 +20,8 @@ export interface Config {
   driverLostAskMs: number;
   /** ON_TRIP without a driver location ping this long → the system cancels the ride */
   driverLostCancelMs: number;
+  /** ON_TRIP route points buffered in the zone actor are sent to Postgres this often */
+  trackFlushMs: number;
   fare: FareConfig;
   match: MatchConfig;
   presence: PresenceConfig;
@@ -45,6 +47,7 @@ export function loadConfig(env: Env): Config {
     topupMax: num(env.TOPUP_MAX, 1_000_000),
     driverLostAskMs: num(env.DRIVER_LOST_ASK_MS, 60 * 60_000),
     driverLostCancelMs: num(env.DRIVER_LOST_CANCEL_MS, 3 * 60 * 60_000),
+    trackFlushMs: num(env.TRACK_FLUSH_MS, 60_000),
     fare: DEFAULT_FARE_CONFIG,
     match,
     presence: {

@@ -152,6 +152,8 @@ const PURGE_EVERY_MS = 10 * 60_000;
 const KEEP_TERMINAL_MS = 60 * 60_000;
 const KEEP_IDLE_DRIVER_MS = 60 * 60_000;
 const SNAPSHOT_MS = 30_000;
+/** route points sent to Postgres per insert (a minute of a trip is ~15) */
+const TRACK_BATCH = 500;
 const ALARM_CONCURRENCY = 16;
 /** a ride still pgPending (or with a pending transition) after this long is checked against Postgres */
 const CREATE_RECOVERY_MS = 5_000;
@@ -231,6 +233,12 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     for (const r of rows) this.sql.exec("INSERT OR IGNORE INTO timers (key, at) VALUES (?, ?)", `${r.kind}:${r.id}`, now);
     // every trip is watched for a driver gone silent
     this.sql.exec("INSERT OR IGNORE INTO timers (key, at) SELECT 'watch:' || id, ? FROM rides WHERE status = 'ON_TRIP'", now);
+    // every trip route reaches Postgres (a flush that was running when this actor died left no timer behind)
+    this.sql.exec(
+      `INSERT OR IGNORE INTO timers (key, at) SELECT 'track:' || id, ? FROM
+         (SELECT id FROM rides WHERE status = 'ON_TRIP' UNION SELECT ride_id FROM track)`,
+      now,
+    );
     // every search goes on (a step that was running when this actor died left no timer behind)
     this.sql.exec(
       `INSERT OR IGNORE INTO timers (key, at) SELECT 'dispatch:' || id, ? FROM rides
@@ -274,6 +282,10 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       CREATE TABLE IF NOT EXISTS ride_idem (customer_id TEXT NOT NULL, key TEXT NOT NULL, ride_id TEXT NOT NULL,
         PRIMARY KEY (customer_id, key));
       CREATE TABLE IF NOT EXISTS timers (key TEXT PRIMARY KEY, at INTEGER NOT NULL);
+      -- ON_TRIP route points not yet in Postgres; seq (AUTOINCREMENT: never reused) is their key there
+      CREATE TABLE IF NOT EXISTS track (seq INTEGER PRIMARY KEY AUTOINCREMENT, ride_id TEXT NOT NULL,
+        lat REAL NOT NULL, lng REAL NOT NULL, at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS track_ride ON track (ride_id, seq);
       -- replaced by Postgres-first transitions (HotRide.pending); never deployed with data that matters
       DROP TABLE IF EXISTS outbox;
       CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -416,6 +428,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       else if (kind === "settle") await this.settleFromTimer(id);
       else if (kind === "create") await this.recoverCreate(id);
       else if (kind === "watch") await this.watchDriver(id);
+      else if (kind === "track") await this.flushTrack(id);
       else if (kind === "purge") this.purge();
     } catch (err) {
       console.error("timer failed", key, err);
@@ -425,10 +438,11 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
   private purge() {
     const now = Date.now();
     this.sql.exec(
-      // keep a ride while Postgres still owes it a write or a settlement
+      // keep a ride while Postgres still owes it a write, a settlement or route points
       `DELETE FROM rides WHERE status IN ('COMPLETED','CANCELLED','NO_DRIVER') AND updated_at < ?
          AND json_extract(data, '$.pending') IS NULL
-         AND NOT (status = 'COMPLETED' AND json_extract(data, '$.paidAt') IS NULL)`,
+         AND NOT (status = 'COMPLETED' AND json_extract(data, '$.paidAt') IS NULL)
+         AND NOT EXISTS (SELECT 1 FROM track WHERE track.ride_id = rides.id)`,
       now - KEEP_TERMINAL_MS,
     );
     this.sql.exec(
@@ -608,7 +622,10 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     // same storage step as the save above: an unsettled completion always has its retry timer
     if (event === "COMPLETE" && !settled) await this.schedule(`settle:${ride.id}`, Date.now() + retryDelay(1));
     if (event === "START") await this.schedule(`watch:${ride.id}`, Date.now() + this.cfg.driverLostAskMs);
+    if (event === "START") await this.schedule(`track:${ride.id}`, Date.now() + this.cfg.trackFlushMs);
     if (event === "COMPLETE" || event === "CANCEL") this.cancelTimer(`watch:${ride.id}`);
+    // the trip is over: send the rest of its route now (no-op for a ride cancelled before the trip)
+    if (event === "COMPLETE" || event === "CANCEL") await this.schedule(`track:${ride.id}`, Date.now());
 
     if (event === "ACCEPT" && ride.driverId) {
       // The driver now lives in the ride's zone for the whole trip (one actor per active ride).
@@ -1196,6 +1213,35 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     });
   }
 
+  // ------------------------------------------------------------ trip route
+
+  /**
+   * `track:` timer: send the trip's buffered route points to Postgres, oldest first, then delete what
+   * was sent. Runs every `trackFlushMs` while the ride is ON_TRIP and once more when it ends; points
+   * that could not be sent (Postgres down) stay buffered and go with the next run. Repeating a batch
+   * whose reply was lost is harmless (`seq` is the key in Postgres).
+   */
+  private async flushTrack(rideId: string) {
+    const points = this.sql
+      .exec<db.TrackPoint>("SELECT seq, lat, lng, at FROM track WHERE ride_id = ? ORDER BY seq LIMIT ?", rideId, TRACK_BATCH)
+      .toArray();
+    let sentFull = false;
+    if (points.length) {
+      try {
+        await this.pg((sql) => db.insertTrack(sql, rideId, points));
+        this.sql.exec("DELETE FROM track WHERE ride_id = ? AND seq <= ?", rideId, points[points.length - 1]!.seq);
+        sentFull = points.length === TRACK_BATCH;
+      } catch (err) {
+        console.error("track flush failed", rideId, err);
+      }
+    }
+    const left = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM track WHERE ride_id = ?", rideId).one().n;
+    const onTrip = this.loadRide(rideId)?.status === "ON_TRIP";
+    // a full batch went through and more is waiting (a long backlog): go on right away
+    if (sentFull && left > 0) await this.schedule(`track:${rideId}`, Date.now());
+    else if (onTrip || left > 0) await this.schedule(`track:${rideId}`, Date.now() + this.cfg.trackFlushMs);
+  }
+
   // ------------------------------------------------------------ driver gone silent mid-trip
 
   /** Last sign of life of the trip's driver: their latest location ping (or the trip's start). */
@@ -1529,6 +1575,9 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
         if (d.status === "ON_RIDE" && d.rideId) {
           const ride = this.loadRide(d.rideId);
           if (ride) {
+            // the trip's route: buffered here, sent to Postgres in batches by the `track:` timer
+            if (ride.status === "ON_TRIP")
+              this.sql.exec("INSERT INTO track (ride_id, lat, lng, at) VALUES (?, ?, ?, ?)", ride.id, d.lat, d.lng, now);
             this.send(ride.customerId, { t: "driver.loc", rideId: ride.id, lat: d.lat, lng: d.lng, heading: d.heading });
             this.driverBack(ride);
           }

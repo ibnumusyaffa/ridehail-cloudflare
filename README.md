@@ -82,6 +82,7 @@ Status driver: `OFFLINE`, `AVAILABLE`, `RESERVED` (sedang ditawari), `ON_RIDE`.
 - Setelah menerima, driver **pindah ke zona ride** selama perjalanan (`zone.moved` → client reconnect), jadi customer, driver, dan ride ada di satu ZoneDO.
 - Driver `AVAILABLE` yang keluar zona dipindah setelah ≥ 100 m di dalam zona baru atau 3 ping berturut-turut di luar.
 - Ping lokasi: server membuang ping yang datang < 2 detik (saat ride: < 1 detik) **dan** bergerak < 30 m.
+- **Rute perjalanan**: tiap ping yang lolos saat `ON_TRIP` dicatat di SQLite ZoneDO (tabel `track`), lalu dikirim ke Postgres (`ride_track`) tiap `TRACK_FLUSH_MS` (1 menit) dan sekali lagi saat ride berakhir. Postgres mati → titik menunggu di ZoneDO, tidak hilang dan tidak dobel (`seq` jadi kunci). Posisi di luar `ON_TRIP` tidak disimpan.
 
 ### Yang dijaga Postgres
 
@@ -103,7 +104,7 @@ Status driver: `OFFLINE`, `AVAILABLE`, `RESERVED` (sedang ditawari), `ON_RIDE`.
 
 - **Pembuatan ride**: dicatat "pending" di ZoneDO sebelum Postgres ditanya; kalau hasilnya tidak jelas, timer `create:` mengecek ulang.
 - **Pembayaran**: biasanya ikut transaksi "selesai". Kalau tidak (balasan hilang), timer `settle:` mengulang sampai terbayar; driver tetap dibebaskan.
-- Semua timer (`dispatch:`, `offer:`, `search:`, `sync:`, `settle:`, `create:`, `purge:`) memakai satu alarm DO + tabel `timers`. Saat ZoneDO menyala, timer untuk pekerjaan yang masih menunggu Postgres dipasang ulang.
+- Semua timer (`dispatch:`, `offer:`, `search:`, `sync:`, `settle:`, `create:`, `watch:`, `track:`, `purge:`) memakai satu alarm DO + tabel `timers`. Saat ZoneDO menyala, timer untuk pekerjaan yang masih menunggu Postgres dipasang ulang.
 
 ## API
 
@@ -137,7 +138,7 @@ Definisi lengkap: `packages/client/src/protocol.ts`.
 ## Config (`apps/api/wrangler.jsonc`)
 
 `ZONE_PRECISION` (≤ 5), `COMMISSION_RATE`, `DRIVER_MIN_BALANCE`, `OFFER_TIMEOUT_MS`, `RESERVE_TTL_MS`,
-`SEARCH_TIMEOUT_MS`, `RESEARCH_DELAY_MS`, `TOPUP_MAX`, `LOC_MIN_INTERVAL_MS`, `LOC_MIN_INTERVAL_ON_RIDE_MS`,
+`SEARCH_TIMEOUT_MS`, `RESEARCH_DELAY_MS`, `TOPUP_MAX`, `DRIVER_LOST_ASK_MS`, `DRIVER_LOST_CANCEL_MS`, `TRACK_FLUSH_MS`, `LOC_MIN_INTERVAL_MS`, `LOC_MIN_INTERVAL_ON_RIDE_MS`,
 `LOC_MIN_MOVE_M`, `HANDOFF_MARGIN_M`, `HANDOFF_PINGS`. Secret: `JWT_SECRET`. Konstanta tarif: `packages/core/src/fare.ts`.
 
 ## Test
