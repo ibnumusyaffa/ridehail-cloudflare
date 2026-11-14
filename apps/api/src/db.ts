@@ -1,5 +1,5 @@
 import { ACTIVE_STATUSES, commissionOf, type ErrorCode, type PaymentMethod, type Role, type WalletTxType } from "@gojek/core";
-import { isUniqueViolation, type Sql, type Tx } from "./pg";
+import { begin, isUniqueViolation, type Sql, type Tx } from "./pg";
 import type { DriverInfo, RideView, Vehicle } from "./protocol";
 
 export interface User {
@@ -49,7 +49,7 @@ export async function loginUser(sql: Sql, phone: string, role: Role, name?: stri
 
   const now = Date.now();
   const displayName = name?.trim() || `${role === "driver" ? "Driver" : "Customer"} ${phone.slice(-4)}`;
-  const user = await sql.begin(async (tx) => {
+  const user = await begin(sql, async (tx) => {
     const [u] = await tx`
       INSERT INTO users (id, role, name, phone, created_at) VALUES (${newId("u")}, ${role}, ${displayName}, ${phone}, ${now})
       ON CONFLICT (phone) DO NOTHING RETURNING *`;
@@ -146,7 +146,7 @@ export async function driverEarnings(sql: Sql, driverId: string, since: number, 
   return { count: r!.count as number, gross: r!.gross as number, net: r!.net as number };
 }
 
-async function upsertRideTx(tx: Tx, r: RideView, idempotencyKey: string | null) {
+async function insertRideTx(tx: Tx, r: RideView, idempotencyKey: string | null) {
   await tx`
     INSERT INTO rides (id, customer_id, driver_id, pickup_lat, pickup_lng, pickup_label, drop_lat, drop_lng, drop_label,
       status, fare_estimate, fare_final, distance_m, payment_method, cancel_reason, cancelled_by, idempotency_key,
@@ -154,14 +154,7 @@ async function upsertRideTx(tx: Tx, r: RideView, idempotencyKey: string | null) 
     VALUES (${r.id}, ${r.customerId}, ${r.driverId}, ${r.pickup.lat}, ${r.pickup.lng}, ${r.pickup.label ?? null},
       ${r.dropoff.lat}, ${r.dropoff.lng}, ${r.dropoff.label ?? null}, ${r.status}, ${r.fare}, ${r.fareFinal}, ${r.distanceM},
       ${r.paymentMethod}, ${r.cancelReason}, ${r.cancelledBy}, ${idempotencyKey}, ${r.requestedAt}, ${r.acceptedAt},
-      ${r.arrivedAt}, ${r.startedAt}, ${r.completedAt}, ${r.cancelledAt})
-    ON CONFLICT (id) DO UPDATE SET
-      driver_id = excluded.driver_id, status = excluded.status, fare_final = excluded.fare_final,
-      cancel_reason = excluded.cancel_reason, cancelled_by = excluded.cancelled_by,
-      accepted_at = excluded.accepted_at, arrived_at = excluded.arrived_at, started_at = excluded.started_at,
-      completed_at = excluded.completed_at, cancelled_at = excluded.cancelled_at
-    -- a terminal ride is final: a late or replayed write-through must not revive it
-    WHERE rides.status NOT IN ('COMPLETED', 'CANCELLED', 'NO_DRIVER')`;
+      ${r.arrivedAt}, ${r.startedAt}, ${r.completedAt}, ${r.cancelledAt})`;
 }
 
 export type CreateRideResult =
@@ -176,8 +169,8 @@ export type CreateRideResult =
  */
 export async function createRide(sql: Sql, r: RideView, idempotencyKey: string | null): Promise<CreateRideResult> {
   try {
-    return await sql.begin(async (tx) => {
-      await upsertRideTx(tx, r, idempotencyKey);
+    return await begin(sql, async (tx) => {
+      await insertRideTx(tx, r, idempotencyKey);
       if (r.paymentMethod === "WALLET") {
         const [w] = await tx`SELECT balance FROM wallets WHERE user_id = ${r.customerId} FOR UPDATE`;
         const [h] = await tx`SELECT COALESCE(SUM(amount), 0)::int8 AS held FROM wallet_holds WHERE user_id = ${r.customerId} AND status = 'ACTIVE'`;
@@ -203,13 +196,65 @@ export async function createRide(sql: Sql, r: RideView, idempotencyKey: string |
 
 class InsufficientBalance extends Error {}
 
-/** Write-through of the hot ride state; a cancelled / unmatched WALLET ride releases its hold. */
-export async function persistRide(sql: Sql, r: RideView, idempotencyKey: string | null): Promise<void> {
-  await sql.begin(async (tx) => {
-    await upsertRideTx(tx, r, idempotencyKey);
-    if (RELEASE_ON.includes(r.status))
-      await tx`UPDATE wallet_holds SET status = 'RELEASED', updated_at = ${Date.now()} WHERE ride_id = ${r.id} AND status = 'ACTIVE'`;
+export type TransitionResult =
+  | { ok: true; settled: SettleResult | null }
+  /** the row is not at the expected version: its current state */
+  | { ok: false; reason: "STALE"; current: RideView | null; version: number }
+  /** the driver already has another active ride (`one_active_ride_driver`) */
+  | { ok: false; reason: "DRIVER_BUSY" };
+
+/**
+ * Apply one ride transition in Postgres — the source of truth for ride status — in one transaction:
+ *  - compare-and-set on `version` (the row as the zone actor last knew it), bumped by one: two racing
+ *    transitions can never both win, and a late copy of a write can never land after a fence;
+ *  - a cancelled / unmatched WALLET ride releases its hold;
+ *  - `settle` (COMPLETE) settles the fare in the same transaction.
+ */
+export async function transitionRide(
+  sql: Sql,
+  r: RideView,
+  version: number,
+  settle: SettleArgs | null,
+): Promise<TransitionResult> {
+  try {
+    return await begin(sql, async (tx) => {
+      const changed = await tx`
+        UPDATE rides SET status = ${r.status}, driver_id = ${r.driverId}, fare_final = ${r.fareFinal},
+          cancel_reason = ${r.cancelReason}, cancelled_by = ${r.cancelledBy},
+          accepted_at = ${r.acceptedAt}, arrived_at = ${r.arrivedAt}, started_at = ${r.startedAt},
+          completed_at = ${r.completedAt}, cancelled_at = ${r.cancelledAt}, version = version + 1
+        WHERE id = ${r.id} AND version = ${version}
+        RETURNING id`;
+      if (!changed.length) return { ok: false as const, reason: "STALE" as const, ...(await currentTx(tx, r.id)) };
+      if (RELEASE_ON.includes(r.status))
+        await tx`UPDATE wallet_holds SET status = 'RELEASED', updated_at = ${Date.now()} WHERE ride_id = ${r.id} AND status = 'ACTIVE'`;
+      return { ok: true as const, settled: settle ? await settleRideTx(tx, settle) : null };
+    });
+  } catch (e) {
+    if (isUniqueViolation(e, "one_active_ride_driver")) return { ok: false, reason: "DRIVER_BUSY" };
+    throw e;
+  }
+}
+
+export type FenceResult = { fenced: true } | { fenced: false; current: RideView | null; version: number };
+
+/**
+ * Settle the fate of a transition whose reply was lost (it expected `version`): bump the version from
+ * that value. Fenced → the transition had not committed and now never will. Not fenced → the row moved
+ * on (normally: the transition committed); its current state is returned. Waits for a transaction
+ * still holding the row, so the answer is final.
+ */
+export async function fenceRide(sql: Sql, rideId: string, version: number): Promise<FenceResult> {
+  return begin(sql, async (tx) => {
+    const fenced = await tx`UPDATE rides SET version = version + 1 WHERE id = ${rideId} AND version = ${version} RETURNING id`;
+    if (fenced.length) return { fenced: true as const };
+    return { fenced: false as const, ...(await currentTx(tx, rideId)) };
   });
+}
+
+async function currentTx(tx: Tx, rideId: string): Promise<{ current: RideView | null; version: number }> {
+  const [cur] = await tx`${rideSelect(tx as unknown as Sql)} WHERE r.id = ${rideId}`;
+  return { current: cur ? rowToRide(cur) : null, version: (cur?.version as number | undefined) ?? 0 };
 }
 
 export async function rateRide(sql: Sql, rideId: string, customerId: string, stars: number): Promise<boolean> {
@@ -260,7 +305,7 @@ export async function listTransactions(sql: Sql, userId: string, limit = 100): P
 /** Credit `amount` once per (user, idempotencyKey): ledger row + balance in one transaction. */
 export async function topup(sql: Sql, userId: string, amount: number, idemKey: string): Promise<number> {
   const now = Date.now();
-  return sql.begin(async (tx) => {
+  return begin(sql, async (tx) => {
     const [w] = await tx`SELECT balance FROM wallets WHERE user_id = ${userId} FOR UPDATE`;
     if (!w) throw new Error(`wallet missing for ${userId}`);
     const balance = w.balance as number;
@@ -297,46 +342,48 @@ export interface SettleResult {
  *  - CASH: the driver owes the platform its commission.
  * Mirrors the pure `settle()` in @gojek/core.
  */
-export async function settleRide(sql: Sql, a: SettleArgs): Promise<SettleResult> {
+export function settleRide(sql: Sql, a: SettleArgs): Promise<SettleResult> {
+  return begin(sql, (tx) => settleRideTx(tx, a));
+}
+
+async function settleRideTx(tx: Tx, a: SettleArgs): Promise<SettleResult> {
   const now = Date.now();
   const commission = commissionOf(a.fare, a.commissionRate);
   const earning = a.fare - commission;
-  return sql.begin(async (tx) => {
-    const [ride] = await tx`SELECT paid_at, paid_via FROM rides WHERE id = ${a.rideId} FOR UPDATE`;
-    if (!ride) throw new Error(`ride ${a.rideId} not found`);
-    // lock both wallets in a fixed order (no deadlock between concurrent settlements)
-    const ws = await tx`
-      SELECT user_id, balance FROM wallets WHERE user_id IN (${a.customerId}, ${a.driverId}) ORDER BY user_id FOR UPDATE`;
-    const bal = new Map(ws.map((w) => [w.user_id as string, w.balance as number]));
-    const balance = (id: string) => bal.get(id) ?? 0;
+  const [ride] = await tx`SELECT paid_at, paid_via FROM rides WHERE id = ${a.rideId} FOR UPDATE`;
+  if (!ride) throw new Error(`ride ${a.rideId} not found`);
+  // lock both wallets in a fixed order (no deadlock between concurrent settlements)
+  const ws = await tx`
+    SELECT user_id, balance FROM wallets WHERE user_id IN (${a.customerId}, ${a.driverId}) ORDER BY user_id FOR UPDATE`;
+  const bal = new Map(ws.map((w) => [w.user_id as string, w.balance as number]));
+  const balance = (id: string) => bal.get(id) ?? 0;
 
-    let paidVia = ride.paid_via as PaymentMethod | null;
-    if (ride.paid_at === null) {
-      const entry = async (userId: string, type: WalletTxType, amount: number) => {
-        const after = balance(userId) + amount;
-        await tx`
-          INSERT INTO wallet_transactions (id, user_id, type, amount, balance_after, ride_id, created_at)
-          VALUES (${newId("tx")}, ${userId}, ${type}, ${amount}, ${after}, ${a.rideId}, ${now})`;
-        await tx`UPDATE wallets SET balance = ${after}, updated_at = ${now} WHERE user_id = ${userId}`;
-        bal.set(userId, after);
-      };
-      paidVia = "CASH";
-      if (a.paymentMethod === "WALLET" && balance(a.customerId) >= a.fare) {
-        await entry(a.customerId, "RIDE_PAYMENT", -a.fare);
-        await entry(a.driverId, "RIDE_EARNING", earning);
-        paidVia = "WALLET";
-      } else if (commission > 0) {
-        await entry(a.driverId, "COMMISSION", -commission);
-      }
+  let paidVia = ride.paid_via as PaymentMethod | null;
+  if (ride.paid_at === null) {
+    const entry = async (userId: string, type: WalletTxType, amount: number) => {
+      const after = balance(userId) + amount;
       await tx`
-        UPDATE wallet_holds SET status = ${paidVia === "WALLET" ? "CAPTURED" : "RELEASED"}, updated_at = ${now}
-        WHERE ride_id = ${a.rideId} AND status = 'ACTIVE'`;
-      await tx`
-        UPDATE rides SET paid_via = ${paidVia}, paid_at = ${now}, fare_final = COALESCE(fare_final, ${a.fare})
-        WHERE id = ${a.rideId}`;
+        INSERT INTO wallet_transactions (id, user_id, type, amount, balance_after, ride_id, created_at)
+        VALUES (${newId("tx")}, ${userId}, ${type}, ${amount}, ${after}, ${a.rideId}, ${now})`;
+      await tx`UPDATE wallets SET balance = ${after}, updated_at = ${now} WHERE user_id = ${userId}`;
+      bal.set(userId, after);
+    };
+    paidVia = "CASH";
+    if (a.paymentMethod === "WALLET" && balance(a.customerId) >= a.fare) {
+      await entry(a.customerId, "RIDE_PAYMENT", -a.fare);
+      await entry(a.driverId, "RIDE_EARNING", earning);
+      paidVia = "WALLET";
+    } else if (commission > 0) {
+      await entry(a.driverId, "COMMISSION", -commission);
     }
-    return { paidVia: paidVia ?? "CASH", customerBalance: balance(a.customerId), driverBalance: balance(a.driverId) };
-  });
+    await tx`
+      UPDATE wallet_holds SET status = ${paidVia === "WALLET" ? "CAPTURED" : "RELEASED"}, updated_at = ${now}
+      WHERE ride_id = ${a.rideId} AND status = 'ACTIVE'`;
+    await tx`
+      UPDATE rides SET paid_via = ${paidVia}, paid_at = ${now}, fare_final = COALESCE(fare_final, ${a.fare})
+      WHERE id = ${a.rideId}`;
+  }
+  return { paidVia: paidVia ?? "CASH", customerBalance: balance(a.customerId), driverBalance: balance(a.driverId) };
 }
 
 // ---------------------------------------------------------------- zones / dev

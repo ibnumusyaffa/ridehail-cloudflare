@@ -56,3 +56,17 @@ export function zoneOfRide(rideId: string): string | null {
   const i = rideId.indexOf("_");
   return i > 0 ? rideId.slice(0, i) : null;
 }
+
+const LOCATION_HINTS = new Set(["wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me"]);
+
+/**
+ * The zone actor's stub. `DO_LOCATION_HINT` places new actors near the Postgres region (every ride
+ * transition waits on Postgres); it only applies when an actor is first created, never moves one.
+ */
+export function zoneStub(env: Env, zone: string): DurableObjectStub {
+  const id = env.ZONE.idFromName(zone);
+  const hint = env.DO_LOCATION_HINT;
+  return hint && LOCATION_HINTS.has(hint)
+    ? env.ZONE.get(id, { locationHint: hint as DurableObjectLocationHint })
+    : env.ZONE.get(id);
+}

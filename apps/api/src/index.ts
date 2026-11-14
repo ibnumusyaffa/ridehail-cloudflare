@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { issueToken, type Principal, readToken } from "./auth";
-import { loadConfig, zoneOfRide } from "./config";
+import { loadConfig, zoneOfRide, zoneStub } from "./config";
 import * as db from "./db";
 import { connect, type Sql } from "./pg";
 import type { ZoneApi } from "./zone";
@@ -29,7 +29,7 @@ class HttpError extends Error {
   }
 }
 
-const zoneStub = (env: Env, zone: string) => env.ZONE.get(env.ZONE.idFromName(zone)) as unknown as ZoneApi;
+const zoneApi = (env: Env, zone: string) => zoneStub(env, zone) as unknown as ZoneApi;
 
 async function body<T = Record<string, unknown>>(req: Request): Promise<T> {
   try {
@@ -125,7 +125,7 @@ app.get("/ws", async (c) => {
     headers.set("x-lat", String(lat));
     headers.set("x-lng", String(lng));
   }
-  const stub = c.env.ZONE.get(c.env.ZONE.idFromName(zone));
+  const stub = zoneStub(c.env, zone);
   return stub.fetch(new Request(c.req.raw.url, { headers }));
 });
 
@@ -134,7 +134,7 @@ app.get("/ws", async (c) => {
 app.post("/dev/reset", async (c) => {
   if (c.env.DEV_RESET !== "1") return c.json({ error: { code: "NOT_FOUND", message: "not found" } }, 404);
   const zones = await db.listZones(c.var.db());
-  await Promise.all(zones.map((z) => zoneStub(c.env, z).reset()));
+  await Promise.all(zones.map((z) => zoneApi(c.env, z).reset()));
   await db.wipeAll(c.var.db());
   return c.json({ ok: true, zones: zones.length });
 });
@@ -182,7 +182,7 @@ app.post("/rides", async (c) => {
   const idemKey = c.req.header("Idempotency-Key")?.slice(0, 100) ?? null;
   // Idempotency, one-active-ride and the wallet hold are enforced by Postgres inside createRide.
   const zone = geohashEncode(pickup.lat, pickup.lng, cfg.zonePrecision);
-  const res = await zoneStub(c.env, zone).createRide(zone, { customerId: u.sub, pickup, dropoff, paymentMethod, idempotencyKey: idemKey });
+  const res = await zoneApi(c.env, zone).createRide(zone, { customerId: u.sub, pickup, dropoff, paymentMethod, idempotencyKey: idemKey });
   if (!res.ok) throw new HttpError(res.code, res.message);
   return c.json({ rideId: res.ride.id, status: res.ride.status, ride: res.ride }, 201);
 });
@@ -221,7 +221,7 @@ app.post("/rides/:id/cancel", async (c) => {
   const b = await body<{ reason?: unknown }>(c.req.raw).catch(() => ({}) as { reason?: unknown });
   const reason = typeof b.reason === "string" ? b.reason.slice(0, 200) : "";
   if (u.role === "driver" && !reason) throw new HttpError("BAD_REQUEST", "driver must give a reason");
-  const res = await zoneStub(c.env, zone).cancelRide(id, u.sub, u.role, reason);
+  const res = await zoneApi(c.env, zone).cancelRide(id, u.sub, u.role, reason);
   if (!res.ok) throw new HttpError(res.code, res.message);
   return c.json({ ride: res.ride });
 });

@@ -25,6 +25,9 @@
     { "name": "WS_LIMITER", "namespace_id": "1002", "simple": { "limit": 30, "period": 60 } }
   ],
   "vars": {
+    // Durable Object placement near the Postgres region (wnam, enam, sam, weur, eeur, apac, oc, afr, me);
+    // empty = nearest to the first request. Only affects zone actors created after it is set.
+    "DO_LOCATION_HINT": "apac",
     // geohash length of one zone actor (<= 5 so a zone always covers whole search cells)
     "ZONE_PRECISION": "5",
     "COMMISSION_RATE": "0.2",

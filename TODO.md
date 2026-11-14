@@ -1,126 +1,106 @@
-# TODO — Scalability
+# TODO
 
-Urutan: fondasi data (Postgres) dulu, lalu quick wins di ZoneDO, lalu refactor struktural & infra baru.
-Angka biaya = estimasi kasar untuk skenario 10k driver online, 100k ride/hari, ping lokasi tiap 5 detik.
+Urutan: **logic ride-hailing untuk MVP dulu**, baru skalabilitas.
+Penjelasan tiap temuan ada di [ARCHITECTURE-REVIEW.md](ARCHITECTURE-REVIEW.md) (nomor § di bawah merujuk ke sana).
 
-## Aturan biaya (jangan dilanggar saat refactor)
-
-- **Jangan tulis SQLite DO per ping lokasi.** 5,2 miliar ping/bln × $1/juta rows written ≈ $5.000/bln.
-- **Jangan buat 1 DO per ride.** DO yang terus dibangunkan ping ditagih duration ~190 GB-s/ride ≈ $7.000/bln. Pakai shard tetap.
-- **Jangan relay tiap ping lewat RPC antar-DO.** Pesan WS masuk ditagih 20:1, RPC 1:1 (≈ $780/bln). Socket driver langsung ke DO pemilik state.
+Tiap butir dianggap selesai kalau ada test-nya di `apps/api/test/`.
 
 ---
 
-## Tahap 1 — Pindah ke Postgres (D1 dihapus)
+## Tahap A — Stabilitas & logic MVP (urut dari paling kritis)
 
-Tulis ke Postgres **tetap sinkron** dulu (`await`, sama seperti D1 sekarang). Outbox/Queues menyusul di Tahap 3
-setelah load test membuktikan perlu — jangan bangun dua hal sekaligus.
+Tiga level: **P0** = data rusak / user terkunci selamanya, **P1** = hasil salah atau bisa dicurangi, **P2** = perbaikan kecil & pengalaman.
+Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
 
-- [x] **1. Infra lokal & binding**
-  - `docker-compose.yml` Postgres 17 untuk dev/test; DB terpisah `gojek_test` dan `gojek_e2e`.
-  - Binding Hyperdrive di `apps/api/wrangler.jsonc` (`localConnectionString` untuk dev), flag `nodejs_compat`, driver `postgres` (postgres.js).
-  - **Matikan query caching Hyperdrive** (`--caching-disabled`): saldo & ride aktif tidak boleh dibaca basi.
-  - Pastikan binding Hyperdrive juga terpakai dari `ZoneDO` (bukan hanya Worker). ✔ lokal; di produksi cek lagi saat deploy pertama.
-  - Selesai jika: `pnpm dev` jalan dengan Postgres lokal; `wrangler d1` tidak dipakai lagi.
+### P0 — Data rusak / user terkunci
 
-- [x] **2. Skema & migrasi**
-  - Port `apps/api/migrations/*.sql` ke Postgres (SQL polos + `apps/api/scripts/migrate.mjs`); tipe `BIGINT` untuk uang & epoch ms.
-  - Tambahan sekaligus:
-    ```sql
-    -- satu ride aktif per customer, dijamin DB (menutup race dua zona)
-    CREATE UNIQUE INDEX one_active_ride ON rides (customer_id)
-      WHERE status IN ('REQUESTED','OFFERING','ACCEPTED','ARRIVED','ON_TRIP');
-    -- satu ride aktif per driver
-    CREATE UNIQUE INDEX one_active_ride_driver ON rides (driver_id)
-      WHERE status IN ('ACCEPTED','ARRIVED','ON_TRIP');
-    ```
-  - Tabel `wallet_holds` (ride_id, user_id, amount, status) untuk hold saldo ride WALLET.
+- [x] **A1. Batas waktu Postgres** (§3.10) — kecil, prasyarat A2
+  - `pg.ts`: `connect_timeout` 5 detik; `withDb` batas 8 detik per operasi (`DbTimeoutError`); transaksi lewat `begin()` dengan `SET LOCAL statement_timeout` 5 detik.
+  - `locationHint` DO lewat var `DO_LOCATION_HINT` (`zoneStub()` di `config.ts`). Hanya berlaku untuk DO yang baru dibuat.
+  - Sisa: query Worker di luar transaksi belum punya batas sisi klien (hanya batas 60 detik Hyperdrive).
+  - Kenapa duluan: setelah A2 tiap transisi menunggu Postgres; tanpa batas waktu, Postgres lambat = semua aksi menggantung ±30 detik.
 
-- [x] **3. Tulis ulang `apps/api/src/db.ts` ke Postgres**
-  - `settleRide`: transaksi biasa (`BEGIN … SELECT … FOR UPDATE … COMMIT`) menggantikan guard `EXISTS` ala D1 batch; tetap idempotent lewat `UNIQUE(ride_id, user_id, type)` + `paid_at IS NULL`.
-  - `topup`: `INSERT … ON CONFLICT (user_id, idempotency_key) DO NOTHING RETURNING` lalu update saldo dalam transaksi yang sama.
-  - Ride WALLET: hold saldo saat create, capture saat selesai, release saat batal — tidak ada lagi fallback diam-diam ke cash.
-  - Selesai jika: `wallet.test.ts` & `ride.test.ts` hijau di Postgres; `balance == SUM(amount)` per user.
+- [x] **A2. Status ride: Postgres dulu, baru DO** (§3.8) ⭐
+  - Transisi accept / arrive / start / complete / cancel / `NO_DRIVER`: cek state machine di DO → catat `pending` + timer `sync:` → satu transaksi Postgres (`transitionRide`, compare-and-set pada `rides.version`, migrasi `0002`) → baru diterapkan di DO + `notifyRide`. Selesai sekalian membayar dalam transaksi yang sama.
+  - Postgres gagal / balasan hilang → `UNAVAILABLE`, status tidak berubah. Pemulihan memakai *fence* (`fenceRide`): menaikkan versi supaya tulisan lama pasti tidak commit belakangan, atau mendapati tulisan itu sudah commit lalu menerapkannya. "Ditolak" selalu berarti "tidak terjadi".
+  - Aksi satu ride diantrikan (`serial`) supaya `arrive → start → complete` beruntun tetap berurutan. Timer pekerjaan yang menunggu Postgres dipasang ulang saat DO menyala (`rearmTimers`).
+  - Outbox dihapus (tabel di-DROP; belum pernah di-deploy). `OFFERING` hanya di DO; Postgres tetap `REQUESTED` selama mencari.
+  - Dites: `test/resilience.test.ts` (cancel/complete saat Postgres mati, balasan hilang, tidak ada yang mengulang, accept vs cancel bersamaan).
 
-- [x] **4. Create ride sinkron + kunci ride aktif global**
-  - `ZoneDO.createRide` insert baris ride ke Postgres **sebelum** dispatch; unique violation (`23505` pada `one_active_ride`) → `ACTIVE_RIDE_EXISTS`.
-  - Hapus cek ride aktif per-zona di DO dan cek ganda di Worker (`POST /rides`).
-  - Selesai jika: test baru — dua `POST /rides` paralel dengan pickup di zona berbeda → tepat satu sukses.
+- [ ] **A3. Ride `ON_TRIP` tidak boleh macet selamanya** (§3.1)
+  - Timer penjaga baru di ZoneDO (jenis `watch:`): driver tanpa ping lama saat `ON_TRIP` (juga `ACCEPTED` terlalu lama tanpa `ARRIVED`, kurang mendesak karena customer masih bisa batal).
+  - Tindakan: batalkan oleh `system` (sebelum `ON_TRIP`) atau tandai bermasalah (saat `ON_TRIP`). `ON_TRIP` perlu aturan baru di `packages/core/src/rideStateMachine.ts`.
+  - Endpoint admin: paksa batal / paksa selesai satu ride. Belum ada peran admin (`Role` hanya `customer | driver`): tentukan autentikasinya dulu (mis. header `ADMIN_TOKEN` atau peran baru).
+  - Putuskan nasib saldo tertahan saat ride `ON_TRIP` diakhiri paksa: dilepas penuh, ditarik sebagian, atau ditarik penuh.
+  - Selesai jika: driver hilang di `ON_TRIP` → customer bisa pesan lagi dan saldo tertahan dilepas.
 
-- [x] **5. WS connect tanpa DB**
-  - Andalkan JWT (`sub`, `role`, `name` sudah ada — `apps/api/src/auth.ts`); hapus `getUser` di `/ws`.
-  - Client selalu kirim `rideId` atau `lat/lng`; lookup ride aktif ke Postgres hanya fallback.
-  - Selesai jika: jalur `/ws` normal = 0 query DB (badai reconnect saat deploy tidak menghantam Postgres).
+### P1 — Hasil salah / bisa dicurangi
 
-- [x] **6. Pendapatan harian driver pakai agregat SQL**
-  - Ganti hitung dari `listRides` (limit 50 → salah untuk driver > 50 ride/hari) dengan `COUNT/SUM … WHERE completed_at >= start_of_day`.
+- [ ] **A4. Pencarian driver yang andal** (§3.2, §3.6, §3.9) — satu fungsi (`dispatch` / `findCandidates`), kerjakan sekaligus
+  - Timer penjaga `dispatch:` yang selalu ada selama `REQUESTED`/`OFFERING`, dipasang sebelum tiap langkah (reserve, release, persist). Menutup: panggilan `dispatch` yang terbuang oleh penanda `dispatching`, RPC antar-zona yang gagal (`runTimer` hanya log), DO mati di tengah pencarian.
+  - Buang tanda `searched` / `researched` (`searched` tidak pernah tersimpan, `zone.ts:730-733`). Aturan baru: selama belum lewat `SEARCH_TIMEOUT_MS`, cari ulang tiap `RESEARCH_DELAY_MS`.
+  - `findCandidates`: `Promise.allSettled`, zona tetangga yang gagal diabaikan.
+  - Selesai jika: (1) driver menolak saat tawaran pertama masih ditulis → ride lanjut ke kandidat berikutnya; (2) RPC `reserveAndOffer` yang error dicoba ulang; (3) driver yang online 20 detik setelah order tetap ditawari, `NO_DRIVER` baru setelah 120 detik.
 
-- [x] **7. Tes & dev reset**
-  - `vitest` (pool workers) pakai Hyperdrive lokal ke `gojek_test`; `TRUNCATE … RESTART IDENTITY CASCADE` antar file test.
-  - `/dev/reset` dan e2e (`pnpm e2e`) pakai `gojek_e2e`; CI menyalakan Postgres service.
-  - Update README (quick start, deploy) & ARCHITECTURE (D1 → Postgres).
+- [ ] **A5. Cek lokasi untuk Tiba dan Selesai** (§3.3)
+  - `ARRIVE` hanya jika driver dekat titik jemput; `COMPLETE` hanya jika dekat tujuan. Jarak batas masuk config.
+  - Pakai posisi terakhir di memori (`pos`). `pos` bisa kosong setelah DO restart atau pindah zona: jatuh ke `lat/lng` di `DriverRow` (snapshot ≤30 detik), dan kalau tetap tidak ada, tolak dengan error yang jelas.
+  - Selesai jika: Tiba dari 2 km ditolak dengan error yang jelas.
 
----
+- [ ] **A6. Driver tidak boleh punya dua ride** (§3.5, §3.11)
+  - ~~Dua zona: Postgres menolak accept karena `one_active_ride_driver` → tawarkan ke kandidat berikutnya.~~ Selesai bersama A2 (`DRIVER_BUSY` → `dropOffer` + `dispatch`); belum ada test khusus.
+  - Accept `UNAVAILABLE` (A2): zona driver kini tetap memegang reservasi, dan kalau ternyata tidak commit, timer tawaran melepasnya. Tapi kalau accept ternyata commit lewat pemulihan `sync:`, zona driver belum diberi tahu (driver tidak dipindah ke zona ride sampai mengulang accept). Perlu RPC pemberitahuan ke zona driver.
+  - Accept gagal di jaringan: kalau RPC `acceptOffer` melempar error (bukan `!res.ok`), jangan biarkan driver jatuh ke status bebas setelah reservasi habis; tanya ulang zona ride atau perpanjang reservasi sampai jelas.
 
-## Tahap 2 — Quick wins ZoneDO (tidak menyentuh Postgres, bisa paralel dengan Tahap 1)
+### P2 — Perbaikan kecil & pengalaman
 
-- [x] **8. Index `nearest` yang benar** — diganti grid di memori (#10): `nearest` tidak query SQL per sel lagi, hanya lookup status by primary key.
-  - Masalah: `WHERE substr(cell,1,?) IN (...)` (`apps/api/src/zone.ts` `nearest`) tidak pakai index → full scan driver zona.
-  - Kerja: kolom `cell5` + `cell6` ber-index, query `WHERE cell6 IN (...)`.
-  - Selesai jika: `EXPLAIN QUERY PLAN` menunjukkan `USING INDEX`.
+- [ ] **A7. Validasi input** (§3.7, §3.12)
+  - `zoneOfRide()` di `index.ts` (`/ws?rideId=`, `/rides/:id/cancel`): tolak kalau bukan geohash dengan panjang `zonePrecision`.
+  - `POST /rides`: tolak jarak di atas batas dan titik jemput = tujuan.
 
-- [x] **9. Throttle ping lokasi**
-  - Server: abaikan `loc` < 2 dtk sejak ping terakhir (ON_RIDE: batas 1 dtk) **kecuali bergerak ≥ 30 m** (lompatan posisi tidak boleh dibuang).
-  - Client: kirim hanya jika bergerak > 30 m atau sudah 5 dtk.
+- [ ] **A8. Driver batal → cari driver lain** (§3.4)
+  - Ride kembali ke pencarian, driver yang batal masuk daftar `rejected`. Butuh transisi baru `ACCEPTED/ARRIVED → REQUESTED`.
+  - Ikut diurus: kosongkan `driverId` / `driver`, ulang `searchDeadline`, kabari customer lewat WebSocket ("mencari driver lagi").
+  - Di Postgres `driver_id` juga harus dikosongkan, kalau tidak `one_active_ride_driver` tetap mengunci driver yang batal.
 
-- [x] **10. Posisi driver di memori, SQLite hanya saat status berubah** ⭐ impact biaya terbesar
-  - `Map<driverId, {lat,lng,heading,ts}>` + grid `Map<cell6, Set<driverId>>` di memori; snapshot posisi ke SQLite tiap ~30 dtk untuk recovery.
-  - Selesai jika: rows written per driver per jam turun dari ~720 ke < 150; matching benar setelah DO di-evict. (Belum diukur — ikut load test #14.)
+## Tahap B — Sebelum ada pengguna & uang sungguhan
 
-- [x] **11. Reconnect jitter + hysteresis zona**
-  - Client (`packages/client/src/socket.ts`): backoff eksponensial + jitter 0–5 dtk.
-  - `maybeHandOff`: pindah zona hanya jika > 100 m di dalam zona baru atau 3 ping berturut-turut.
-  - Catatan: selama masa tunggu hysteresis (≤ ~15 dtk) driver di pita batas tidak terlihat oleh pencarian dari zona baru.
-
-- [x] **12. Alarm zona tanpa head-of-line blocking**
-  - Timer jatuh tempo dijalankan paralel (`Promise.allSettled`, batas ~16); cache waktu alarm di memori.
-  - Selesai jika: satu RPC/DB lambat (mock 2 dtk) tidak menunda offer timeout ride lain. (Belum ada test khusus.)
-
-- [x] **13. Rate limit**
-  - Binding Rate Limiting Cloudflare di `/auth/login` (per IP) dan `/ws` (per user).
+- [ ] **B1. Login OTP** — sekarang siapa pun bisa masuk dengan nomor siapa pun.
+- [ ] **B2. Pisah `zone.ts`** (1.255 baris) jadi beberapa file: posisi driver, pencarian, status ride (transisi + sync), pembayaran, WebSocket. Tanpa mengubah perilaku.
+- [ ] **B3. Deploy pertama** — pastikan Hyperdrive terpakai dari ZoneDO di produksi, bukan hanya Worker.
+- [ ] **B4. Payment gateway & penarikan saldo driver.**
+- [ ] **B5. Catatan kecil dari review (P3)** — driver yang socket-nya putus tetap `AVAILABLE` sampai 1 jam dan tidak dicek saldo ulang saat tersambung lagi; REST (`GET /rides/:id`, Postgres) dan WebSocket (ZoneDO) kini sama setelah A2, kecuali `OFFERING` (REST menampilkan `REQUESTED`); `purge` tidak menghapus driver `RESERVED` yang kedaluwarsa; `Idempotency-Key` dibuat baru tiap panggilan di `packages/client/src/api.ts`.
 
 ---
 
-## Tahap 3 — Ukur, lalu refactor struktural
+## Tahap C — Skalabilitas (tunda sampai ada beban nyata)
 
-- [ ] **14. Load test baseline**
-  - Fleet headless (k6 WebSocket atau script Bun): 1k → 5k driver di satu zona, N customer paralel.
-  - Catat: latensi offer, durasi DO, rows written, latensi & koneksi Postgres, error rate.
+Jangan dikerjakan sebelum Tahap A selesai dan ada hasil ukur.
 
-- [ ] **15. Outbox + Queues (bila #14 menunjukkan write sinkron jadi bottleneck)**
-  - Sudah ada: outbox SQLite DO → Postgres dengan retry (untuk kebenaran, lihat ARCHITECTURE-REVIEW R1). Sisa: flush batch lewat Queues bila perlu throughput.
-  - ZoneDO tulis transisi ride ke tabel `outbox` di SQLite DO → alarm flush batch ke Cloudflare Queues → consumer upsert dengan kolom `version`.
-  - Create ride & settlement tetap sinkron (butuh kunci & transaksi).
+- [ ] **C1. Load test** — 1k → 5k driver di satu zona. Catat latensi tawaran, durasi DO, rows written, koneksi Postgres.
+- [ ] **C2. Tulis Postgres lewat Queues** — hanya bila C1 menunjukkan tulis ke Postgres jadi penghambat. Setelah A2 status ride ditulis langsung; ini hanya relevan untuk data non-kritis (riwayat, statistik).
+- [ ] **C3. RideShardDO** — pisah state ride dari zona jemput (N shard tetap, `hash(rideId) % N`).
+- [ ] **C4. ETA lewat jalan & batch matching** — layanan terpisah; ZoneDO tetap punya cadangan jarak lurus.
+- [ ] **C5. Zona adaptif, partisi tabel `rides`, read replica.**
 
-- [ ] **16. RideShardDO (pisah state ride dari zona jemput)**
-  - N shard tetap per kota (mis. 64), `shard = hash(rideId) % N`; pegang state machine, timer, socket driver & customer selama trip.
-  - ZoneDO tinggal geo index + reservasi + matching.
-  - Selesai jika: load test dengan 80% pickup di satu zona tidak menaikkan latensi zona tsb.
+### Aturan biaya (jangan dilanggar saat refactor)
 
----
+Perkiraan kasar untuk 10k driver online, 100k ride/hari, ping tiap 5 detik.
 
-## Tahap 4 — VM Rust (kualitas matching & job berat)
-
-Akses VM hanya lewat Cloudflare Tunnel + Access service token. Service Rust **stateless**; ZoneDO fallback ke haversine + greedy jika VM timeout > 200 ms.
-
-- [ ] **17. routing-svc** — ETA lewat jalan: Rust + `fast_paths` dari OSM Jabodetabek (atau OSRM/Valhalla). `POST /matrix { sources, target }`.
-- [ ] **18. Batch matching (matcher-svc)** — tiap ~2 dtk: matriks ETA + Hungarian/min-cost flow → ZoneDO reservasi hasilnya.
-- [ ] **19. ingest-svc + jobs** — consumer Queues → Postgres (`COPY`/multi-row upsert); cron rekonsiliasi ledger, payout, fraud GPS, heatmap demand.
+- **Jangan tulis SQLite DO per ping lokasi.** ≈ $5.000/bulan.
+- **Jangan buat 1 DO per ride.** ≈ $7.000/bulan. Pakai shard tetap.
+- **Jangan teruskan tiap ping lewat RPC antar-DO.** Socket driver langsung ke DO pemilik state.
 
 ---
 
-## Tahap 5 — Nanti (hanya bila data menunjukkan perlu)
+## Sudah selesai
 
-- [ ] **20. Zona adaptif** — tabel `prefix → presisi` di KV; pertimbangkan H3 menggantikan geohash.
-- [ ] **21. Skala Postgres** — partisi `rides` per bulan, read replica untuk riwayat, Citus bila primary jenuh.
-- [ ] **22. Realtime core di Rust** — ganti ZoneDO hanya jika tagihan duration DO > biaya engineer yang mengoperasikan cluster sendiri.
+- Pindah dari D1 ke Postgres (Hyperdrive, cache mati); skema + migrasi.
+- Satu ride aktif per customer / driver dijaga Postgres; ride dibuat di Postgres sebelum dispatch.
+- Saldo tertahan (hold) → capture / release; pembayaran dan top-up aman diulang.
+- Status ride Postgres dulu (compare-and-set + fence, A2); recovery pembuatan ride; retry pembayaran.
+- WebSocket connect tanpa query database (`known=1`).
+- Pendapatan harian driver dengan agregat SQL.
+- Posisi driver di memori + grid geohash 6; snapshot ke SQLite tiap 30 detik.
+- Throttle ping lokasi (server + client); reconnect dengan jitter; pindah zona dengan hysteresis.
+- Timer zona dijalankan paralel (maks 16); rate limit login dan WebSocket.
