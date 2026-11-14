@@ -1512,6 +1512,17 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     if (msg.t === "resume") return this.resume(ws, meta, msg.rideId);
     if (meta.role !== "driver") throw new DomainError("FORBIDDEN", `${msg.t} is driver-only`);
 
+    // Location pings are the bulk of all traffic: drop the ones the throttle would drop anyway from
+    // memory alone, before touching SQLite. Checked with the looser of the two intervals, so a ping
+    // dropped here would also be dropped below whatever the driver's status turns out to be.
+    if (msg.t === "loc" && isValidLatLng(msg)) {
+      const prev = this.pos.get(meta.userId);
+      const { locMinIntervalMs, locMinIntervalOnRideMs } = this.cfg.presence;
+      const loosest = locMinIntervalOnRideMs <= locMinIntervalMs;
+      if (prev && !acceptPing({ lat: prev.lat, lng: prev.lng, at: prev.ts }, { lat: msg.lat, lng: msg.lng, at: Date.now() }, loosest, this.cfg.presence))
+        return; // throttled
+    }
+
     const d = this.loadDriver(meta.userId);
     if (!d) {
       // socket outlived its row (handed off): ask client to reconnect by location
