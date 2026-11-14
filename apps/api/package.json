@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler d1 migrations apply DB --local && wrangler dev",
+    "dev": "node scripts/migrate.mjs && wrangler dev",
     "deploy": "wrangler deploy",
-    "db:migrate:local": "wrangler d1 migrations apply DB --local",
-    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
+    "db:migrate": "node scripts/migrate.mjs",
+    "db:reset": "node scripts/migrate.mjs --reset",
     "cf-typegen": "wrangler types",
     "test": "vitest run",
     "typecheck": "tsc -p ."
@@ -15,7 +15,8 @@
   "dependencies": {
     "@gojek/client": "workspace:*",
     "@gojek/core": "workspace:*",
-    "hono": "^4.13.18"
+    "hono": "^4.13.18",
+    "postgres": "^4.1.1"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.1",

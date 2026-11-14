@@ -35,7 +35,9 @@ export type ErrorCode =
   | "INSUFFICIENT_BALANCE"
   | "DRIVER_BALANCE_TOO_LOW"
   | "BAD_REQUEST"
-  | "ACTIVE_RIDE_EXISTS";
+  | "ACTIVE_RIDE_EXISTS"
+  | "RATE_LIMITED"
+  | "UNAVAILABLE";
 
 export class DomainError extends Error {
   constructor(

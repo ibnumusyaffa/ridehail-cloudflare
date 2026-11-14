@@ -4,6 +4,8 @@
   "packageManager": "pnpm@12.10.1",
   "scripts": {
     "build": "turbo run build",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
     "dev": "turbo run dev --filter=@gojek/api --filter=@gojek/simulator-customer --filter=@gojek/simulator-driver",
     "test": "turbo run test",
     "typecheck": "turbo run typecheck",

@@ -1,0 +1,2 @@
+CREATE DATABASE gojek_test;
+CREATE DATABASE gojek_e2e;

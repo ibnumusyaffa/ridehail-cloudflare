@@ -1,3 +1,4 @@
+import { ACTIVE_STATUSES } from "@gojek/core";
 import type { ClientMsg, ServerMsg } from "./protocol";
 
 export type SocketState = "connecting" | "open" | "closed";
@@ -13,9 +14,15 @@ export interface RideSocketOptions {
   onReset?: () => void;
 }
 
+/** Close codes after which every client reconnects at once (deploy / restart): spread them out. */
+const STORM_CODES = new Set([1001, 1006, 1012]);
+
 /**
- * WebSocket with auto-reconnect (exponential backoff), zone hand-over (`zone.moved`)
+ * WebSocket with auto-reconnect (exponential backoff + jitter), zone hand-over (`zone.moved`)
  * and keepalive. Callers send `resume` from their `hello` handler.
+ *
+ * After the first `hello` the socket tracks the user's active ride itself and reconnects with
+ * `known=1` (plus `rideId` when on a ride), so the server never has to look it up in the database.
  */
 export class RideSocket {
   private ws: WebSocket | null = null;
@@ -23,6 +30,8 @@ export class RideSocket {
   private backoff = 500;
   private zone: string | null = null;
   private rideId: string | null = null;
+  /** true once a hello arrived: from then on this socket knows whether it has an active ride */
+  private known = false;
   private keepalive: ReturnType<typeof setInterval> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -35,6 +44,7 @@ export class RideSocket {
     for (const [k, v] of Object.entries(this.opts.query?.() ?? {})) if (v !== undefined) qs.set(k, String(v));
     if (this.zone) qs.set("zone", this.zone);
     if (this.rideId && !qs.has("rideId") && !this.zone) qs.set("rideId", this.rideId);
+    if (this.known) qs.set("known", "1");
     return `${this.opts.baseUrl.replace(/^http/, "ws")}/ws?${qs}`;
   }
 
@@ -50,7 +60,18 @@ export class RideSocket {
     };
     ws.onmessage = (e) => {
       const msg = JSON.parse(String(e.data)) as ServerMsg;
-      if (msg.t === "hello") this.zone = null;
+      if (msg.t === "hello") {
+        this.zone = null;
+        this.known = true;
+        // a driver lives in the ride's zone only while ON_RIDE; a customer always follows its ride
+        if (msg.role === "driver") this.rideId = msg.driverStatus === "ON_RIDE" ? (msg.rideId ?? null) : null;
+        else if (msg.rideId) this.rideId = msg.rideId;
+      }
+      if (msg.t === "driver.state") this.rideId = msg.status === "ON_RIDE" ? msg.rideId : null;
+      if (msg.t === "ride.status") {
+        if (ACTIVE_STATUSES.includes(msg.status)) this.rideId = msg.rideId;
+        else if (this.rideId === msg.rideId) this.rideId = null;
+      }
       if (msg.t === "zone.moved") {
         // on a ride: follow the ride's zone; otherwise reconnect routed by location
         this.zone = msg.rideId ? msg.zone : null;
@@ -72,7 +93,9 @@ export class RideSocket {
       this.ws = null;
       this.opts.onState?.("closed");
       if (this.stopped) return;
-      this.timer = setTimeout(() => this.connect(), this.backoff);
+      // jitter: a deploy drops every socket at once — don't let them all come back in the same instant
+      const delay = STORM_CODES.has(e.code) && this.backoff <= 500 ? 500 + Math.random() * 4_500 : this.backoff * (0.5 + Math.random());
+      this.timer = setTimeout(() => this.connect(), delay);
       this.backoff = Math.min(this.backoff * 2, 10_000);
     };
     ws.onerror = () => {};

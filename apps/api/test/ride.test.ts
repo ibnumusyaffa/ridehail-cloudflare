@@ -222,6 +222,52 @@ describe("ride flow", () => {
     cws.close();
   });
 
+  it("one active ride per customer holds across zones (two parallel orders, different zones)", async () => {
+    const [a, b] = [spot(), spot()];
+    expect(geohashEncode(a.lat, a.lng, 5)).not.toBe(geohashEncode(b.lat, b.lng, 5));
+    const c = await customer();
+    const res = await Promise.all([requestRide(c.token, a), requestRide(c.token, b)]);
+    expect(res.map((r) => r.status).sort()).toEqual([201, 409]);
+    expect(res.find((r) => r.status === 409)!.json.error.code).toBe("ACTIVE_RIDE_EXISTS");
+  });
+
+  it("wallet order holds the fare; cancelling releases it", async () => {
+    const p = spot();
+    const c = await customer(50_000);
+    const { json, status: st } = await requestRide(c.token, p, "WALLET");
+    expect(st).toBe(201);
+    expect((await api("/wallet", { token: c.token })).json).toEqual({ balance: 50_000, held: json.ride.fare });
+    await api(`/rides/${json.rideId}/cancel`, { token: c.token, body: { reason: "batal" } });
+    expect((await api("/wallet", { token: c.token })).json).toEqual({ balance: 50_000, held: 0 });
+  });
+
+  it("zone hand-over waits out GPS jitter on the border (hysteresis)", async () => {
+    const base = spot();
+    const b = geohashBounds(geohashEncode(base.lat, base.lng, 5));
+    const lng = (b.lngMin + b.lngMax) / 2;
+    const inside = { lat: b.latMax - 0.002, lng };
+    const justAcross = { lat: b.latMax + 0.0002, lng }; // ~22 m into the northern zone
+    const d = await onlineDriver(inside.lat, inside.lng);
+    d.ws.send({ t: "loc", ...justAcross });
+    d.ws.send({ t: "loc", ...inside }); // jitter back: counter resets
+    d.ws.send({ t: "loc", ...justAcross });
+    d.ws.send({ t: "loc", ...justAcross });
+    await sleep(300);
+    expect(d.ws.inbox.some((m) => m.t === "zone.moved")).toBe(false);
+    d.ws.send({ t: "loc", ...justAcross }); // 3rd consecutive ping outside
+    expect((await d.ws.next("zone.moved")).zone).toBe(geohashEncode(justAcross.lat, justAcross.lng, 5));
+    d.ws.close();
+  });
+
+  it("known=1 reconnects skip the active-ride lookup", async () => {
+    const c = await customer();
+    const { json } = await requestRide(c.token, spot());
+    const ws = await Client.connect({ token: c.token }); // cold start: database finds the ride
+    expect((await ws.next("hello")).rideId).toBe(json.rideId);
+    ws.close();
+    await expect(Client.connect({ token: c.token, known: 1 })).rejects.toThrow(/400/);
+  });
+
   it("rejects bad auth and bad input", async () => {
     expect((await api("/me")).status).toBe(401);
     const c = await customer();

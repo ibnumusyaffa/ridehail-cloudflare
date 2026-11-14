@@ -1,4 +1,11 @@
-import { DEFAULT_FARE_CONFIG, DEFAULT_MATCH_CONFIG, type FareConfig, type MatchConfig } from "@gojek/core";
+import {
+  DEFAULT_FARE_CONFIG,
+  DEFAULT_MATCH_CONFIG,
+  DEFAULT_PRESENCE_CONFIG,
+  type FareConfig,
+  type MatchConfig,
+  type PresenceConfig,
+} from "@gojek/core";
 
 export interface Config {
   zonePrecision: number;
@@ -11,6 +18,7 @@ export interface Config {
   topupMax: number;
   fare: FareConfig;
   match: MatchConfig;
+  presence: PresenceConfig;
 }
 
 const num = (v: unknown, d: number) => {
@@ -33,6 +41,13 @@ export function loadConfig(env: Env): Config {
     topupMax: num(env.TOPUP_MAX, 1_000_000),
     fare: DEFAULT_FARE_CONFIG,
     match,
+    presence: {
+      locMinIntervalMs: num(env.LOC_MIN_INTERVAL_MS, DEFAULT_PRESENCE_CONFIG.locMinIntervalMs),
+      locMinIntervalOnRideMs: num(env.LOC_MIN_INTERVAL_ON_RIDE_MS, DEFAULT_PRESENCE_CONFIG.locMinIntervalOnRideMs),
+      locMinMoveM: num(env.LOC_MIN_MOVE_M, DEFAULT_PRESENCE_CONFIG.locMinMoveM),
+      handoffMarginM: num(env.HANDOFF_MARGIN_M, DEFAULT_PRESENCE_CONFIG.handoffMarginM),
+      handoffPings: num(env.HANDOFF_PINGS, DEFAULT_PRESENCE_CONFIG.handoffPings),
+    },
   };
 }
 

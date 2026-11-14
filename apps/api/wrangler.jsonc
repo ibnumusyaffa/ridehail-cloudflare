@@ -3,20 +3,27 @@
   "name": "gojek-clone-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  "d1_databases": [
+  "hyperdrive": [
     {
-      "binding": "DB",
-      "database_name": "gojek-clone",
-      // replace with `wrangler d1 create gojek-clone` output before deploying
-      "database_id": "00000000-0000-0000-0000-000000000000",
-      "migrations_dir": "migrations"
+      "binding": "HYPERDRIVE",
+      // replace with `wrangler hyperdrive create gojek --connection-string=... --caching-disabled` output
+      "id": "00000000000000000000000000000000",
+      // `pnpm db:up` (docker compose); override with CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE
+      "localConnectionString": "postgres://postgres:postgres@localhost:54329/gojek"
     }
   ],
   "durable_objects": {
     "bindings": [{ "name": "ZONE", "class_name": "ZoneDO" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ZoneDO"] }],
+  "ratelimits": [
+    // per client IP
+    { "name": "LOGIN_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } },
+    // per user: WebSocket (re)connects
+    { "name": "WS_LIMITER", "namespace_id": "1002", "simple": { "limit": 30, "period": 60 } }
+  ],
   "vars": {
     // geohash length of one zone actor (<= 5 so a zone always covers whole search cells)
     "ZONE_PRECISION": "5",
@@ -26,7 +33,13 @@
     "RESERVE_TTL_MS": "20000",
     "SEARCH_TIMEOUT_MS": "120000",
     "RESEARCH_DELAY_MS": "5000",
-    "TOPUP_MAX": "1000000"
+    "TOPUP_MAX": "1000000",
+    // location throttle (server drops pings closer together than this) and zone hand-over hysteresis
+    "LOC_MIN_INTERVAL_MS": "2000",
+    "LOC_MIN_INTERVAL_ON_RIDE_MS": "1000",
+    "LOC_MIN_MOVE_M": "30",
+    "HANDOFF_MARGIN_M": "100",
+    "HANDOFF_PINGS": "3"
   }
   // JWT_SECRET: `wrangler secret put JWT_SECRET` (local: .dev.vars)
 }

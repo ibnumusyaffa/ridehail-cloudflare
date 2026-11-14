@@ -1,7 +1,9 @@
 import { defineConfig, devices } from "@playwright/test";
 
-// Isolated stack on its own ports with a fresh local D1/DO state for every run.
+// Isolated stack on its own ports with a fresh Postgres database (gojek_e2e) and DO state for every run.
+// Needs the local Postgres from `pnpm db:up`.
 const API_PORT = 8788;
+const E2E_DATABASE_URL = process.env.E2E_DATABASE_URL ?? "postgres://postgres:postgres@localhost:54329/gojek_e2e";
 const api = `http://localhost:${API_PORT}`;
 process.env.CUSTOMER_URL ??= "http://localhost:5273";
 process.env.DRIVER_URL ??= "http://localhost:5274";
@@ -20,8 +22,9 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: `rm -rf .wrangler/e2e && pnpm exec wrangler d1 migrations apply DB --local --persist-to .wrangler/e2e && pnpm exec wrangler dev --port ${API_PORT} --persist-to .wrangler/e2e`,
+      command: `rm -rf .wrangler/e2e && node scripts/migrate.mjs --reset ${E2E_DATABASE_URL} && pnpm exec wrangler dev --port ${API_PORT} --persist-to .wrangler/e2e`,
       cwd: "../api",
+      env: { CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE: E2E_DATABASE_URL },
       url: `${api}/health`,
       reuseExistingServer: false,
       timeout: 120_000,

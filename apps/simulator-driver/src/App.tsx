@@ -6,7 +6,7 @@ import {
 } from "@gojek/client/react";
 import { advanceAlong, getRoute, pathLength, trimFrom } from "@gojek/client/route";
 import { RideSocket, type SocketState } from "@gojek/client/socket";
-import { type DriverStatus, haversineM, type LatLng } from "@gojek/core";
+import { type DriverStatus, haversineM, type LatLng, shouldSendPing } from "@gojek/core";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const API = import.meta.env.VITE_API_URL ?? "http://localhost:8787";
@@ -177,25 +177,22 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetKey]);
 
-  // 1s tick: autopilot movement + location pings (every tick while driving, every 5s otherwise)
-  const lastPing = useRef(0);
+  // 1s tick: autopilot movement + location pings (throttled by distance / time)
+  const lastPing = useRef<(LatLng & { at: number }) | null>(null);
   useEffect(() => {
     const id = setInterval(() => {
       setNow(Date.now());
       const r = rideRef.current;
       const tgt = r?.status === "ACCEPTED" ? r.pickup : r?.status === "ON_TRIP" ? r.dropoff : null;
-      let moved = false;
       if (tgt && autopilot && haversineM(posRef.current, tgt) > 1) {
         const step = advanceAlong(posRef.current, pathRef.current.length ? pathRef.current : [tgt], speed);
         if (step.heading !== null) setHeading(step.heading);
         setPos(step.pos);
         setPath(step.path);
-        moved = true;
       }
-      if (moved || Date.now() - lastPing.current > 5000) {
-        lastPing.current = Date.now();
-        sendLoc();
-      }
+      // ping when moved >= 30 m or every 5 s (the server also drops pings closer than 1-2 s apart)
+      const here = { ...posRef.current, at: Date.now() };
+      if (shouldSendPing(lastPing.current, here, haversineM) && sendLoc()) lastPing.current = here;
     }, 1000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps

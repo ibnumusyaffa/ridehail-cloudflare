@@ -5,11 +5,12 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { issueToken, type Principal, readToken } from "./auth";
 import { loadConfig, zoneOfRide } from "./config";
 import * as db from "./db";
+import { connect, type Sql } from "./pg";
 import type { ZoneApi } from "./zone";
 
 export { ZoneDO } from "./zone";
 
-type AppEnv = { Bindings: Env; Variables: { user: Principal } };
+type AppEnv = { Bindings: Env; Variables: { user: Principal; db: () => Sql } };
 
 const STATUS: Partial<Record<ErrorCode, ContentfulStatusCode>> = {
   UNAUTHORIZED: 401,
@@ -18,6 +19,8 @@ const STATUS: Partial<Record<ErrorCode, ContentfulStatusCode>> = {
   BAD_REQUEST: 400,
   INSUFFICIENT_BALANCE: 402,
   DRIVER_BALANCE_TOO_LOW: 402,
+  RATE_LIMITED: 429,
+  UNAVAILABLE: 503,
 };
 
 class HttpError extends Error {
@@ -55,14 +58,31 @@ app.onError((err, c) => {
   return c.json({ error: { code: "INTERNAL", message: "internal error" } }, 500);
 });
 
+// One lazily-opened Postgres client per request (Hyperdrive pools the real connections).
+app.use("*", async (c, next) => {
+  let sql: Sql | null = null;
+  c.set("db", () => (sql ??= connect(c.env)));
+  try {
+    await next();
+  } finally {
+    const open = sql as Sql | null;
+    if (open) c.executionCtx.waitUntil(open.end({ timeout: 1 }).catch(() => {}));
+  }
+});
+
+async function limit(limiter: RateLimit | undefined, key: string) {
+  if (limiter && !(await limiter.limit({ key })).success) throw new HttpError("RATE_LIMITED", "too many requests, slow down");
+}
+
 app.get("/health", (c) => c.json({ ok: true }));
 
 app.post("/auth/login", async (c) => {
+  await limit(c.env.LOGIN_LIMITER, c.req.header("cf-connecting-ip") ?? "local");
   const b = await body<{ phone?: unknown; role?: unknown; name?: unknown }>(c.req.raw);
   const phone = typeof b.phone === "string" ? b.phone.replace(/[^\d+]/g, "") : "";
   if (phone.length < 6 || phone.length > 20) throw new HttpError("BAD_REQUEST", "phone required");
   if (b.role !== "customer" && b.role !== "driver") throw new HttpError("BAD_REQUEST", "role must be customer|driver");
-  const user = await db.loginUser(c.env.DB, phone, b.role, typeof b.name === "string" ? b.name.slice(0, 80) : undefined);
+  const user = await db.loginUser(c.var.db(), phone, b.role, typeof b.name === "string" ? b.name.slice(0, 80) : undefined);
   if (!user) throw new HttpError("FORBIDDEN", "phone registered with another role");
   const token = await issueToken(c.env, { sub: user.id, role: user.role, name: user.name });
   return c.json({ token, user });
@@ -70,11 +90,16 @@ app.post("/auth/login", async (c) => {
 
 // ------------------------------------------------------------- WebSocket gateway
 // /ws?token=...  customer: &rideId=  (or active ride lookup)
-//                driver:   &lat=&lng= (zone by location) | &zone= (explicit, after zone.moved) | active ride
+//                driver:   &rideId= | &zone= (explicit, after zone.moved) | &lat=&lng= (zone by location)
+//                &known=1: the client already knows whether it has an active ride (every reconnect after
+//                the first hello), so the database is not consulted — a deploy's reconnect storm costs 0 queries.
 app.get("/ws", async (c) => {
   if (c.req.header("Upgrade") !== "websocket") return c.text("expected websocket", 426);
   const user = await readToken(c.env, c.req.query("token"));
-  if (!user || !(await db.getUser(c.env.DB, user.sub))) return c.text("unauthorized", 401);
+  if (!user) return c.text("unauthorized", 401);
+  // Users only ever disappear through the dev reset; production trusts the signed token alone.
+  if (c.env.DEV_RESET === "1" && !(await db.getUser(c.var.db(), user.sub))) return c.text("unauthorized", 401);
+  if (c.env.WS_LIMITER && !(await c.env.WS_LIMITER.limit({ key: user.sub })).success) return c.text("too many reconnects", 429);
   const cfg = loadConfig(c.env);
   const q = c.req.query();
   const lat = Number(q.lat);
@@ -84,8 +109,8 @@ app.get("/ws", async (c) => {
   let zone: string | null = null;
   if (q.rideId) zone = zoneOfRide(q.rideId);
   if (!zone && q.zone && isGeohash(q.zone) && q.zone.length === cfg.zonePrecision) zone = q.zone;
-  if (!zone) {
-    const active = await db.getActiveRide(c.env.DB, user.sub, user.role);
+  if (!zone && q.known !== "1") {
+    const active = await db.getActiveRide(c.var.db(), user.sub, user.role);
     if (active && (user.role === "customer" || active.status !== "OFFERING")) zone = zoneOfRide(active.id);
   }
   if (!zone && hasLoc) zone = geohashEncode(lat, lng, cfg.zonePrecision);
@@ -108,12 +133,10 @@ app.get("/ws", async (c) => {
 // Wipes ALL data (D1 + every zone actor). Enabled only when DEV_RESET=1 (set in .dev.vars, never in prod).
 app.post("/dev/reset", async (c) => {
   if (c.env.DEV_RESET !== "1") return c.json({ error: { code: "NOT_FOUND", message: "not found" } }, 404);
-  const { results } = await c.env.DB.prepare("SELECT zone FROM zones").all<{ zone: string }>();
-  await Promise.all(results.map((z) => zoneStub(c.env, z.zone).reset()));
-  await c.env.DB.batch(
-    ["wallet_transactions", "wallets", "rides", "vehicles", "users", "zones"].map((t) => c.env.DB.prepare(`DELETE FROM ${t}`)),
-  );
-  return c.json({ ok: true, zones: results.length });
+  const zones = await db.listZones(c.var.db());
+  await Promise.all(zones.map((z) => zoneStub(c.env, z).reset()));
+  await db.wipeAll(c.var.db());
+  return c.json({ ok: true, zones: zones.length });
 });
 
 // ------------------------------------------------------------- authenticated REST
@@ -131,12 +154,10 @@ const requireRole = (u: Principal, ...roles: Role[]) => {
 
 app.get("/me", async (c) => {
   const u = c.get("user");
-  const user = await db.getUser(c.env.DB, u.sub);
+  const sql = c.var.db();
+  const user = await db.getUser(sql, u.sub);
   if (!user) throw new HttpError("UNAUTHORIZED");
-  const [balance, vehicle] = await Promise.all([
-    db.getBalance(c.env.DB, u.sub),
-    u.role === "driver" ? db.getVehicle(c.env.DB, u.sub) : null,
-  ]);
+  const [balance, vehicle] = await Promise.all([db.getBalance(sql, u.sub), u.role === "driver" ? db.getVehicle(sql, u.sub) : null]);
   return c.json({ user, vehicle, wallet: { balance } });
 });
 
@@ -159,18 +180,7 @@ app.post("/rides", async (c) => {
   const paymentMethod = (b.paymentMethod ?? "CASH") as PaymentMethod;
   if (paymentMethod !== "CASH" && paymentMethod !== "WALLET") throw new HttpError("BAD_REQUEST", "paymentMethod must be CASH|WALLET");
   const idemKey = c.req.header("Idempotency-Key")?.slice(0, 100) ?? null;
-
-  if (idemKey) {
-    const prev = await db.getRideByIdempotencyKey(c.env.DB, u.sub, idemKey);
-    if (prev) return c.json({ rideId: prev.id, status: prev.status, ride: prev });
-  }
-  const active = await db.getActiveRide(c.env.DB, u.sub, "customer");
-  if (active) throw new HttpError("ACTIVE_RIDE_EXISTS", `active ride ${active.id}`);
-  if (paymentMethod === "WALLET") {
-    const { fare } = estimate(pickup, dropoff, cfg.fare);
-    const balance = await db.getBalance(c.env.DB, u.sub);
-    if (balance < fare) throw new HttpError("INSUFFICIENT_BALANCE", `balance ${balance} < fare ${fare}`);
-  }
+  // Idempotency, one-active-ride and the wallet hold are enforced by Postgres inside createRide.
   const zone = geohashEncode(pickup.lat, pickup.lng, cfg.zonePrecision);
   const res = await zoneStub(c.env, zone).createRide(zone, { customerId: u.sub, pickup, dropoff, paymentMethod, idempotencyKey: idemKey });
   if (!res.ok) throw new HttpError(res.code, res.message);
@@ -180,31 +190,24 @@ app.post("/rides", async (c) => {
 app.get("/rides", async (c) => {
   const u = c.get("user");
   if (c.req.query("active") === "1") {
-    const ride = await db.getActiveRide(c.env.DB, u.sub, u.role);
+    const ride = await db.getActiveRide(c.var.db(), u.sub, u.role);
     return c.json({ ride });
   }
-  const rides = await db.listRides(c.env.DB, u.sub, u.role);
+  const sql = c.var.db();
+  const rides = await db.listRides(sql, u.sub, u.role);
   if (u.role === "driver") {
     const startOfDay = new Date();
     startOfDay.setUTCHours(-7, 0, 0, 0); // WIB midnight (UTC+7)
     if (startOfDay.getTime() > Date.now()) startOfDay.setUTCDate(startOfDay.getUTCDate() - 1);
-    const today = rides.filter((r) => r.status === "COMPLETED" && (r.completedAt ?? 0) >= startOfDay.getTime());
-    const commission = loadConfig(c.env).commissionRate;
-    return c.json({
-      rides,
-      today: {
-        count: today.length,
-        gross: today.reduce((s, r) => s + (r.fareFinal ?? r.fare), 0),
-        net: today.reduce((s, r) => s + Math.round((r.fareFinal ?? r.fare) * (1 - commission)), 0),
-      },
-    });
+    const today = await db.driverEarnings(sql, u.sub, startOfDay.getTime(), loadConfig(c.env).commissionRate);
+    return c.json({ rides, today });
   }
   return c.json({ rides });
 });
 
 app.get("/rides/:id", async (c) => {
   const u = c.get("user");
-  const ride = await db.getRide(c.env.DB, c.req.param("id"));
+  const ride = await db.getRide(c.var.db(), c.req.param("id"));
   if (!ride) throw new HttpError("RIDE_NOT_FOUND");
   if (ride.customerId !== u.sub && ride.driverId !== u.sub) throw new HttpError("FORBIDDEN");
   return c.json({ ride });
@@ -229,12 +232,12 @@ app.post("/rides/:id/rating", async (c) => {
   const b = await body<{ stars?: unknown }>(c.req.raw);
   const stars = b.stars;
   if (typeof stars !== "number" || !Number.isInteger(stars) || stars < 1 || stars > 5) throw new HttpError("BAD_REQUEST", "stars 1..5");
-  if (!(await db.rateRide(c.env.DB, c.req.param("id"), u.sub, stars)))
+  if (!(await db.rateRide(c.var.db(), c.req.param("id"), u.sub, stars)))
     throw new HttpError("INVALID_TRANSITION", "ride not completed, not yours, or already rated");
   return c.json({ ok: true });
 });
 
-app.get("/wallet", async (c) => c.json({ balance: await db.getBalance(c.env.DB, c.get("user").sub) }));
+app.get("/wallet", async (c) => c.json(await db.getWallet(c.var.db(), c.get("user").sub)));
 
 app.post("/wallet/topup", async (c) => {
   const u = c.get("user");
@@ -245,9 +248,9 @@ app.post("/wallet/topup", async (c) => {
   const amount = b.amount;
   if (typeof amount !== "number" || !Number.isInteger(amount) || amount <= 0 || amount > cfg.topupMax)
     throw new HttpError("BAD_REQUEST", `amount must be an integer in 1..${cfg.topupMax}`);
-  return c.json({ balance: await db.topup(c.env.DB, u.sub, amount, idemKey) });
+  return c.json({ balance: await db.topup(c.var.db(), u.sub, amount, idemKey) });
 });
 
-app.get("/wallet/transactions", async (c) => c.json({ transactions: await db.listTransactions(c.env.DB, c.get("user").sub) }));
+app.get("/wallet/transactions", async (c) => c.json({ transactions: await db.listTransactions(c.var.db(), c.get("user").sub) }));
 
 export default app;

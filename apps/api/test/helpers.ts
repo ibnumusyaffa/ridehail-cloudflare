@@ -93,3 +93,6 @@ export async function onlineDriver(lat: number, lng: number, name?: string) {
 }
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Run `fn` against the test database (same Hyperdrive binding the app uses). */
+export { withDb as withSql } from "../src/pg";

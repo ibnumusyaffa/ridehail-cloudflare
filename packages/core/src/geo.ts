@@ -95,3 +95,23 @@ export function isValidLatLng(p: unknown): p is LatLng {
     lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180
   );
 }
+
+/** Every cell of `precision` inside `hash` (or `hash` itself when it is already that precise). */
+export function geohashChildren(hash: string, precision: number): string[] {
+  let out = [hash];
+  for (let p = hash.length; p < precision; p++) out = out.flatMap((h) => [...BASE32].map((c) => h + c));
+  return out;
+}
+
+/** Metres from `p` to the nearest edge of cell `hash`; negative when `p` lies outside it. */
+export function distanceInsideCellM(p: LatLng, hash: string): number {
+  const b = geohashBounds(hash);
+  const mPerDegLat = 111_320;
+  const mPerDegLng = 111_320 * Math.cos((p.lat * Math.PI) / 180);
+  return Math.min(
+    (p.lat - b.latMin) * mPerDegLat,
+    (b.latMax - p.lat) * mPerDegLat,
+    (p.lng - b.lngMin) * mPerDegLng,
+    (b.lngMax - p.lng) * mPerDegLng,
+  );
+}

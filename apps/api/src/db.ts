@@ -1,4 +1,5 @@
-import { ACTIVE_STATUSES, commissionOf, type PaymentMethod, type Role, type WalletTxType } from "@gojek/core";
+import { ACTIVE_STATUSES, commissionOf, type ErrorCode, type PaymentMethod, type Role, type WalletTxType } from "@gojek/core";
+import { isUniqueViolation, type Sql, type Tx } from "./pg";
 import type { DriverInfo, RideView, Vehicle } from "./protocol";
 
 export interface User {
@@ -9,7 +10,11 @@ export interface User {
   createdAt: number;
 }
 
+type Row = Record<string, unknown>;
+
 const newId = (prefix: string) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
+const ACTIVE = [...ACTIVE_STATUSES] as string[];
+const RELEASE_ON = ["CANCELLED", "NO_DRIVER"];
 
 // ---------------------------------------------------------------- users
 
@@ -24,7 +29,7 @@ function fakeVehicle(): Vehicle {
   return { plate: `${pick(PLATES)} ${digits} ${suffix}`, model: pick(MODELS), color: pick(COLORS) };
 }
 
-const rowToUser = (r: Record<string, unknown>): User => ({
+const rowToUser = (r: Row): User => ({
   id: r.id as string,
   role: r.role as Role,
   name: r.name as string,
@@ -32,48 +37,42 @@ const rowToUser = (r: Record<string, unknown>): User => ({
   createdAt: r.created_at as number,
 });
 
-export async function getUser(db: D1Database, id: string): Promise<User | null> {
-  const r = await db.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+export async function getUser(sql: Sql, id: string): Promise<User | null> {
+  const [r] = await sql`SELECT * FROM users WHERE id = ${id}`;
   return r ? rowToUser(r) : null;
 }
 
 /** Find-or-create by phone. Returns null when the phone is registered with another role. */
-export async function loginUser(db: D1Database, phone: string, role: Role, name?: string): Promise<User | null> {
-  const existing = await db.prepare("SELECT * FROM users WHERE phone = ?").bind(phone).first();
+export async function loginUser(sql: Sql, phone: string, role: Role, name?: string): Promise<User | null> {
+  const [existing] = await sql`SELECT * FROM users WHERE phone = ${phone}`;
   if (existing) return existing.role === role ? rowToUser(existing) : null;
 
   const now = Date.now();
-  const id = newId("u");
   const displayName = name?.trim() || `${role === "driver" ? "Driver" : "Customer"} ${phone.slice(-4)}`;
-  const stmts = [
-    db.prepare("INSERT INTO users (id, role, name, phone, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(phone) DO NOTHING")
-      .bind(id, role, displayName, phone, now),
-    db.prepare("INSERT OR IGNORE INTO wallets (user_id, balance, updated_at) SELECT id, 0, ? FROM users WHERE phone = ?")
-      .bind(now, phone),
-  ];
-  if (role === "driver") {
-    const v = fakeVehicle();
-    stmts.push(
-      db.prepare("INSERT OR IGNORE INTO vehicles (driver_id, plate, model, color) SELECT id, ?, ?, ? FROM users WHERE phone = ?")
-        .bind(v.plate, v.model, v.color, phone),
-    );
-  }
-  await db.batch(stmts);
-  // re-read: a concurrent login may have won the insert
-  const r = await db.prepare("SELECT * FROM users WHERE phone = ?").bind(phone).first();
+  const user = await sql.begin(async (tx) => {
+    const [u] = await tx`
+      INSERT INTO users (id, role, name, phone, created_at) VALUES (${newId("u")}, ${role}, ${displayName}, ${phone}, ${now})
+      ON CONFLICT (phone) DO NOTHING RETURNING *`;
+    if (!u) return null; // a concurrent login won the insert
+    await tx`INSERT INTO wallets (user_id, balance, updated_at) VALUES (${u.id as string}, 0, ${now})`;
+    if (role === "driver") {
+      const v = fakeVehicle();
+      await tx`INSERT INTO vehicles (driver_id, plate, model, color) VALUES (${u.id as string}, ${v.plate}, ${v.model}, ${v.color})`;
+    }
+    return u;
+  });
+  const r = user ?? (await sql`SELECT * FROM users WHERE phone = ${phone}`)[0];
   return r && r.role === role ? rowToUser(r) : null;
 }
 
-export async function getVehicle(db: D1Database, driverId: string): Promise<Vehicle | null> {
-  const r = await db.prepare("SELECT plate, model, color FROM vehicles WHERE driver_id = ?").bind(driverId).first<Vehicle>();
-  return r ?? null;
+export async function getVehicle(sql: Sql, driverId: string): Promise<Vehicle | null> {
+  const [r] = await sql`SELECT plate, model, color FROM vehicles WHERE driver_id = ${driverId}`;
+  return r ? { plate: r.plate as string, model: r.model as string, color: r.color as string } : null;
 }
 
 // ---------------------------------------------------------------- rides
 
-const ACTIVE_SQL = ACTIVE_STATUSES.map((s) => `'${s}'`).join(",");
-
-function rowToRide(r: Record<string, unknown>): RideView {
+function rowToRide(r: Row): RideView {
   return {
     id: r.id as string,
     status: r.status as RideView["status"],
@@ -106,68 +105,118 @@ function rowToRide(r: Record<string, unknown>): RideView {
   };
 }
 
-const RIDE_SELECT = `
+const rideSelect = (sql: Sql) => sql`
   SELECT r.*, u.name AS driver_name, v.plate, v.model, v.color
   FROM rides r
   LEFT JOIN users u ON u.id = r.driver_id
   LEFT JOIN vehicles v ON v.driver_id = r.driver_id`;
 
-export async function getRide(db: D1Database, id: string): Promise<RideView | null> {
-  const r = await db.prepare(`${RIDE_SELECT} WHERE r.id = ?`).bind(id).first();
+export async function getRide(sql: Sql, id: string): Promise<RideView | null> {
+  const [r] = await sql`${rideSelect(sql)} WHERE r.id = ${id}`;
   return r ? rowToRide(r) : null;
 }
 
-export async function getRideByIdempotencyKey(db: D1Database, customerId: string, key: string): Promise<RideView | null> {
-  const r = await db.prepare(`${RIDE_SELECT} WHERE r.customer_id = ? AND r.idempotency_key = ?`).bind(customerId, key).first();
+export async function getRideByIdempotencyKey(sql: Sql, customerId: string, key: string): Promise<RideView | null> {
+  const [r] = await sql`${rideSelect(sql)} WHERE r.customer_id = ${customerId} AND r.idempotency_key = ${key}`;
   return r ? rowToRide(r) : null;
 }
 
-export async function getActiveRide(db: D1Database, userId: string, role: Role): Promise<RideView | null> {
-  const col = role === "driver" ? "driver_id" : "customer_id";
-  const r = await db
-    .prepare(`${RIDE_SELECT} WHERE r.${col} = ? AND r.status IN (${ACTIVE_SQL}) ORDER BY r.requested_at DESC LIMIT 1`)
-    .bind(userId)
-    .first();
+export async function getActiveRide(sql: Sql, userId: string, role: Role): Promise<RideView | null> {
+  const col = role === "driver" ? sql`r.driver_id` : sql`r.customer_id`;
+  const [r] = await sql`
+    ${rideSelect(sql)} WHERE ${col} = ${userId} AND r.status = ANY(${ACTIVE}::text[])
+    ORDER BY r.requested_at DESC LIMIT 1`;
   return r ? rowToRide(r) : null;
 }
 
-export async function listRides(db: D1Database, userId: string, role: Role, limit = 50): Promise<RideView[]> {
-  const col = role === "driver" ? "driver_id" : "customer_id";
-  const { results } = await db
-    .prepare(`${RIDE_SELECT} WHERE r.${col} = ? ORDER BY r.requested_at DESC LIMIT ?`)
-    .bind(userId, limit)
-    .all();
-  return results.map(rowToRide);
+export async function listRides(sql: Sql, userId: string, role: Role, limit = 50): Promise<RideView[]> {
+  const col = role === "driver" ? sql`r.driver_id` : sql`r.customer_id`;
+  const rows = await sql`${rideSelect(sql)} WHERE ${col} = ${userId} ORDER BY r.requested_at DESC LIMIT ${limit}`;
+  return rows.map(rowToRide);
 }
 
-/** Write-through of the hot ride state. Settlement fields and rating are owned by other writers. */
-export function upsertRideStmt(db: D1Database, r: RideView, idempotencyKey: string | null): D1PreparedStatement {
-  return db
-    .prepare(
-      `INSERT INTO rides (id, customer_id, driver_id, pickup_lat, pickup_lng, pickup_label, drop_lat, drop_lng, drop_label,
-         status, fare_estimate, fare_final, distance_m, payment_method, cancel_reason, cancelled_by, idempotency_key,
-         requested_at, accepted_at, arrived_at, started_at, completed_at, cancelled_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-       ON CONFLICT(id) DO UPDATE SET
-         driver_id = excluded.driver_id, status = excluded.status, fare_final = excluded.fare_final,
-         cancel_reason = excluded.cancel_reason, cancelled_by = excluded.cancelled_by,
-         accepted_at = excluded.accepted_at, arrived_at = excluded.arrived_at, started_at = excluded.started_at,
-         completed_at = excluded.completed_at, cancelled_at = excluded.cancelled_at`,
-    )
-    .bind(
-      r.id, r.customerId, r.driverId, r.pickup.lat, r.pickup.lng, r.pickup.label ?? null,
-      r.dropoff.lat, r.dropoff.lng, r.dropoff.label ?? null, r.status, r.fare, r.fareFinal, r.distanceM,
-      r.paymentMethod, r.cancelReason, r.cancelledBy, idempotencyKey, r.requestedAt, r.acceptedAt, r.arrivedAt,
-      r.startedAt, r.completedAt, r.cancelledAt,
-    );
+/** Completed rides of a driver since `since` (epoch ms): count, gross fare, net of commission. */
+export async function driverEarnings(sql: Sql, driverId: string, since: number, commissionRate: number) {
+  const [r] = await sql`
+    SELECT COUNT(*)::int8 AS count,
+           COALESCE(SUM(COALESCE(fare_final, fare_estimate)), 0)::int8 AS gross,
+           COALESCE(SUM(COALESCE(fare_final, fare_estimate)
+             - ROUND(COALESCE(fare_final, fare_estimate) * ${commissionRate}::numeric)), 0)::int8 AS net
+    FROM rides WHERE driver_id = ${driverId} AND status = 'COMPLETED' AND completed_at >= ${since}`;
+  return { count: r!.count as number, gross: r!.gross as number, net: r!.net as number };
 }
 
-export async function rateRide(db: D1Database, rideId: string, customerId: string, stars: number): Promise<boolean> {
-  const res = await db
-    .prepare("UPDATE rides SET rating = ? WHERE id = ? AND customer_id = ? AND status = 'COMPLETED' AND rating IS NULL")
-    .bind(stars, rideId, customerId)
-    .run();
-  return res.meta.changes > 0;
+async function upsertRideTx(tx: Tx, r: RideView, idempotencyKey: string | null) {
+  await tx`
+    INSERT INTO rides (id, customer_id, driver_id, pickup_lat, pickup_lng, pickup_label, drop_lat, drop_lng, drop_label,
+      status, fare_estimate, fare_final, distance_m, payment_method, cancel_reason, cancelled_by, idempotency_key,
+      requested_at, accepted_at, arrived_at, started_at, completed_at, cancelled_at)
+    VALUES (${r.id}, ${r.customerId}, ${r.driverId}, ${r.pickup.lat}, ${r.pickup.lng}, ${r.pickup.label ?? null},
+      ${r.dropoff.lat}, ${r.dropoff.lng}, ${r.dropoff.label ?? null}, ${r.status}, ${r.fare}, ${r.fareFinal}, ${r.distanceM},
+      ${r.paymentMethod}, ${r.cancelReason}, ${r.cancelledBy}, ${idempotencyKey}, ${r.requestedAt}, ${r.acceptedAt},
+      ${r.arrivedAt}, ${r.startedAt}, ${r.completedAt}, ${r.cancelledAt})
+    ON CONFLICT (id) DO UPDATE SET
+      driver_id = excluded.driver_id, status = excluded.status, fare_final = excluded.fare_final,
+      cancel_reason = excluded.cancel_reason, cancelled_by = excluded.cancelled_by,
+      accepted_at = excluded.accepted_at, arrived_at = excluded.arrived_at, started_at = excluded.started_at,
+      completed_at = excluded.completed_at, cancelled_at = excluded.cancelled_at
+    -- a terminal ride is final: a late or replayed write-through must not revive it
+    WHERE rides.status NOT IN ('COMPLETED', 'CANCELLED', 'NO_DRIVER')`;
+}
+
+export type CreateRideResult =
+  | { ok: true; ride: RideView; existing: boolean }
+  | { ok: false; code: ErrorCode; message: string };
+
+/**
+ * Insert a new ride synchronously (before dispatch). The database enforces, across every zone:
+ *  - one active ride per customer (`one_active_ride`), and
+ *  - idempotency per (customer, Idempotency-Key) (`rides_idem`) → the existing ride is returned.
+ * WALLET rides also place a hold on the customer's available balance in the same transaction.
+ */
+export async function createRide(sql: Sql, r: RideView, idempotencyKey: string | null): Promise<CreateRideResult> {
+  try {
+    return await sql.begin(async (tx) => {
+      await upsertRideTx(tx, r, idempotencyKey);
+      if (r.paymentMethod === "WALLET") {
+        const [w] = await tx`SELECT balance FROM wallets WHERE user_id = ${r.customerId} FOR UPDATE`;
+        const [h] = await tx`SELECT COALESCE(SUM(amount), 0)::int8 AS held FROM wallet_holds WHERE user_id = ${r.customerId} AND status = 'ACTIVE'`;
+        const available = ((w?.balance as number) ?? 0) - (h!.held as number);
+        if (available < r.fare) throw new InsufficientBalance(`balance ${available} < fare ${r.fare}`);
+        await tx`
+          INSERT INTO wallet_holds (ride_id, user_id, amount, status, created_at, updated_at)
+          VALUES (${r.id}, ${r.customerId}, ${r.fare}, 'ACTIVE', ${r.requestedAt}, ${r.requestedAt})`;
+      }
+      return { ok: true as const, ride: r, existing: false };
+    });
+  } catch (e) {
+    if (e instanceof InsufficientBalance) return { ok: false, code: "INSUFFICIENT_BALANCE", message: e.message };
+    if (!isUniqueViolation(e)) throw e;
+    if (idempotencyKey) {
+      const prev = await getRideByIdempotencyKey(sql, r.customerId, idempotencyKey);
+      if (prev) return { ok: true, ride: prev, existing: true };
+    }
+    const active = await getActiveRide(sql, r.customerId, "customer");
+    return { ok: false, code: "ACTIVE_RIDE_EXISTS", message: `active ride ${active?.id ?? "exists"}` };
+  }
+}
+
+class InsufficientBalance extends Error {}
+
+/** Write-through of the hot ride state; a cancelled / unmatched WALLET ride releases its hold. */
+export async function persistRide(sql: Sql, r: RideView, idempotencyKey: string | null): Promise<void> {
+  await sql.begin(async (tx) => {
+    await upsertRideTx(tx, r, idempotencyKey);
+    if (RELEASE_ON.includes(r.status))
+      await tx`UPDATE wallet_holds SET status = 'RELEASED', updated_at = ${Date.now()} WHERE ride_id = ${r.id} AND status = 'ACTIVE'`;
+  });
+}
+
+export async function rateRide(sql: Sql, rideId: string, customerId: string, stars: number): Promise<boolean> {
+  const res = await sql`
+    UPDATE rides SET rating = ${stars}
+    WHERE id = ${rideId} AND customer_id = ${customerId} AND status = 'COMPLETED' AND rating IS NULL`;
+  return res.count > 0;
 }
 
 // ---------------------------------------------------------------- wallet
@@ -181,17 +230,24 @@ export interface WalletTx {
   createdAt: number;
 }
 
-export async function getBalance(db: D1Database, userId: string): Promise<number> {
-  const r = await db.prepare("SELECT balance FROM wallets WHERE user_id = ?").bind(userId).first<{ balance: number }>();
-  return r?.balance ?? 0;
+export async function getBalance(sql: Sql, userId: string): Promise<number> {
+  const [r] = await sql`SELECT balance FROM wallets WHERE user_id = ${userId}`;
+  return (r?.balance as number) ?? 0;
 }
 
-export async function listTransactions(db: D1Database, userId: string, limit = 100): Promise<WalletTx[]> {
-  const { results } = await db
-    .prepare("SELECT * FROM wallet_transactions WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?")
-    .bind(userId, limit)
-    .all();
-  return results.map((r) => ({
+/** Balance plus the part of it held for an in-flight WALLET ride. */
+export async function getWallet(sql: Sql, userId: string): Promise<{ balance: number; held: number }> {
+  const [r] = await sql`
+    SELECT COALESCE(w.balance, 0)::int8 AS balance,
+           (SELECT COALESCE(SUM(amount), 0) FROM wallet_holds WHERE user_id = ${userId} AND status = 'ACTIVE')::int8 AS held
+    FROM (SELECT ${userId}::text AS id) u LEFT JOIN wallets w ON w.user_id = u.id`;
+  return { balance: r!.balance as number, held: r!.held as number };
+}
+
+export async function listTransactions(sql: Sql, userId: string, limit = 100): Promise<WalletTx[]> {
+  const rows = await sql`
+    SELECT * FROM wallet_transactions WHERE user_id = ${userId} ORDER BY created_at DESC, seq DESC LIMIT ${limit}`;
+  return rows.map((r) => ({
     id: r.id as string,
     type: r.type as WalletTxType,
     amount: r.amount as number,
@@ -201,23 +257,21 @@ export async function listTransactions(db: D1Database, userId: string, limit = 1
   }));
 }
 
-/**
- * Credit `amount` once per (user, idempotencyKey). Atomic: ledger row + balance in one batch,
- * the balance update is guarded by the existence of *this* call's ledger row.
- */
-export async function topup(db: D1Database, userId: string, amount: number, idemKey: string): Promise<number> {
-  const txId = newId("tx");
+/** Credit `amount` once per (user, idempotencyKey): ledger row + balance in one transaction. */
+export async function topup(sql: Sql, userId: string, amount: number, idemKey: string): Promise<number> {
   const now = Date.now();
-  await db.batch([
-    db.prepare(
-      `INSERT OR IGNORE INTO wallet_transactions (id, user_id, type, amount, balance_after, idempotency_key, created_at)
-       SELECT ?, user_id, 'TOPUP', ?, balance + ?, ?, ? FROM wallets WHERE user_id = ?`,
-    ).bind(txId, amount, amount, idemKey, now, userId),
-    db.prepare(
-      "UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ? AND EXISTS (SELECT 1 FROM wallet_transactions WHERE id = ?)",
-    ).bind(amount, now, userId, txId),
-  ]);
-  return getBalance(db, userId);
+  return sql.begin(async (tx) => {
+    const [w] = await tx`SELECT balance FROM wallets WHERE user_id = ${userId} FOR UPDATE`;
+    if (!w) throw new Error(`wallet missing for ${userId}`);
+    const balance = w.balance as number;
+    const inserted = await tx`
+      INSERT INTO wallet_transactions (id, user_id, type, amount, balance_after, idempotency_key, created_at)
+      VALUES (${newId("tx")}, ${userId}, 'TOPUP', ${amount}, ${balance + amount}, ${idemKey}, ${now})
+      ON CONFLICT (user_id, idempotency_key) DO NOTHING RETURNING id`;
+    if (!inserted.length) return balance;
+    await tx`UPDATE wallets SET balance = balance + ${amount}, updated_at = ${now} WHERE user_id = ${userId}`;
+    return balance + amount;
+  });
 }
 
 export interface SettleArgs {
@@ -236,72 +290,68 @@ export interface SettleResult {
 }
 
 /**
- * Settle a COMPLETED ride in ONE D1 batch (atomic), idempotent:
- *  - every insert is guarded by `rides.paid_at IS NULL` (set by the last statement) and
- *    UNIQUE(ride_id, user_id, type), so re-running never charges twice;
- *  - every balance update is guarded by the existence of the ledger row *this* run inserted,
- *    keeping `balance == SUM(amount)`;
- *  - WALLET deducts only `WHERE balance >= fare`; otherwise falls back to CASH (driver pays commission).
- * Mirrors the pure `settle()` in @gojek/core, but evaluated inside the transaction.
+ * Settle a COMPLETED ride in one transaction, idempotently (the ride row is locked and `paid_at`
+ * marks it settled; ledger rows are also UNIQUE(ride_id, user_id, type)):
+ *  - WALLET: customer pays the fare, driver earns fare − commission; the hold is captured.
+ *    If the balance is somehow short (no hold), it falls back to CASH.
+ *  - CASH: the driver owes the platform its commission.
+ * Mirrors the pure `settle()` in @gojek/core.
  */
-export async function settleRide(db: D1Database, a: SettleArgs): Promise<SettleResult> {
+export async function settleRide(sql: Sql, a: SettleArgs): Promise<SettleResult> {
   const now = Date.now();
   const commission = commissionOf(a.fare, a.commissionRate);
   const earning = a.fare - commission;
-  const payId = newId("tx");
-  const earnId = newId("tx");
-  const commId = newId("tx");
-  const unpaid = "NOT EXISTS (SELECT 1 FROM rides WHERE id = ?1 AND paid_at IS NOT NULL)";
-  const paidByWallet = "EXISTS (SELECT 1 FROM wallet_transactions WHERE ride_id = ?1 AND type = 'RIDE_PAYMENT')";
-  const txExists = "EXISTS (SELECT 1 FROM wallet_transactions WHERE id = ?)";
+  return sql.begin(async (tx) => {
+    const [ride] = await tx`SELECT paid_at, paid_via FROM rides WHERE id = ${a.rideId} FOR UPDATE`;
+    if (!ride) throw new Error(`ride ${a.rideId} not found`);
+    // lock both wallets in a fixed order (no deadlock between concurrent settlements)
+    const ws = await tx`
+      SELECT user_id, balance FROM wallets WHERE user_id IN (${a.customerId}, ${a.driverId}) ORDER BY user_id FOR UPDATE`;
+    const bal = new Map(ws.map((w) => [w.user_id as string, w.balance as number]));
+    const balance = (id: string) => bal.get(id) ?? 0;
 
-  const stmts: D1PreparedStatement[] = [];
-  if (a.paymentMethod === "WALLET") {
-    stmts.push(
-      db.prepare(
-        `INSERT OR IGNORE INTO wallet_transactions (id, user_id, type, amount, balance_after, ride_id, created_at)
-         SELECT ?2, user_id, 'RIDE_PAYMENT', -?3, balance - ?3, ?1, ?4 FROM wallets
-         WHERE user_id = ?5 AND balance >= ?3 AND ${unpaid}`,
-      ).bind(a.rideId, payId, a.fare, now, a.customerId),
-      db.prepare(`UPDATE wallets SET balance = balance - ?, updated_at = ? WHERE user_id = ? AND ${txExists}`)
-        .bind(a.fare, now, a.customerId, payId),
-      db.prepare(
-        `INSERT OR IGNORE INTO wallet_transactions (id, user_id, type, amount, balance_after, ride_id, created_at)
-         SELECT ?2, user_id, 'RIDE_EARNING', ?3, balance + ?3, ?1, ?4 FROM wallets
-         WHERE user_id = ?5 AND EXISTS (SELECT 1 FROM wallet_transactions WHERE id = ?6)`,
-      ).bind(a.rideId, earnId, earning, now, a.driverId, payId),
-      db.prepare(`UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ? AND ${txExists}`)
-        .bind(earning, now, a.driverId, earnId),
-    );
-  }
-  if (commission > 0) {
-    // CASH ride, or WALLET ride that fell back to cash: driver owes the platform its commission.
-    stmts.push(
-      db.prepare(
-        `INSERT OR IGNORE INTO wallet_transactions (id, user_id, type, amount, balance_after, ride_id, created_at)
-         SELECT ?2, user_id, 'COMMISSION', -?3, balance - ?3, ?1, ?4 FROM wallets
-         WHERE user_id = ?5 AND ${unpaid} AND NOT ${paidByWallet}`,
-      ).bind(a.rideId, commId, commission, now, a.driverId),
-      db.prepare(`UPDATE wallets SET balance = balance - ?, updated_at = ? WHERE user_id = ? AND ${txExists}`)
-        .bind(commission, now, a.driverId, commId),
-    );
-  }
-  stmts.push(
-    db.prepare(
-      `UPDATE rides SET
-         paid_via = CASE WHEN ${paidByWallet} THEN 'WALLET' ELSE 'CASH' END,
-         paid_at = ?2, fare_final = COALESCE(fare_final, ?3)
-       WHERE id = ?1 AND paid_at IS NULL`,
-    ).bind(a.rideId, now, a.fare),
-    db.prepare("SELECT paid_via FROM rides WHERE id = ?").bind(a.rideId),
-    db.prepare("SELECT user_id, balance FROM wallets WHERE user_id IN (?, ?)").bind(a.customerId, a.driverId),
-  );
+    let paidVia = ride.paid_via as PaymentMethod | null;
+    if (ride.paid_at === null) {
+      const entry = async (userId: string, type: WalletTxType, amount: number) => {
+        const after = balance(userId) + amount;
+        await tx`
+          INSERT INTO wallet_transactions (id, user_id, type, amount, balance_after, ride_id, created_at)
+          VALUES (${newId("tx")}, ${userId}, ${type}, ${amount}, ${after}, ${a.rideId}, ${now})`;
+        await tx`UPDATE wallets SET balance = ${after}, updated_at = ${now} WHERE user_id = ${userId}`;
+        bal.set(userId, after);
+      };
+      paidVia = "CASH";
+      if (a.paymentMethod === "WALLET" && balance(a.customerId) >= a.fare) {
+        await entry(a.customerId, "RIDE_PAYMENT", -a.fare);
+        await entry(a.driverId, "RIDE_EARNING", earning);
+        paidVia = "WALLET";
+      } else if (commission > 0) {
+        await entry(a.driverId, "COMMISSION", -commission);
+      }
+      await tx`
+        UPDATE wallet_holds SET status = ${paidVia === "WALLET" ? "CAPTURED" : "RELEASED"}, updated_at = ${now}
+        WHERE ride_id = ${a.rideId} AND status = 'ACTIVE'`;
+      await tx`
+        UPDATE rides SET paid_via = ${paidVia}, paid_at = ${now}, fare_final = COALESCE(fare_final, ${a.fare})
+        WHERE id = ${a.rideId}`;
+    }
+    return { paidVia: paidVia ?? "CASH", customerBalance: balance(a.customerId), driverBalance: balance(a.driverId) };
+  });
+}
 
-  const results = await db.batch(stmts);
-  const paidRow = results[results.length - 2]!.results[0] as { paid_via: PaymentMethod } | undefined;
-  const balances = results[results.length - 1]!.results as { user_id: string; balance: number }[];
-  const bal = (id: string) => balances.find((b) => b.user_id === id)?.balance ?? 0;
-  return { paidVia: paidRow?.paid_via ?? "CASH", customerBalance: bal(a.customerId), driverBalance: bal(a.driverId) };
+// ---------------------------------------------------------------- zones / dev
+
+export async function registerZone(sql: Sql, zone: string): Promise<void> {
+  await sql`INSERT INTO zones (zone, first_seen) VALUES (${zone}, ${Date.now()}) ON CONFLICT (zone) DO NOTHING`;
+}
+
+export async function listZones(sql: Sql): Promise<string[]> {
+  return (await sql`SELECT zone FROM zones`).map((r) => r.zone as string);
+}
+
+/** Dev only: wipe every table. */
+export async function wipeAll(sql: Sql): Promise<void> {
+  await sql`TRUNCATE wallet_holds, wallet_transactions, wallets, rides, vehicles, users, zones`;
 }
 
 export type { DriverInfo };
