@@ -63,10 +63,14 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
   - `zoneOfRide()` di `index.ts` (`/ws?rideId=`, `/rides/:id/cancel`): tolak kalau bukan geohash dengan panjang `zonePrecision`.
   - `POST /rides`: tolak jarak di atas batas dan titik jemput = tujuan.
 
-- [ ] **A8. Driver batal → cari driver lain** (§3.4)
-  - Ride kembali ke pencarian, driver yang batal masuk daftar `rejected`. Butuh transisi baru `ACCEPTED/ARRIVED → REQUESTED`.
-  - Ikut diurus: kosongkan `driverId` / `driver`, ulang `searchDeadline`, kabari customer lewat WebSocket ("mencari driver lagi").
-  - Di Postgres `driver_id` juga harus dikosongkan, kalau tidak `one_active_ride_driver` tetap mengunci driver yang batal.
+- [x] **A8. Driver batal → cari driver lain** (§3.4)
+  - Event baru `REQUEUE`: `ACCEPTED/ARRIVED → REQUESTED`. Driver tidak lagi bisa `CANCEL`; `/rides/:id/cancel` dari driver = `REQUEUE` (alasan tetap wajib).
+  - Postgres: satu transaksi `transitionRide` mengosongkan `driver_id`, `accepted_at`, `arrived_at`. Hold saldo tetap `ACTIVE` (customer masih memesan). Catatan: `one_active_ride_driver` adalah partial index (`ACCEPTED/ARRIVED/ON_TRIP`), jadi driver sudah lepas begitu status `REQUESTED`; `driver_id` dikosongkan supaya REST, riwayat driver, dan pemulihan tidak menunjuk driver lama.
+  - ZoneDO (`adopt`): driver masuk `rejected` + `dropoutDrivers`, `searchDeadline` diulang, timer `search:` + `dispatch:` dipasang, driver jadi `AVAILABLE`. Customer menerima `ride.requeued` lalu `ride.status` `REQUESTED`.
+  - Batas `MAX_REQUEUES` (3): driver ke-(N+1) yang batal → `CANCEL` oleh `system` (`drivers_cancelled`), hold dilepas.
+  - Pemulihan: `EVENT_FOR.REQUESTED = REQUEUE`, hanya diikuti kalau ride di DO punya driver (OFFERING di DO = REQUESTED di Postgres). Ulang batal dari driver yang sama setelah sukses → 200 (idempotent).
+  - Dites: `test/requeue.test.ts`.
+  - Sisa: jejak driver yang batal hanya di DO (`dropoutDrivers`); untuk penalti / cancel rate perlu tabel audit di Postgres.
 
 ## Tahap B — Sebelum ada pengguna & uang sungguhan
 

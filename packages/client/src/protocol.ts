@@ -71,6 +71,8 @@ export type ServerMsg =
   /** ON_TRIP and no location from the driver for a long while: ask the customer what happened */
   | { t: "ride.driver_lost"; rideId: string; lastSeenAt: number; autoCancelAt: number }
   | { t: "ride.driver_back"; rideId: string }
+  /** the driver dropped the ride before the trip: it is searched again (a `ride.status` REQUESTED follows) */
+  | { t: "ride.requeued"; rideId: string; reason: "DRIVER_CANCELLED" }
   | { t: "zone.moved"; zone: string; rideId?: string }
   | { t: "pong" }
   | { t: "error"; code: ErrorCode; message: string };

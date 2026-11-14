@@ -119,6 +119,12 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
           case "ride.driver_lost":
             if (m.rideId === rideId) setLost({ lastSeenAt: m.lastSeenAt, autoCancelAt: m.autoCancelAt });
             break;
+          case "ride.requeued":
+            if (m.rideId === rideId) {
+              setDriverPos(null);
+              flash("Driver membatalkan, mencari driver lain…");
+            }
+            break;
           case "ride.driver_back":
             if (m.rideId === rideId) {
               setLost(null);

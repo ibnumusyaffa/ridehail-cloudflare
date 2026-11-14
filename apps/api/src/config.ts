@@ -15,6 +15,8 @@ export interface Config {
   reserveTtlMs: number;
   searchTimeoutMs: number;
   researchDelayMs: number;
+  /** a driver dropping an accepted ride sends it back to the search, at most this many times per ride */
+  maxRequeues: number;
   topupMax: number;
   /** ON_TRIP without a driver location ping this long → ask the customer (and again every interval) */
   driverLostAskMs: number;
@@ -44,6 +46,7 @@ export function loadConfig(env: Env): Config {
     reserveTtlMs: num(env.RESERVE_TTL_MS, 20_000),
     searchTimeoutMs: num(env.SEARCH_TIMEOUT_MS, 120_000),
     researchDelayMs: num(env.RESEARCH_DELAY_MS, 5_000),
+    maxRequeues: num(env.MAX_REQUEUES, 3),
     topupMax: num(env.TOPUP_MAX, 1_000_000),
     driverLostAskMs: num(env.DRIVER_LOST_ASK_MS, 60 * 60_000),
     driverLostCancelMs: num(env.DRIVER_LOST_CANCEL_MS, 3 * 60 * 60_000),

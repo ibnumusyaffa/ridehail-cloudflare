@@ -7,6 +7,7 @@ export type RideEvent =
   | { type: "ARRIVE" }
   | { type: "START" }
   | { type: "COMPLETE" }
+  | { type: "REQUEUE" } // the driver dropped the ride before the trip: search for another one
   | { type: "CANCEL"; by: Role | "system" };
 
 export const ACTIVE_STATUSES: readonly RideStatus[] = ["REQUESTED", "OFFERING", "ACCEPTED", "ARRIVED", "ON_TRIP"];
@@ -18,7 +19,8 @@ export function isTerminal(s: RideStatus): boolean {
 
 const CANCELLABLE_BY: Record<Role | "system", readonly RideStatus[]> = {
   customer: ["REQUESTED", "OFFERING", "ACCEPTED", "ARRIVED"],
-  driver: ["ACCEPTED", "ARRIVED"],
+  // a driver never ends a ride: dropping one before the trip is REQUEUE (the search goes on)
+  driver: [],
   // ON_TRIP too: a trip whose driver went silent for hours (phone dead) must not lock the customer forever
   system: ["REQUESTED", "OFFERING", "ACCEPTED", "ARRIVED", "ON_TRIP"],
 };
@@ -37,6 +39,8 @@ function target(state: RideStatus, ev: RideEvent): RideStatus | null {
       return state === "ARRIVED" ? "ON_TRIP" : null;
     case "COMPLETE":
       return state === "ON_TRIP" ? "COMPLETED" : null;
+    case "REQUEUE":
+      return state === "ACCEPTED" || state === "ARRIVED" ? "REQUESTED" : null;
     case "CANCEL":
       return CANCELLABLE_BY[ev.by].includes(state) ? "CANCELLED" : null;
   }
@@ -50,6 +54,7 @@ const LANDS_ON: Partial<Record<RideEvent["type"], RideStatus>> = {
   COMPLETE: "COMPLETED",
   CANCEL: "CANCELLED",
   NO_CANDIDATE: "NO_DRIVER",
+  // no REQUEUE: a ride already REQUESTED has no driver to drop, so it is refused, not a duplicate
 };
 
 export interface Transition {

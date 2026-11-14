@@ -342,7 +342,10 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
                       const reason = prompt("Alasan batal?", "Kendaraan bermasalah");
                       if (!reason) return;
                       try {
-                        setRide((await api.cancel(ride.id, reason)).ride);
+                        // the ride is not ours anymore: it goes back to the search for another driver
+                        await api.cancel(ride.id, reason);
+                        setRide(null);
+                        flash("Ride dilepas, dicarikan driver lain");
                       } catch (e) {
                         flash((e as Error).message);
                       }

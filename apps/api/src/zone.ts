@@ -55,6 +55,8 @@ interface HotRide extends RideView {
   settleAttempts?: number;
   /** ON_TRIP and the driver went silent: the customer was asked what happened (see `watchDriver`) */
   driverLostAt?: number;
+  /** drivers who accepted this ride, then dropped it (REQUEUE); each one is also in `rejected` */
+  dropoutDrivers?: string[];
 }
 
 /**
@@ -84,6 +86,7 @@ const PG_FIELDS = [
 
 /** The event that leads to each status (used to adopt a status Postgres has and this actor does not). */
 const EVENT_FOR: Partial<Record<RideStatus, RideEvent["type"]>> = {
+  REQUESTED: "REQUEUE",
   ACCEPTED: "ACCEPT", ARRIVED: "ARRIVE", ON_TRIP: "START", COMPLETED: "COMPLETE", CANCELLED: "CANCEL", NO_DRIVER: "NO_CANDIDATE",
 };
 
@@ -476,7 +479,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
   private view(r: HotRide): RideView {
     const {
       idempotencyKey: _k, queue: _q, rejected: _r, offer: _o, searchDeadline: _d,
-      pgPending: _p, settleAttempts: _a, pending: _t, pgVersion: _v, driverLostAt: _l, ...v
+      pgPending: _p, settleAttempts: _a, pending: _t, pgVersion: _v, driverLostAt: _l, dropoutDrivers: _x, ...v
     } = r;
     return v;
   }
@@ -587,7 +590,9 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       if (ours) return { ok: true, ride: await this.adopt(ride, p.next, p.event, null, ctx), changed: true };
       // Postgres moved on without this actor knowing: it is the truth, follow it
       const event = EVENT_FOR[res.current.status];
-      if (res.current.status !== ride.status && event) {
+      // OFFERING is this actor's own detail of REQUESTED: only a ride that had a driver went back to the search
+      const moved = res.current.status === "REQUESTED" ? !ACTIVE_DISPATCH.has(ride.status) : res.current.status !== ride.status;
+      if (moved && event) {
         console.error("ride: following postgres", rideId, ride.status, "→", res.current.status);
         const adopted = await this.adopt(ride, res.current, event, null, {});
         return fail("INVALID_TRANSITION", `ride is ${adopted.status}`);
@@ -609,6 +614,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     settled: db.SettleResult | null,
     ctx: CommitCtx,
   ): Promise<HotRide> {
+    const before = ride.driverId; // REQUEUE: the driver who dropped the ride (Postgres no longer has it)
     const fields = ride as unknown as Record<string, unknown>;
     for (const k of PG_FIELDS) fields[k] = src[k];
     const offer = ride.offer;
@@ -618,7 +624,18 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       for (const k of ["offer", "search", "dispatch"]) this.cancelTimer(`${k}:${ride.id}`);
     }
     if (event === "COMPLETE" || event === "CANCEL") ride.driverLostAt = undefined;
+    if (event === "REQUEUE" && before) {
+      // a fresh search that never offers this ride to the driver who dropped it
+      ride.rejected.push(before);
+      ride.dropoutDrivers = [...(ride.dropoutDrivers ?? []), before];
+      ride.searchDeadline = Date.now() + this.cfg.searchTimeoutMs;
+    }
     this.saveRide(ride);
+    // same storage step as the save above: a ride back in the search always has its timers
+    if (event === "REQUEUE") {
+      await this.schedule(`search:${ride.id}`, ride.searchDeadline);
+      await this.schedule(`dispatch:${ride.id}`, Date.now());
+    }
     // same storage step as the save above: an unsettled completion always has its retry timer
     if (event === "COMPLETE" && !settled) await this.schedule(`settle:${ride.id}`, Date.now() + retryDelay(1));
     if (event === "START") await this.schedule(`watch:${ride.id}`, Date.now() + this.cfg.driverLostAskMs);
@@ -640,13 +657,15 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       d.offer = null;
       this.saveDriver(d);
     }
-    const freed = event === "CANCEL" && ride.driverId ? this.loadDriver(ride.driverId) : null;
+    const freedId = event === "CANCEL" ? ride.driverId : event === "REQUEUE" ? before : null;
+    const freed = freedId ? this.loadDriver(freedId) : null;
     if (freed && freed.rideId === ride.id) {
       this.setDriverFree(freed);
       freed.updatedAt = Date.now();
       this.saveDriver(freed);
     }
 
+    if (event === "REQUEUE") this.send(ride.customerId, { t: "ride.requeued", rideId: ride.id, reason: "DRIVER_CANCELLED" });
     this.notifyRide(ride);
     if (offer && offer.driverId !== ride.driverId)
       await this.stub(offer.zone).release(offer.driverId, ride.id, event === "NO_CANDIDATE" ? "NO_DRIVER" : "CANCELLED");
@@ -1201,7 +1220,8 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       const r = await this.ready(rideId);
       if (!r.ok) return r;
       const ride = r.ride;
-      if (role === "customer" ? ride.customerId !== userId : ride.driverId !== userId) return fail("FORBIDDEN");
+      if (role === "driver") return this.driverDrops(ride, userId);
+      if (ride.customerId !== userId) return fail("FORBIDDEN");
       if (ride.pgPending) return fail("INVALID_TRANSITION", "ride is still being created, try again shortly");
       const res = await this.commit(rideId, { type: "CANCEL", by: role }, (n) => {
         n.cancelReason = reason || null;
@@ -1211,6 +1231,32 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       if (!res.ok) return res;
       return { ok: true, ride: this.view(res.ride) };
     });
+  }
+
+  /**
+   * The driver drops the ride before the trip (in the ride's lane). The order stays: the ride goes back
+   * to the search without this driver (REQUEUE), the customer keeps the wallet hold. A ride its drivers
+   * dropped `maxRequeues` times is cancelled by the system instead, so a customer never waits forever.
+   */
+  private async driverDrops(ride: HotRide, driverId: string): Promise<Result<{ ride: RideView }>> {
+    // a retry of a drop that went through (its reply was lost): same answer
+    if (ride.dropoutDrivers?.includes(driverId)) return { ok: true, ride: this.view(ride) };
+    if (ride.driverId !== driverId) return fail("FORBIDDEN");
+    const res =
+      (ride.dropoutDrivers?.length ?? 0) >= this.cfg.maxRequeues
+        ? await this.commit(ride.id, { type: "CANCEL", by: "system" }, (n) => {
+            n.cancelReason = "drivers_cancelled";
+            n.cancelledBy = "system";
+            n.cancelledAt = Date.now();
+          })
+        : await this.commit(ride.id, { type: "REQUEUE" }, (n) => {
+            n.driverId = null;
+            n.driver = null;
+            n.acceptedAt = null;
+            n.arrivedAt = null;
+          });
+    if (!res.ok) return res;
+    return { ok: true, ride: this.view(res.ride) };
   }
 
   // ------------------------------------------------------------ trip route

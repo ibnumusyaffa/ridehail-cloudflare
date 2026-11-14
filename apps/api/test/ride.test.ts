@@ -187,7 +187,7 @@ describe("ride flow", () => {
     expect(res.json.error.code).toBe("INSUFFICIENT_BALANCE");
   });
 
-  it("driver after accept can cancel with a reason before pickup", async () => {
+  it("driver after accept can drop the ride with a reason before pickup → searched again", async () => {
     const p = spot();
     const c = await customer();
     const d = await onlineDriver(p.lat, p.lng);
@@ -197,7 +197,7 @@ describe("ride flow", () => {
     await d.ws.next(status("ACCEPTED"));
     expect((await api(`/rides/${json.rideId}/cancel`, { token: d.token, body: {} })).status).toBe(400);
     const res = await api(`/rides/${json.rideId}/cancel`, { token: d.token, body: { reason: "ban bocor" } });
-    expect(res.json.ride).toMatchObject({ status: "CANCELLED", cancelledBy: "driver" });
+    expect(res.json.ride).toMatchObject({ status: "REQUESTED", driverId: null, cancelledBy: null });
     expect((await d.ws.next((m) => m.t === "driver.state")).status).toBe("AVAILABLE");
     d.ws.close();
   });

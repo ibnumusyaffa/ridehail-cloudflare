@@ -37,6 +37,8 @@
     "SEARCH_TIMEOUT_MS": "120000",
     "RESEARCH_DELAY_MS": "5000",
     "TOPUP_MAX": "1000000",
+    // a ride its drivers dropped this many times is searched again no more: the system cancels it
+    "MAX_REQUEUES": "3",
     // ON_TRIP driver without a location ping: ask the customer every hour, cancel by system after 3 hours
     "DRIVER_LOST_ASK_MS": "3600000",
     "DRIVER_LOST_CANCEL_MS": "10800000",

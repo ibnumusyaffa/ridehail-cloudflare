@@ -27,12 +27,18 @@ describe("ride state machine", () => {
   it("cancel rules", () => {
     for (const s of ["REQUESTED", "OFFERING", "ACCEPTED", "ARRIVED"] as RideStatus[])
       expect(applyRideEvent(s, { type: "CANCEL", by: "customer" }).status).toBe("CANCELLED");
-    for (const s of ["ACCEPTED", "ARRIVED"] as RideStatus[])
-      expect(applyRideEvent(s, { type: "CANCEL", by: "driver" }).status).toBe("CANCELLED");
-    expect(() => applyRideEvent("OFFERING", { type: "CANCEL", by: "driver" })).toThrow(/INVALID_TRANSITION|cannot/);
+    // a driver never ends a ride: dropping it sends the ride back to the search (REQUEUE)
+    for (const s of ALL.filter((x) => x !== "CANCELLED")) expect(() => applyRideEvent(s, { type: "CANCEL", by: "driver" }), s).toThrow(/INVALID_TRANSITION|cannot/);
     expect(() => applyRideEvent("ON_TRIP", { type: "CANCEL", by: "customer" })).toThrow();
     expect(() => applyRideEvent("ON_TRIP", { type: "CANCEL", by: "driver" })).toThrow();
     expect(() => applyRideEvent("COMPLETED", { type: "CANCEL", by: "customer" })).toThrow();
+  });
+
+  it("driver drops an accepted ride → back to REQUESTED", () => {
+    for (const s of ["ACCEPTED", "ARRIVED"] as RideStatus[])
+      expect(applyRideEvent(s, { type: "REQUEUE" })).toEqual({ status: "REQUESTED", changed: true });
+    // not a no-op on a searching ride: there is no driver to drop
+    expect(() => applyRideEvent("REQUESTED", { type: "REQUEUE" })).toThrow(/INVALID_TRANSITION|cannot/);
   });
 
   it("system may end a trip whose driver went silent", () => {
@@ -55,6 +61,7 @@ describe("ride state machine", () => {
       ARRIVE: ["ACCEPTED", "ARRIVED"],
       START: ["ARRIVED", "ON_TRIP"],
       COMPLETE: ["ON_TRIP", "COMPLETED"],
+      REQUEUE: ["ACCEPTED", "ARRIVED"],
     };
     for (const [type, ok] of Object.entries(valid)) {
       for (const s of ALL) {
