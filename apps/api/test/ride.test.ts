@@ -129,7 +129,7 @@ describe("ride flow", () => {
     expect(d.ws.inbox.filter((m) => m.t === "offer")).toHaveLength(0); // never double-offered
     d.ws.send({ t: "offer.accept", rideId: offer.rideId });
     await d.ws.next(status("ACCEPTED"));
-    // the other ride ends with NO_DRIVER (researched once, nobody free)
+    // the other ride ends with NO_DRIVER at the search deadline (nobody free)
     const loser = offer.rideId === r1.json.rideId ? r2 : r1;
     const loserToken = loser === r1 ? c1.token : c2.token;
     const lws = await Client.connect({ token: loserToken, rideId: loser.json.rideId });

@@ -38,11 +38,14 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
 
 ### P1 — Hasil salah / bisa dicurangi
 
-- [ ] **A4. Pencarian driver yang andal** (§3.2, §3.6, §3.9) — satu fungsi (`dispatch` / `findCandidates`), kerjakan sekaligus
-  - Timer penjaga `dispatch:` yang selalu ada selama `REQUESTED`/`OFFERING`, dipasang sebelum tiap langkah (reserve, release, persist). Menutup: panggilan `dispatch` yang terbuang oleh penanda `dispatching`, RPC antar-zona yang gagal (`runTimer` hanya log), DO mati di tengah pencarian.
-  - Buang tanda `searched` / `researched` (`searched` tidak pernah tersimpan, `zone.ts:730-733`). Aturan baru: selama belum lewat `SEARCH_TIMEOUT_MS`, cari ulang tiap `RESEARCH_DELAY_MS`.
-  - `findCandidates`: `Promise.allSettled`, zona tetangga yang gagal diabaikan.
-  - Selesai jika: (1) driver menolak saat tawaran pertama masih ditulis → ride lanjut ke kandidat berikutnya; (2) RPC `reserveAndOffer` yang error dicoba ulang; (3) driver yang online 20 detik setelah order tetap ditawari, `NO_DRIVER` baru setelah 120 detik.
+- [x] **A4. Pencarian driver yang andal** (§3.2, §3.6, §3.9)
+  - `dispatch` jalan di lane ride (`serial`), penanda `dispatching` dibuang. Tolak / terima / batal yang datang di tengah langkah menunggu, tidak hilang. `offerRejected`, timeout tawaran, dan `DRIVER_BUSY` cukup memasang `dispatch:` di `now`.
+  - Timer penjaga `dispatch:` (`DISPATCH_RETRY_MS`, 2 detik) dipasang sebelum tiap langkah yang bisa gagal, diganti `offer:` setelah tawaran berdiri. `rearmTimers` memasang `dispatch:` untuk tiap ride `REQUESTED`/`OFFERING` (DO mati di tengah langkah).
+  - Tawaran ditulis dulu (`offer.reserving`) sebelum RPC `reserveAndOffer`. RPC error / DO mati → driver yang sama dicoba ulang (maks `RESERVE_TRIES` = 3), lalu kandidat berikutnya. `reserveAndOffer` idempotent per ride.
+  - Tanda `searched` / `researched` dibuang. Aturan: selama belum lewat `searchDeadline`, cari ulang tiap `RESEARCH_DELAY_MS`; `NO_DRIVER` dari timer `search:`.
+  - `findCandidates`: `Promise.allSettled`, zona gagal dilewati; kalau semua zona gagal, langkah gagal dan timer penjaga mengulang.
+  - Dites: `test/dispatch.test.ts`. Test lama memakai `SEARCH_TIMEOUT_MS=3000`.
+  - Sisa: belum ada test untuk DO mati di tengah pencarian (`rearmTimers`).
 
 - [ ] **A5. Cek lokasi untuk Tiba dan Selesai** (§3.3)
   - `ARRIVE` hanya jika driver dekat titik jemput; `COMPLETE` hanya jika dekat tujuan. Jarak batas masuk config.

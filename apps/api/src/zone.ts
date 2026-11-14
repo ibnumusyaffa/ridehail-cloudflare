@@ -38,9 +38,12 @@ interface HotRide extends RideView {
   idempotencyKey: string | null;
   queue: (Candidate & { zone: string })[];
   rejected: string[];
-  offer: { driverId: string; zone: string; expiresAt: number } | null;
-  searched: boolean;
-  researched: boolean;
+  /**
+   * The driver this ride is offered to. `reserving`: written before the `reserveAndOffer` RPC, whose
+   * outcome is unknown until it returns — if it threw or this actor died, the next dispatch step
+   * retries the same driver (the reservation is idempotent) up to RESERVE_TRIES times.
+   */
+  offer: { driverId: string; zone: string; expiresAt: number; reserving?: boolean; tries?: number } | null;
   searchDeadline: number;
   /** written to this actor, Postgres insert not confirmed yet (see createRide / recoverCreate) */
   pgPending?: boolean;
@@ -152,6 +155,10 @@ const SNAPSHOT_MS = 30_000;
 const ALARM_CONCURRENCY = 16;
 /** a ride still pgPending (or with a pending transition) after this long is checked against Postgres */
 const CREATE_RECOVERY_MS = 5_000;
+/** a dispatch step that did not reach a resting state (RPC failed, actor died) is run again after this */
+const DISPATCH_RETRY_MS = 2_000;
+/** attempts to reserve one candidate whose `reserveAndOffer` RPC failed before moving on to the next */
+const RESERVE_TRIES = 3;
 
 /** Backoff for Postgres retries (pending transitions, settlement): 2 s, 4 s, … capped at 60 s. */
 const retryDelay = (attempt: number) => Math.min(60_000, 1_000 * 2 ** Math.min(attempt, 6));
@@ -176,7 +183,6 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
   private sql: SqlStorage;
   private zone: string | null;
   private registered: boolean;
-  private dispatching = new Set<string>();
   private pos = new Map<string, Pos>();
   private grid = new Map<string, Set<string>>();
   private gridPrecision: number;
@@ -225,6 +231,13 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     for (const r of rows) this.sql.exec("INSERT OR IGNORE INTO timers (key, at) VALUES (?, ?)", `${r.kind}:${r.id}`, now);
     // every trip is watched for a driver gone silent
     this.sql.exec("INSERT OR IGNORE INTO timers (key, at) SELECT 'watch:' || id, ? FROM rides WHERE status = 'ON_TRIP'", now);
+    // every search goes on (a step that was running when this actor died left no timer behind)
+    this.sql.exec(
+      `INSERT OR IGNORE INTO timers (key, at) SELECT 'dispatch:' || id, ? FROM rides
+       WHERE status IN ('REQUESTED', 'OFFERING') AND json_extract(data, '$.pending') IS NULL
+         AND json_extract(data, '$.pgPending') IS NOT 1`,
+      now,
+    );
     const next = this.sql.exec<{ at: number | null }>("SELECT MIN(at) AS at FROM timers").one().at;
     if (next === null) return;
     const cur = await this.ctx.storage.getAlarm();
@@ -306,7 +319,6 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     this.initSchema();
     this.zone = this.ctx.id.name ?? null;
     this.registered = false;
-    this.dispatching.clear();
     this.pos.clear();
     this.grid.clear();
     this.nextAlarm = null;
@@ -449,7 +461,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
 
   private view(r: HotRide): RideView {
     const {
-      idempotencyKey: _k, queue: _q, rejected: _r, offer: _o, searched: _s, researched: _rs, searchDeadline: _d,
+      idempotencyKey: _k, queue: _q, rejected: _r, offer: _o, searchDeadline: _d,
       pgPending: _p, settleAttempts: _a, pending: _t, pgVersion: _v, driverLostAt: _l, ...v
     } = r;
     return v;
@@ -634,7 +646,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
 
   /** A search that was paused for a transition that did not happen goes on. */
   private async resumeDispatch(ride: HotRide) {
-    if (ACTIVE_DISPATCH.has(ride.status) && !ride.offer && !ride.pgPending) await this.schedule(`dispatch:${ride.id}`, Date.now());
+    if (ACTIVE_DISPATCH.has(ride.status) && (!ride.offer || ride.offer.reserving) && !ride.pgPending) await this.schedule(`dispatch:${ride.id}`, Date.now());
   }
 
   /**
@@ -815,12 +827,17 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     return rankCandidates(pickup, drivers, { now: Date.now(), exclude: new Set(exclude), cfg: this.cfg.match });
   }
 
-  /** Atomic reservation (single writer): only an AVAILABLE, connected driver can be reserved. */
+  /**
+   * Atomic reservation (single writer): only an AVAILABLE, connected driver can be reserved.
+   * Idempotent per ride, so the ride's zone can retry it when the reply was lost.
+   */
   async reserveAndOffer(driverId: string, offer: OfferPayload, ttlMs: number): Promise<boolean> {
     const d = this.loadDriver(driverId);
     const now = Date.now();
     if (!d) return false;
-    const free = d.status === "AVAILABLE" || (d.status === "RESERVED" && (d.reservedUntil ?? 0) < now);
+    // a retry of a reservation whose reply was lost: same ride, still reserved → offer it again
+    const again = d.status === "RESERVED" && d.rideId === offer.rideId;
+    const free = again || d.status === "AVAILABLE" || (d.status === "RESERVED" && (d.reservedUntil ?? 0) < now);
     if (!free || !this.connected(driverId)) return false;
     d.status = "RESERVED";
     d.rideId = offer.rideId;
@@ -881,8 +898,6 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       queue: [],
       rejected: [],
       offer: null,
-      searched: false,
-      researched: false,
       searchDeadline: now + this.cfg.searchTimeoutMs,
       pgPending: true,
     };
@@ -957,72 +972,102 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     await this.activate(cur);
   }
 
-  /** Sequential offering: reserve next candidate, offer, wait for accept / reject / timeout. */
-  private async dispatch(rideId: string): Promise<void> {
-    if (this.dispatching.has(rideId)) return;
-    this.dispatching.add(rideId);
-    try {
-      for (;;) {
-        let ride = this.loadRide(rideId);
-        // a pending transition (cancel / no driver) pauses the search; resumeDispatch picks it up again
-        if (!ride || ride.pgPending || ride.pending || !ACTIVE_DISPATCH.has(ride.status) || ride.offer) return;
-        if (Date.now() >= ride.searchDeadline) return this.noDriver(rideId);
+  /**
+   * Sequential offering: reserve the next candidate, offer, wait for accept / reject / timeout.
+   *
+   * Runs in the ride's lane, so a reject / accept / cancel arriving mid-step waits for the step instead
+   * of being lost, and steps never overlap. While a ride is searching, something always runs this
+   * again: the `dispatch:` timer is set before every step that can fail (an RPC to another zone, this
+   * actor dying) and replaced by the `offer:` timer once an offer stands. Every step decides from the
+   * stored ride alone, so running it again is always safe.
+   */
+  private dispatch(rideId: string): Promise<void> {
+    return this.serial(rideId, () => this.dispatchStep(rideId));
+  }
 
+  private async dispatchStep(rideId: string): Promise<void> {
+    for (;;) {
+      let ride = this.loadRide(rideId);
+      // a pending transition (cancel / no driver) pauses the search; resumeDispatch picks it up again
+      if (!ride || ride.pgPending || ride.pending || !ACTIVE_DISPATCH.has(ride.status)) return;
+      if (ride.offer && !ride.offer.reserving) return; // an offer stands: its `offer:` timer moves on
+      if (Date.now() >= ride.searchDeadline) return this.endSearch(rideId);
+      await this.schedule(`dispatch:${rideId}`, Date.now() + DISPATCH_RETRY_MS);
+
+      let target = ride.offer; // a reservation whose outcome is unknown: retry the same driver
+      if (target && (target.tries ?? 0) >= RESERVE_TRIES) {
+        ride.offer = null;
+        ride.rejected.push(target.driverId);
+        this.saveRide(ride);
+        await this.releaseQuietly(target.zone, target.driverId, rideId, "TIMEOUT");
+        continue;
+      }
+      if (!target) {
         if (ride.queue.length === 0) {
-          if (ride.searched && ride.researched) return this.noDriver(rideId);
-          if (ride.searched) ride.researched = true;
-          ride.searched = true;
           const found = await this.findCandidates(ride);
           ride = this.loadRide(rideId);
-          if (!ride || !ACTIVE_DISPATCH.has(ride.status) || ride.offer) return;
-          ride.queue = found;
-          this.saveRide(ride);
+          if (!ride || ride.pending || !ACTIVE_DISPATCH.has(ride.status) || ride.offer) return;
           if (found.length === 0) {
-            if (ride.researched) return this.noDriver(rideId);
-            // nobody nearby right now: search once more shortly (drivers may come online)
-            ride.researched = true;
-            this.saveRide(ride);
-            await this.schedule(`dispatch:${rideId}`, Date.now() + this.cfg.researchDelayMs);
-            return;
+            // nobody free nearby right now: drivers come online, finish trips — look again shortly
+            return void (await this.schedule(`dispatch:${rideId}`, Date.now() + this.cfg.researchDelayMs));
           }
+          ride.queue = found;
         }
-
         const c = ride.queue.shift()!;
-        this.saveRide(ride);
-        const offer: OfferPayload = {
-          rideId,
-          pickup: ride.pickup,
-          dropoff: ride.dropoff,
-          fare: ride.fare,
-          distanceM: ride.distanceM,
-          paymentMethod: ride.paymentMethod,
-          expiresAt: Date.now() + this.cfg.offerTimeoutMs,
-        };
-        const reserved = await this.stub(c.zone).reserveAndOffer(c.driverId, offer, this.cfg.reserveTtlMs);
+        target = { driverId: c.driverId, zone: c.zone, expiresAt: 0, reserving: true, tries: 0 };
+      }
+      const offer: OfferPayload = {
+        rideId,
+        pickup: ride.pickup,
+        dropoff: ride.dropoff,
+        fare: ride.fare,
+        distanceM: ride.distanceM,
+        paymentMethod: ride.paymentMethod,
+        expiresAt: Date.now() + this.cfg.offerTimeoutMs,
+      };
+      // write-ahead: if the RPC below throws or this actor dies, the next step knows whom to retry
+      ride.offer = { ...target, expiresAt: offer.expiresAt, reserving: true, tries: (target.tries ?? 0) + 1 };
+      this.saveRide(ride);
+      const reserved = await this.stub(target.zone).reserveAndOffer(target.driverId, offer, this.cfg.reserveTtlMs);
 
-        ride = this.loadRide(rideId);
-        if (!ride || ride.pending || !ACTIVE_DISPATCH.has(ride.status) || ride.offer) {
-          // cancelled (or otherwise moved on) while we were reserving
-          if (reserved) await this.stub(c.zone).release(c.driverId, rideId, "CANCELLED");
-          return;
-        }
-        if (!reserved) continue; // busy / gone: next candidate
-
-        const first = ride.status === "REQUESTED";
-        this.transition(ride, { type: "OFFER" });
-        ride.offer = { driverId: c.driverId, zone: c.zone, expiresAt: offer.expiresAt };
-        this.saveRide(ride);
-        await this.schedule(`offer:${rideId}`, offer.expiresAt);
-        // OFFERING is this actor's own detail of searching: Postgres keeps the ride REQUESTED
-        if (first) this.notifyRide(ride);
+      ride = this.loadRide(rideId);
+      if (!ride || ride.pending || !ACTIVE_DISPATCH.has(ride.status) || ride.offer?.driverId !== target.driverId) {
+        // moved on while we were reserving
+        if (reserved) await this.releaseQuietly(target.zone, target.driverId, rideId, "CANCELLED");
         return;
       }
-    } finally {
-      this.dispatching.delete(rideId);
+      if (!reserved) {
+        // busy / gone: next candidate
+        ride.offer = null;
+        this.saveRide(ride);
+        continue;
+      }
+
+      const first = ride.status === "REQUESTED";
+      this.transition(ride, { type: "OFFER" });
+      ride.offer = { driverId: target.driverId, zone: target.zone, expiresAt: offer.expiresAt };
+      this.saveRide(ride);
+      await this.schedule(`offer:${rideId}`, offer.expiresAt);
+      this.cancelTimer(`dispatch:${rideId}`);
+      // OFFERING is this actor's own detail of searching: Postgres keeps the ride REQUESTED
+      if (first) this.notifyRide(ride);
+      return;
     }
   }
 
-  /** Rings of geohash cells (fine → coarse), each fanned out to the zones that own them. */
+  /** Free a driver reserved for this ride; a failure only logs (the reservation expires on its own). */
+  private async releaseQuietly(zone: string, driverId: string, rideId: string, reason: string) {
+    try {
+      await this.stub(zone).release(driverId, rideId, reason);
+    } catch (e) {
+      console.error("release failed", rideId, driverId, e);
+    }
+  }
+
+  /**
+   * Rings of geohash cells (fine → coarse), each fanned out to the zones that own them. A zone that
+   * fails is skipped; only when every zone of a ring fails does the search fail (and is retried).
+   */
   private async findCandidates(ride: HotRide): Promise<(Candidate & { zone: string })[]> {
     const exclude = ride.rejected;
     for (const precision of this.cfg.match.ringPrecisions) {
@@ -1032,11 +1077,17 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
         const z = cell.slice(0, this.cfg.zonePrecision);
         byZone.set(z, [...(byZone.get(z) ?? []), cell]);
       }
-      const lists = await Promise.all(
+      const results = await Promise.allSettled(
         [...byZone].map(async ([zone, zcells]) =>
           (await this.stub(zone).nearest(zcells, ride.pickup, exclude)).map((c) => ({ ...c, zone })),
         ),
       );
+      const lists: (Candidate & { zone: string })[][] = [];
+      for (const r of results) {
+        if (r.status === "fulfilled") lists.push(r.value);
+        else console.error("search: zone failed", ride.id, r.reason);
+      }
+      if (lists.length === 0) throw new Error("search: every zone failed");
       const merged = lists.flat().sort((a, b) => a.distanceM - b.distanceM).slice(0, this.cfg.match.k);
       if (merged.length) return merged;
     }
@@ -1045,26 +1096,28 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
 
   /** Search is over without a driver. If Postgres can't record it now, the `sync:` timer will. */
   private noDriver(rideId: string): Promise<void> {
-    return this.serial(rideId, async () => {
-      const ride = this.loadRide(rideId);
-      if (!ride || ride.pending || !ACTIVE_DISPATCH.has(ride.status)) return;
-      const res = await this.commit(rideId, { type: "NO_CANDIDATE" }, () => {});
-      if (!res.ok) console.error("no driver: not recorded yet", rideId, res.code);
-    });
+    return this.serial(rideId, () => this.endSearch(rideId));
   }
 
-  private async onOfferTimeout(rideId: string) {
+  /** `noDriver` from inside the ride's lane. */
+  private async endSearch(rideId: string): Promise<void> {
     const ride = this.loadRide(rideId);
-    if (!ride?.offer || ride.status !== "OFFERING") return;
-    // an accept / cancel is on its way to Postgres: let it conclude first
-    if (ride.pending) return void (await this.schedule(`offer:${rideId}`, Date.now() + CREATE_RECOVERY_MS));
-    if (Date.now() < ride.offer.expiresAt) return void (await this.schedule(`offer:${rideId}`, ride.offer.expiresAt));
-    const o = ride.offer;
-    ride.offer = null;
-    ride.rejected.push(o.driverId);
-    this.saveRide(ride);
-    await this.stub(o.zone).release(o.driverId, rideId, "TIMEOUT");
-    await this.dispatch(rideId);
+    if (!ride || ride.pending || !ACTIVE_DISPATCH.has(ride.status)) return;
+    const res = await this.commit(rideId, { type: "NO_CANDIDATE" }, () => {});
+    if (!res.ok) console.error("no driver: not recorded yet", rideId, res.code);
+  }
+
+  private onOfferTimeout(rideId: string): Promise<void> {
+    return this.serial(rideId, async () => {
+      const ride = this.loadRide(rideId);
+      if (!ride?.offer || ride.offer.reserving || ride.status !== "OFFERING") return;
+      // an accept / cancel is on its way to Postgres: let it conclude first
+      if (ride.pending) return void (await this.schedule(`offer:${rideId}`, Date.now() + CREATE_RECOVERY_MS));
+      if (Date.now() < ride.offer.expiresAt) return void (await this.schedule(`offer:${rideId}`, ride.offer.expiresAt));
+      const o = ride.offer;
+      await this.dropOffer(ride, o.driverId); // arms `dispatch:` before anything that can fail
+      await this.releaseQuietly(o.zone, o.driverId, rideId, "TIMEOUT");
+    });
   }
 
   private async onSearchTimeout(rideId: string) {
@@ -1073,18 +1126,22 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
 
   async offerRejected(rideId: string, driverId: string): Promise<void> {
     this.learnZone(zoneOfRide(rideId));
-    const ride = this.loadRide(rideId);
-    if (!ride || ride.offer?.driverId !== driverId || ride.pending?.event === "ACCEPT") return;
-    this.dropOffer(ride, driverId);
-    await this.dispatch(rideId);
+    // in the lane: a reject that races the offer's reservation waits for it instead of being dropped
+    await this.serial(rideId, async () => {
+      const ride = this.loadRide(rideId);
+      if (!ride || ride.offer?.driverId !== driverId || ride.pending?.event === "ACCEPT") return;
+      await this.dropOffer(ride, driverId);
+    });
   }
 
   /** The offered driver is out (rejected, busy elsewhere): never offer them this ride again. */
-  private dropOffer(ride: HotRide, driverId: string) {
+  private async dropOffer(ride: HotRide, driverId: string) {
     ride.offer = null;
     ride.rejected.push(driverId);
     this.saveRide(ride);
     this.cancelTimer(`offer:${ride.id}`);
+    // the search goes on from the alarm: off the caller's path, and it survives this actor dying
+    await this.schedule(`dispatch:${ride.id}`, Date.now());
   }
 
   async acceptOffer(
@@ -1092,8 +1149,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     driver: DriverInfo & { lat: number | null; lng: number | null; heading: number | null },
   ): Promise<Result<{ ride: RideView }>> {
     this.learnZone(zoneOfRide(rideId));
-    let busy = false;
-    const res = await this.serial(rideId, async (): Promise<Result<{ ride: RideView }>> => {
+    return this.serial(rideId, async (): Promise<Result<{ ride: RideView }>> => {
       const r = await this.ready(rideId);
       if (!r.ok) return r;
       const ride = r.ride;
@@ -1114,15 +1170,12 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
         const cur = this.loadRide(rideId);
         if (c.code === "DRIVER_BUSY" && cur?.offer?.driverId === driver.id) {
           // the driver holds an active ride in another zone (Postgres says so): next candidate
-          this.dropOffer(cur, driver.id);
-          busy = true;
+          await this.dropOffer(cur, driver.id);
         }
         return c;
       }
       return { ok: true, ride: this.view(c.ride) };
     });
-    if (busy) await this.dispatch(rideId); // outside the lane: dispatch may record NO_DRIVER through it
-    return res;
   }
 
   async cancelRide(rideId: string, userId: string, role: Role, reason: string): Promise<Result<{ ride: RideView }>> {

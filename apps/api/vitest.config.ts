@@ -22,6 +22,8 @@ export default defineConfig({
           OFFER_TIMEOUT_MS: "1500",
           RESERVE_TTL_MS: "2000",
           RESEARCH_DELAY_MS: "300",
+          // a search with nobody around ends at this deadline (120 s by default)
+          SEARCH_TIMEOUT_MS: "3000",
           // tests send pings back to back; the throttle itself is unit-tested in @gojek/core
           LOC_MIN_INTERVAL_MS: "0",
           LOC_MIN_INTERVAL_ON_RIDE_MS: "0",
