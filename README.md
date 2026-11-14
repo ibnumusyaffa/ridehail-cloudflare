@@ -76,7 +76,7 @@ Status driver: `OFFLINE`, `AVAILABLE`, `RESERVED` (sedang ditawari), `ON_RIDE`.
 
 - ID ride = `<zona>_<uuid>`, jadi siapa pun tahu zona pemilik ride tanpa lookup.
 - Posisi driver disimpan **di memori** ZoneDO (+ grid geohash 6), disalin ke SQLite tiap 30 detik. Satu ping lokasi tidak menulis ke storage.
-- Pencarian: sel geohash 6 + 8 tetangga dulu; kalau kosong, geohash 5 + 8 tetangga. Maksimal 5 km, 10 kandidat terdekat (jarak lurus). Zona tetangga ditanya paralel.
+- Pencarian: sel geohash 6 + 8 tetangga dulu; kalau kosong, geohash 5 + 8 tetangga. Maksimal 2 km dari titik jemput (`maxRadiusM` di `packages/core/src/matcher.ts`, jarak lurus), 10 kandidat terdekat. Zona tetangga ditanya paralel.
 - Tawaran berurutan. `reserveAndOffer` hanya berhasil untuk driver `AVAILABLE` yang tersambung; kalau gagal lanjut kandidat berikutnya. Tawaran 15 detik, reservasi 20 detik.
 - Pencarian berhenti (`NO_DRIVER`) setelah dua kali hasil kosong (jeda 5 detik) atau lewat 2 menit. Lihat catatan di [ARCHITECTURE-REVIEW.md](ARCHITECTURE-REVIEW.md) §3.2.
 - Setelah menerima, driver **pindah ke zona ride** selama perjalanan (`zone.moved` → client reconnect), jadi customer, driver, dan ride ada di satu ZoneDO.

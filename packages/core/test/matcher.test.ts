@@ -9,7 +9,7 @@ const d = (id: string, dLat: number, extra: Partial<DriverSnapshot> = {}): Drive
 
 describe("rankCandidates", () => {
   it("orders by distance", () => {
-    const r = rankCandidates(pickup, [d("far", 0.02), d("near", 0.001), d("mid", 0.01)], { now });
+    const r = rankCandidates(pickup, [d("far", 0.015), d("near", 0.001), d("mid", 0.01)], { now });
     expect(r.map((c) => c.driverId)).toEqual(["near", "mid", "far"]);
   });
   it("skips busy, stale, rejected and too-far drivers", () => {
@@ -28,6 +28,11 @@ describe("rankCandidates", () => {
       { now, exclude: new Set(["rejected"]) },
     );
     expect(r.map((c) => c.driverId)).toEqual(["ok", "lapsed"]);
+  });
+  it("pickup radius is 2 km by default", () => {
+    // 0.001° latitude ≈ 111 m
+    const r = rankCandidates(pickup, [d("in", 0.017), d("out", 0.019)], { now }); // ~1.9 km, ~2.1 km
+    expect(r.map((c) => c.driverId)).toEqual(["in"]);
   });
   it("takes top k and dedups", () => {
     const many = Array.from({ length: 20 }, (_, i) => d(`d${i}`, i * 0.0001));

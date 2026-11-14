@@ -140,6 +140,20 @@ describe("ride flow", () => {
     lws.close();
   });
 
+  it("a driver more than 2 km from the pickup is never offered the ride", async () => {
+    const p = spot();
+    const c = await customer();
+    const far = await onlineDriver(off(p, 0.0225).lat, p.lng, "Jauh"); // ~2.5 km north
+    const { json } = await requestRide(c.token, p);
+    const ws = await Client.connect({ token: c.token, rideId: json.rideId });
+    await ws.next("hello");
+    ws.send({ t: "resume", rideId: json.rideId });
+    await ws.next(status("NO_DRIVER"), 5_000);
+    expect(far.ws.inbox.filter((m) => m.t === "offer")).toHaveLength(0);
+    far.ws.close();
+    ws.close();
+  });
+
   it("no driver nearby → NO_DRIVER", async () => {
     const c = await customer();
     const { json } = await requestRide(c.token, { lat: -7.9, lng: 112.6 });

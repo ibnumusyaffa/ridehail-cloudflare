@@ -16,6 +16,7 @@ export interface Candidate {
 
 export interface MatchConfig {
   staleMs: number; // driver ignored if no ping for longer than this
+  /** Farthest a driver may be from the pickup (straight line). */
   maxRadiusM: number;
   k: number;
   /** Geohash precisions searched in order: each ring = cell + 8 neighbours at that precision. */
@@ -24,7 +25,7 @@ export interface MatchConfig {
 
 export const DEFAULT_MATCH_CONFIG: MatchConfig = {
   staleMs: 30_000,
-  maxRadiusM: 5_000,
+  maxRadiusM: 2_000,
   k: 10,
   ringPrecisions: [6, 5],
 };
