@@ -50,6 +50,8 @@ interface HotRide extends RideView {
   pgVersion?: number;
   /** failed settlement attempts (retried by the `settle:` timer) */
   settleAttempts?: number;
+  /** ON_TRIP and the driver went silent: the customer was asked what happened (see `watchDriver`) */
+  driverLostAt?: number;
 }
 
 /**
@@ -117,6 +119,9 @@ interface SocketMeta {
   name: string;
 }
 
+/** The customer's answer when the driver went silent mid-trip: "we arrived" or "something went wrong". */
+export type DriverLostAction = "arrived" | "cancel";
+
 export interface CreateRideInput {
   customerId: string;
   pickup: Place;
@@ -134,6 +139,7 @@ export interface ZoneApi {
   release(driverId: string, rideId: string, reason: string): Promise<void>;
   acceptOffer(rideId: string, driver: DriverInfo & { lat: number | null; lng: number | null; heading: number | null }): Promise<Result<{ ride: RideView }>>;
   offerRejected(rideId: string, driverId: string): Promise<void>;
+  driverLost(rideId: string, customerId: string, action: DriverLostAction): Promise<Result<{ ride: RideView }>>;
   reset(): Promise<void>;
 }
 
@@ -217,6 +223,8 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       )
       .toArray();
     for (const r of rows) this.sql.exec("INSERT OR IGNORE INTO timers (key, at) VALUES (?, ?)", `${r.kind}:${r.id}`, now);
+    // every trip is watched for a driver gone silent
+    this.sql.exec("INSERT OR IGNORE INTO timers (key, at) SELECT 'watch:' || id, ? FROM rides WHERE status = 'ON_TRIP'", now);
     const next = this.sql.exec<{ at: number | null }>("SELECT MIN(at) AS at FROM timers").one().at;
     if (next === null) return;
     const cur = await this.ctx.storage.getAlarm();
@@ -395,6 +403,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       else if (kind === "sync") await this.push(id, "recover");
       else if (kind === "settle") await this.settleFromTimer(id);
       else if (kind === "create") await this.recoverCreate(id);
+      else if (kind === "watch") await this.watchDriver(id);
       else if (kind === "purge") this.purge();
     } catch (err) {
       console.error("timer failed", key, err);
@@ -441,7 +450,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
   private view(r: HotRide): RideView {
     const {
       idempotencyKey: _k, queue: _q, rejected: _r, offer: _o, searched: _s, researched: _rs, searchDeadline: _d,
-      pgPending: _p, settleAttempts: _a, pending: _t, pgVersion: _v, ...v
+      pgPending: _p, settleAttempts: _a, pending: _t, pgVersion: _v, driverLostAt: _l, ...v
     } = r;
     return v;
   }
@@ -582,9 +591,12 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       ride.queue = [];
       for (const k of ["offer", "search", "dispatch"]) this.cancelTimer(`${k}:${ride.id}`);
     }
+    if (event === "COMPLETE" || event === "CANCEL") ride.driverLostAt = undefined;
     this.saveRide(ride);
     // same storage step as the save above: an unsettled completion always has its retry timer
     if (event === "COMPLETE" && !settled) await this.schedule(`settle:${ride.id}`, Date.now() + retryDelay(1));
+    if (event === "START") await this.schedule(`watch:${ride.id}`, Date.now() + this.cfg.driverLostAskMs);
+    if (event === "COMPLETE" || event === "CANCEL") this.cancelTimer(`watch:${ride.id}`);
 
     if (event === "ACCEPT" && ride.driverId) {
       // The driver now lives in the ride's zone for the whole trip (one actor per active ride).
@@ -1131,6 +1143,82 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     });
   }
 
+  // ------------------------------------------------------------ driver gone silent mid-trip
+
+  /** Last sign of life of the trip's driver: their latest location ping (or the trip's start). */
+  private driverSeenAt(ride: HotRide): number {
+    const ping = ride.driverId ? (this.pos.get(ride.driverId)?.ts ?? 0) : 0;
+    return Math.max(ride.startedAt ?? 0, ping);
+  }
+
+  /**
+   * `watch:` timer of an ON_TRIP ride. A driver whose phone died leaves the trip open, which locks the
+   * customer (one active ride) and their wallet hold. Silent for `driverLostAskMs` → ask the customer
+   * (they are in the car, they know) and ask again every interval; silent for `driverLostCancelMs` →
+   * the system cancels the ride (hold released). Pings are not written anywhere: this reads memory.
+   */
+  private watchDriver(rideId: string): Promise<void> {
+    return this.serial(rideId, async () => {
+      const ride = this.loadRide(rideId);
+      if (!ride || ride.status !== "ON_TRIP" || !ride.driverId) return;
+      const now = Date.now();
+      const { driverLostAskMs: ask, driverLostCancelMs: cancelAfter } = this.cfg;
+      if (ride.pending) return this.schedule(`watch:${rideId}`, now + retryDelay(1)); // a transition is settling first
+      const seen = this.driverSeenAt(ride);
+      if (now - seen < ask) {
+        this.driverBack(ride);
+        return this.schedule(`watch:${rideId}`, seen + ask);
+      }
+      if (now - seen >= cancelAfter) {
+        const res = await this.commit(rideId, { type: "CANCEL", by: "system" }, (n) => {
+          n.cancelReason = "driver_lost";
+          n.cancelledBy = "system";
+          n.cancelledAt = Date.now();
+        });
+        if (!res.ok && this.loadRide(rideId)?.status === "ON_TRIP") await this.schedule(`watch:${rideId}`, Date.now() + retryDelay(1));
+        return;
+      }
+      ride.driverLostAt ??= now;
+      this.saveRide(ride);
+      this.send(ride.customerId, { t: "ride.driver_lost", rideId, lastSeenAt: seen, autoCancelAt: seen + cancelAfter });
+      await this.schedule(`watch:${rideId}`, Math.min(now + ask, seen + cancelAfter));
+    });
+  }
+
+  /** The driver of a trip the customer was asked about is back: withdraw the question. */
+  private driverBack(ride: HotRide) {
+    if (!ride.driverLostAt) return;
+    ride.driverLostAt = undefined;
+    this.saveRide(ride);
+    this.send(ride.customerId, { t: "ride.driver_back", rideId: ride.id });
+  }
+
+  /** The customer answers "driver gone silent": the trip ended fine (complete + pay) or it did not (cancel). */
+  async driverLost(rideId: string, customerId: string, action: DriverLostAction): Promise<Result<{ ride: RideView }>> {
+    this.learnZone(zoneOfRide(rideId));
+    return this.serial(rideId, async () => {
+      const r = await this.ready(rideId);
+      if (!r.ok) return r;
+      const ride = r.ride;
+      if (ride.customerId !== customerId) return fail("FORBIDDEN");
+      if (ride.status !== "ON_TRIP" || !ride.driverLostAt || Date.now() - this.driverSeenAt(ride) < this.cfg.driverLostAskMs)
+        return fail("INVALID_TRANSITION", "the driver is not reported lost");
+      const res =
+        action === "arrived"
+          ? await this.commit(rideId, { type: "COMPLETE" }, (n) => {
+              n.completedAt = Date.now();
+              n.fareFinal = n.fare;
+            })
+          : await this.commit(rideId, { type: "CANCEL", by: "system" }, (n) => {
+              n.cancelReason = "driver_lost_reported";
+              n.cancelledBy = "system";
+              n.cancelledAt = Date.now();
+            });
+      if (!res.ok) return res;
+      return { ok: true, ride: this.view(res.ride) };
+    });
+  }
+
   private driverRideEvent(driverId: string, rideId: string, type: "ARRIVE" | "START" | "COMPLETE"): Promise<void> {
     return this.serial(rideId, () => this.driverRideEventNow(driverId, rideId, type));
   }
@@ -1387,7 +1475,10 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
         if (now - (this.pos.get(d.id)?.savedAt ?? 0) >= SNAPSHOT_MS) this.saveDriver(d);
         if (d.status === "ON_RIDE" && d.rideId) {
           const ride = this.loadRide(d.rideId);
-          if (ride) this.send(ride.customerId, { t: "driver.loc", rideId: ride.id, lat: d.lat, lng: d.lng, heading: d.heading });
+          if (ride) {
+            this.send(ride.customerId, { t: "driver.loc", rideId: ride.id, lat: d.lat, lng: d.lng, heading: d.heading });
+            this.driverBack(ride);
+          }
         } else {
           this.maybeHandOff(d);
         }
@@ -1461,5 +1552,9 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       return this.sendWs(ws, { t: "error", code: "FORBIDDEN", message: rideId });
     }
     this.sendWs(ws, { t: "ride.status", rideId, status: ride.status, driver: ride.driver, at: Date.now(), ride: this.view(ride) });
+    if (ride.driverLostAt && ride.status === "ON_TRIP" && meta.userId === ride.customerId) {
+      const seen = this.driverSeenAt(ride);
+      this.sendWs(ws, { t: "ride.driver_lost", rideId, lastSeenAt: seen, autoCancelAt: seen + this.cfg.driverLostCancelMs });
+    }
   }
 }

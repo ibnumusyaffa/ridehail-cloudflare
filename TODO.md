@@ -27,12 +27,14 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
   - Outbox dihapus (tabel di-DROP; belum pernah di-deploy). `OFFERING` hanya di DO; Postgres tetap `REQUESTED` selama mencari.
   - Dites: `test/resilience.test.ts` (cancel/complete saat Postgres mati, balasan hilang, tidak ada yang mengulang, accept vs cancel bersamaan).
 
-- [ ] **A3. Ride `ON_TRIP` tidak boleh macet selamanya** (§3.1)
-  - Timer penjaga baru di ZoneDO (jenis `watch:`): driver tanpa ping lama saat `ON_TRIP` (juga `ACCEPTED` terlalu lama tanpa `ARRIVED`, kurang mendesak karena customer masih bisa batal).
-  - Tindakan: batalkan oleh `system` (sebelum `ON_TRIP`) atau tandai bermasalah (saat `ON_TRIP`). `ON_TRIP` perlu aturan baru di `packages/core/src/rideStateMachine.ts`.
-  - Endpoint admin: paksa batal / paksa selesai satu ride. Belum ada peran admin (`Role` hanya `customer | driver`): tentukan autentikasinya dulu (mis. header `ADMIN_TOKEN` atau peran baru).
-  - Putuskan nasib saldo tertahan saat ride `ON_TRIP` diakhiri paksa: dilepas penuh, ditarik sebagian, atau ditarik penuh.
-  - Selesai jika: driver hilang di `ON_TRIP` → customer bisa pesan lagi dan saldo tertahan dilepas.
+- [x] **A3. Ride `ON_TRIP` tidak boleh macet selamanya** (§3.1)
+  - Timer `watch:<rideId>` di ZoneDO, dipasang saat `START` (dan ulang di `rearmTimers` untuk tiap ride `ON_TRIP`). Membaca ping terakhir di memori (`pos.ts`), tidak ada tulis per ping.
+  - Driver tanpa ping `DRIVER_LOST_ASK_MS` (1 jam) → customer ditanya lewat WS `ride.driver_lost`, diulang tiap 1 jam. Jawaban `POST /rides/:id/driver-lost {action}`: `arrived` → `COMPLETE` (dibayar), `cancel` → `CANCEL` oleh `system` (`driver_lost_reported`, hold dilepas penuh). "Masih jalan" = tidak kirim apa-apa.
+  - Tanpa ping `DRIVER_LOST_CANCEL_MS` (3 jam) dan tidak dijawab → `CANCEL` oleh `system` (`driver_lost`), hold dilepas penuh.
+  - Driver ping lagi → `ride.driver_back`, pertanyaan ditarik; jawaban customer ditolak (`INVALID_TRANSITION`).
+  - State machine: `system` boleh `CANCEL` dari `ON_TRIP`. Customer tetap tidak bisa batal `ON_TRIP` lewat `/cancel`.
+  - Dites: `test/driver-lost.test.ts`.
+  - Sisa: endpoint admin paksa batal / paksa selesai (butuh autentikasi admin); `ACCEPTED` terlalu lama tanpa `ARRIVED` (customer masih bisa batal sendiri). Risiko diterima: customer bisa bohong "ada masalah" untuk perjalanan gratis; driver protes manual (`cancel_reason` jadi jejak).
 
 ### P1 — Hasil salah / bisa dicurangi
 

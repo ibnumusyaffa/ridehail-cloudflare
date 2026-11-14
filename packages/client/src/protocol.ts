@@ -68,6 +68,9 @@ export type ServerMsg =
   | { t: "ride.status"; rideId: string; status: RideStatus; driver: DriverInfo | null; at: number; ride: RideView }
   | { t: "ride.paid"; rideId: string; paidVia: PaymentMethod; fare: number; balance: number }
   | { t: "driver.loc"; rideId: string; lat: number; lng: number; heading: number | null }
+  /** ON_TRIP and no location from the driver for a long while: ask the customer what happened */
+  | { t: "ride.driver_lost"; rideId: string; lastSeenAt: number; autoCancelAt: number }
+  | { t: "ride.driver_back"; rideId: string }
   | { t: "zone.moved"; zone: string; rideId?: string }
   | { t: "pong" }
   | { t: "error"; code: ErrorCode; message: string };

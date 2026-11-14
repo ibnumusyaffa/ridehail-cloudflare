@@ -78,6 +78,11 @@ export class ApiClient {
   cancel(id: string, reason: string) {
     return this.req<{ ride: RideView }>(`/rides/${id}/cancel`, { body: { reason } });
   }
+
+  /** Answer "the driver went silent mid-trip": "arrived" completes and pays, "cancel" ends it unpaid. */
+  driverLost(id: string, action: "arrived" | "cancel") {
+    return this.req<{ ride: RideView }>(`/rides/${id}/driver-lost`, { body: { action } });
+  }
   rate(id: string, stars: number) {
     return this.req<{ ok: true }>(`/rides/${id}/rating`, { body: { stars } });
   }

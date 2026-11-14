@@ -67,6 +67,8 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
   const [driverPos, setDriverPos] = useState<LatLng | null>(null);
   /** where the driver was when the approach leg started; the road route is fetched once from here */
   const [legStart, setLegStart] = useState<LatLng | null>(null);
+  /** the driver went silent mid-trip: the server asks what happened (null = not asked / driver back) */
+  const [lost, setLost] = useState<{ lastSeenAt: number; autoCancelAt: number } | null>(null);
   const [paid, setPaid] = useState<{ paidVia: string; fare: number; balance: number } | null>(null);
   const [rated, setRated] = useState(0);
   const [sock, setSock] = useState<SocketState>("closed");
@@ -108,10 +110,20 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
           case "ride.status":
             if (m.rideId !== rideId) break;
             setRide(m.ride);
+            if (m.status !== "ON_TRIP") setLost(null);
             if (m.status === "ACCEPTED") flash(`Driver ditemukan: ${m.driver?.name}`);
             break;
           case "driver.loc":
             if (m.rideId === rideId) setDriverPos({ lat: m.lat, lng: m.lng });
+            break;
+          case "ride.driver_lost":
+            if (m.rideId === rideId) setLost({ lastSeenAt: m.lastSeenAt, autoCancelAt: m.autoCancelAt });
+            break;
+          case "ride.driver_back":
+            if (m.rideId === rideId) {
+              setLost(null);
+              flash("Driver terhubung kembali");
+            }
             break;
           case "ride.paid":
             setPaid({ paidVia: m.paidVia, fare: m.fare, balance: m.balance });
@@ -185,7 +197,18 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
     }
   };
 
+  const answerLost = async (action: "arrived" | "cancel") => {
+    if (!ride) return;
+    try {
+      setRide((await api.driverLost(ride.id, action)).ride);
+      setLost(null);
+    } catch (e) {
+      flash((e as Error).message);
+    }
+  };
+
   const reset = () => {
+    setLost(null);
     setRide(null);
     setPaid(null);
     setDriverPos(null);
@@ -298,6 +321,20 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                   <span className="muted">{ride.pickup.label} → {ride.dropoff.label}</span>
                   <span>{fmtRp(ride.fare)} · {ride.paymentMethod === "CASH" ? "Tunai" : "Wallet"}</span>
                 </div>
+                {lost && ride.status === "ON_TRIP" && (
+                  <div data-testid="driver-lost">
+                    <p className="err">
+                      HP driver tidak aktif sejak {fmtTime(lost.lastSeenAt)}. Perjalanan bagaimana?
+                      <br />
+                      <small className="muted">Dibatalkan otomatis pukul {fmtTime(lost.autoCancelAt)} kalau tidak dijawab.</small>
+                    </p>
+                    <div className="seg">
+                      <button className="primary" data-testid="lost-arrived" onClick={() => answerLost("arrived")}>Sudah sampai</button>
+                      <button data-testid="lost-ongoing" onClick={() => setLost(null)}>Masih jalan</button>
+                      <button className="danger" data-testid="lost-cancel" onClick={() => answerLost("cancel")}>Ada masalah</button>
+                    </div>
+                  </div>
+                )}
                 {["REQUESTED", "OFFERING", "ACCEPTED", "ARRIVED"].includes(ride.status) && (
                   <button
                     className="danger"

@@ -16,6 +16,10 @@ export interface Config {
   searchTimeoutMs: number;
   researchDelayMs: number;
   topupMax: number;
+  /** ON_TRIP without a driver location ping this long → ask the customer (and again every interval) */
+  driverLostAskMs: number;
+  /** ON_TRIP without a driver location ping this long → the system cancels the ride */
+  driverLostCancelMs: number;
   fare: FareConfig;
   match: MatchConfig;
   presence: PresenceConfig;
@@ -39,6 +43,8 @@ export function loadConfig(env: Env): Config {
     searchTimeoutMs: num(env.SEARCH_TIMEOUT_MS, 120_000),
     researchDelayMs: num(env.RESEARCH_DELAY_MS, 5_000),
     topupMax: num(env.TOPUP_MAX, 1_000_000),
+    driverLostAskMs: num(env.DRIVER_LOST_ASK_MS, 60 * 60_000),
+    driverLostCancelMs: num(env.DRIVER_LOST_CANCEL_MS, 3 * 60 * 60_000),
     fare: DEFAULT_FARE_CONFIG,
     match,
     presence: {

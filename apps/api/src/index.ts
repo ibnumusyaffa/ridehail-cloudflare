@@ -226,6 +226,20 @@ app.post("/rides/:id/cancel", async (c) => {
   return c.json({ ride: res.ride });
 });
 
+// ON_TRIP with the driver gone silent: the customer says how it ended ("arrived" pays, "cancel" releases).
+app.post("/rides/:id/driver-lost", async (c) => {
+  const u = c.get("user");
+  const id = c.req.param("id");
+  const zone = zoneOfRide(id);
+  if (!zone) throw new HttpError("RIDE_NOT_FOUND");
+  if (u.role !== "customer") throw new HttpError("FORBIDDEN");
+  const { action } = await body<{ action?: unknown }>(c.req.raw);
+  if (action !== "arrived" && action !== "cancel") throw new HttpError("BAD_REQUEST", "action must be arrived | cancel");
+  const res = await zoneApi(c.env, zone).driverLost(id, u.sub, action);
+  if (!res.ok) throw new HttpError(res.code, res.message);
+  return c.json({ ride: res.ride });
+});
+
 app.post("/rides/:id/rating", async (c) => {
   const u = c.get("user");
   requireRole(u, "customer");

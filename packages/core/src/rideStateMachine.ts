@@ -19,7 +19,8 @@ export function isTerminal(s: RideStatus): boolean {
 const CANCELLABLE_BY: Record<Role | "system", readonly RideStatus[]> = {
   customer: ["REQUESTED", "OFFERING", "ACCEPTED", "ARRIVED"],
   driver: ["ACCEPTED", "ARRIVED"],
-  system: ["REQUESTED", "OFFERING", "ACCEPTED", "ARRIVED"],
+  // ON_TRIP too: a trip whose driver went silent for hours (phone dead) must not lock the customer forever
+  system: ["REQUESTED", "OFFERING", "ACCEPTED", "ARRIVED", "ON_TRIP"],
 };
 
 function target(state: RideStatus, ev: RideEvent): RideStatus | null {

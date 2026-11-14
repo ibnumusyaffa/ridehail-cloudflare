@@ -31,7 +31,14 @@ describe("ride state machine", () => {
       expect(applyRideEvent(s, { type: "CANCEL", by: "driver" }).status).toBe("CANCELLED");
     expect(() => applyRideEvent("OFFERING", { type: "CANCEL", by: "driver" })).toThrow(/INVALID_TRANSITION|cannot/);
     expect(() => applyRideEvent("ON_TRIP", { type: "CANCEL", by: "customer" })).toThrow();
+    expect(() => applyRideEvent("ON_TRIP", { type: "CANCEL", by: "driver" })).toThrow();
     expect(() => applyRideEvent("COMPLETED", { type: "CANCEL", by: "customer" })).toThrow();
+  });
+
+  it("system may end a trip whose driver went silent", () => {
+    for (const s of ["REQUESTED", "OFFERING", "ACCEPTED", "ARRIVED", "ON_TRIP"] as RideStatus[])
+      expect(applyRideEvent(s, { type: "CANCEL", by: "system" }).status).toBe("CANCELLED");
+    expect(() => applyRideEvent("COMPLETED", { type: "CANCEL", by: "system" })).toThrow();
   });
 
   it("duplicate events are idempotent no-ops", () => {
