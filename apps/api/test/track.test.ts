@@ -101,6 +101,26 @@ describe("ON_TRIP route is stored in Postgres", () => {
     drv.ws.close();
   });
 
+  it("thinned: a straight trip keeps one point per 200 m, and always its last position", async () => {
+    const { p, drv, rideId, cws } = await accepted(60_000);
+    await inZone(zoneOf(p), "ride", (inst) => {
+      inst.cfg.track = { ...inst.cfg.track, minGapM: 200 };
+    });
+    drv.ws.send({ t: "ride.arrived", rideId });
+    drv.ws.send({ t: "ride.start", rideId });
+    await cws.next(status("ON_TRIP"));
+
+    const trip = await drive(drv, cws, p, 6); // ~111 m apart, due north
+    drv.ws.send({ t: "ride.complete", rideId });
+    await cws.next(status("COMPLETED"));
+    await sleep(300);
+
+    const track = (await pgTrack(rideId)).map(({ lat, lng }) => ({ lat, lng }));
+    expect(track).toEqual([trip[0], trip[2], trip[4], trip[5]]);
+    cws.close();
+    drv.ws.close();
+  });
+
   it("Postgres down: points wait in the zone actor and arrive once, after it is back", async () => {
     const { p, drv, rideId, cws } = await accepted(300);
     drv.ws.send({ t: "ride.arrived", rideId });

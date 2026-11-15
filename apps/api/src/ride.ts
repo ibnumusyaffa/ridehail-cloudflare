@@ -3,13 +3,17 @@ import {
   type Candidate,
   DomainError,
   type DriverStatus,
+  endTrack,
   estimate,
   type PaymentMethod,
   type Place,
   type RideEvent,
   type RideStatus,
   type Role,
+  sampleTrack,
   searchCells,
+  type TrackPt,
+  type TrackState,
 } from "@gojek/core";
 import { type DriverRow, PURGE_EVERY_MS, retryDelay, type SocketMeta, ZoneActor } from "./actor";
 import { homeOfRide, matchStub, zoneOfKey } from "./config";
@@ -146,6 +150,11 @@ export class RideDO extends ZoneActor implements RideApi {
   private committing = new Map<string, Promise<Result<{ ride: HotRide; changed: boolean }>>>();
   /** rides with a settlement call in flight (the inline attempt and the timer must not overlap) */
   private settling = new Set<string>();
+  /**
+   * route sampler per ON_TRIP ride. Memory only: after an eviction the next ping just starts a new
+   * run (one extra point), and at worst the held-back last ping of the trip is lost.
+   */
+  private tracks = new Map<string, TrackState>();
 
   protected initTables() {
     this.sql.exec(`
@@ -431,8 +440,12 @@ export class RideDO extends ZoneActor implements RideApi {
     if (event === "START") await this.schedule(`watch:${ride.id}`, Date.now() + this.cfg.driverLostAskMs);
     if (event === "START") await this.schedule(`track:${ride.id}`, Date.now() + this.cfg.trackFlushMs);
     if (event === "COMPLETE" || event === "CANCEL") this.cancelTimer(`watch:${ride.id}`);
-    // the trip is over: send the rest of its route now (no-op for a ride cancelled before the trip)
-    if (event === "COMPLETE" || event === "CANCEL") await this.schedule(`track:${ride.id}`, Date.now());
+    // the trip is over: keep its last position, send the rest of its route now (no-op for a ride cancelled before the trip)
+    if (event === "COMPLETE" || event === "CANCEL") {
+      this.keepTrack(ride.id, endTrack(this.tracks.get(ride.id)));
+      this.tracks.delete(ride.id);
+      await this.schedule(`track:${ride.id}`, Date.now());
+    }
 
     if (event === "ACCEPT" && ride.driverId) {
       // The driver now lives in this ride actor for the whole trip.
@@ -1123,15 +1136,22 @@ export class RideDO extends ZoneActor implements RideApi {
     this.moveSockets(driverId, { t: "zone.moved", zone }, false);
   }
 
+  private keepTrack(rideId: string, points: TrackPt[]) {
+    for (const p of points) this.sql.exec("INSERT INTO track (ride_id, lat, lng, at) VALUES (?, ?, ?, ?)", rideId, p.lat, p.lng, p.at);
+  }
+
   /** A location ping of a driver on one of this actor's rides: the customer's map and the trip route. */
   private onDriverLoc(d: DriverRow, loc: { lat: number; lng: number; heading?: number }) {
     const now = this.takePing(d, loc);
     if (!now || d.status !== "ON_RIDE" || !d.rideId) return;
     const ride = this.loadRide(d.rideId);
     if (!ride) return;
-    // the trip's route: buffered here, sent to Postgres in batches by the `track:` timer
-    if (ride.status === "ON_TRIP")
-      this.sql.exec("INSERT INTO track (ride_id, lat, lng, at) VALUES (?, ?, ?, ?)", ride.id, d.lat, d.lng, d.updatedAt);
+    // the trip's route, thinned (straight stretches + turns): buffered here, sent to Postgres in batches by the `track:` timer
+    if (ride.status === "ON_TRIP") {
+      const { keep, state } = sampleTrack(this.tracks.get(ride.id) ?? null, { lat: d.lat!, lng: d.lng!, at: d.updatedAt }, this.cfg.track);
+      this.tracks.set(ride.id, state);
+      this.keepTrack(ride.id, keep);
+    }
     this.send(ride.customerId, { t: "driver.loc", rideId: ride.id, lat: d.lat!, lng: d.lng!, heading: d.heading });
     this.driverBack(ride);
   }

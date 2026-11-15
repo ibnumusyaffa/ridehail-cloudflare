@@ -2,10 +2,12 @@ import {
   DEFAULT_FARE_CONFIG,
   DEFAULT_MATCH_CONFIG,
   DEFAULT_PRESENCE_CONFIG,
+  DEFAULT_TRACK_CONFIG,
   type FareConfig,
   isGeohash,
   type MatchConfig,
   type PresenceConfig,
+  type TrackConfig,
 } from "@gojek/core";
 
 export interface Config {
@@ -25,6 +27,8 @@ export interface Config {
   driverLostCancelMs: number;
   /** ON_TRIP route points buffered in the zone actor are sent to Postgres this often */
   trackFlushMs: number;
+  /** which ON_TRIP pings are kept as the trip's route (see `sampleTrack`) */
+  track: TrackConfig;
   /** ride actors per zone (see `rideHome`) */
   rideShards: RideShards;
   fare: FareConfig;
@@ -54,6 +58,12 @@ export function loadConfig(env: Env): Config {
     driverLostAskMs: num(env.DRIVER_LOST_ASK_MS, 60 * 60_000),
     driverLostCancelMs: num(env.DRIVER_LOST_CANCEL_MS, 3 * 60 * 60_000),
     trackFlushMs: num(env.TRACK_FLUSH_MS, 60_000),
+    track: {
+      minGapM: num(env.TRACK_MIN_GAP_M, DEFAULT_TRACK_CONFIG.minGapM),
+      maxGapMs: num(env.TRACK_MAX_GAP_MS, DEFAULT_TRACK_CONFIG.maxGapMs),
+      turnDeg: num(env.TRACK_TURN_DEG, DEFAULT_TRACK_CONFIG.turnDeg),
+      turnMinLegM: DEFAULT_TRACK_CONFIG.turnMinLegM,
+    },
     rideShards: parseRideShards(env.RIDE_SHARDS),
     fare: DEFAULT_FARE_CONFIG,
     match,
