@@ -86,7 +86,7 @@ Status driver: `OFFLINE`, `AVAILABLE`, `RESERVED` (sedang ditawari), `ON_RIDE`.
 - Saat pindah, server tidak menutup socket lama; client yang menutup. Pesan yang terkirim di sela itu (`loc`, `ride.*`) diteruskan MatchDO ke RideDO, tidak hilang.
 - Driver `AVAILABLE` yang keluar zona dipindah setelah ≥ 100 m di dalam zona baru atau 3 ping berturut-turut di luar.
 - Ping lokasi: server membuang ping yang datang < 2 detik (saat ride: < 1 detik) **dan** bergerak < 30 m.
-- **Rute perjalanan**: ping saat `ON_TRIP` dirampingkan dulu (`sampleTrack`, `packages/core/src/track.ts`): disimpan satu titik tiap `TRACK_MIN_GAP_M` (200 m) atau `TRACK_MAX_GAP_MS` (1 menit), plus tiap belokan > `TRACK_TURN_DEG` (30°), plus posisi terakhir saat ride berakhir. Titik yang lolos dicatat di SQLite RideDO (tabel `track`), lalu dikirim ke Postgres (`ride_track`) tiap `TRACK_FLUSH_MS` (1 menit) dan sekali lagi saat ride berakhir. Postgres mati → titik menunggu di RideDO, tidak hilang dan tidak dobel (`seq` jadi kunci). Posisi di luar `ON_TRIP` tidak disimpan.
+- **Rute perjalanan**: ping saat `ON_TRIP` dirampingkan dulu (`sampleTrack`, `packages/core/src/track.ts`): disimpan satu titik tiap `TRACK_MIN_GAP_M` (200 m) atau `TRACK_MAX_GAP_MS` (1 menit), plus titik di mana garis yang disimpan akan menyimpang > `TRACK_TOLERANCE_M` (25 m) dari ping driver (belokan, tikungan), plus posisi terakhir saat ride berakhir. Titik yang lolos dicatat di SQLite RideDO (tabel `track`), lalu dikirim ke Postgres (`ride_track`) tiap `TRACK_FLUSH_MS` (1 menit) dan sekali lagi saat ride berakhir. Postgres mati → titik menunggu di RideDO, tidak hilang dan tidak dobel (`seq` jadi kunci). Posisi di luar `ON_TRIP` tidak disimpan.
 
 ### Yang dijaga Postgres
 
@@ -143,7 +143,7 @@ Definisi lengkap: `packages/client/src/protocol.ts`.
 
 `ZONE_PRECISION` (≤ 5), `RIDE_SHARDS`, `COMMISSION_RATE`, `DRIVER_MIN_BALANCE`, `OFFER_TIMEOUT_MS`, `RESERVE_TTL_MS`,
 `SEARCH_TIMEOUT_MS`, `RESEARCH_DELAY_MS`, `TOPUP_MAX`, `DRIVER_LOST_ASK_MS`, `DRIVER_LOST_CANCEL_MS`, `TRACK_FLUSH_MS`, `LOC_MIN_INTERVAL_MS`, `LOC_MIN_INTERVAL_ON_RIDE_MS`,
-`LOC_MIN_MOVE_M`, `HANDOFF_MARGIN_M`, `HANDOFF_PINGS`, `TRACK_MIN_GAP_M`, `TRACK_MAX_GAP_MS`, `TRACK_TURN_DEG`. Secret: `JWT_SECRET`. Konstanta tarif: `packages/core/src/fare.ts`.
+`LOC_MIN_MOVE_M`, `HANDOFF_MARGIN_M`, `HANDOFF_PINGS`, `TRACK_MIN_GAP_M`, `TRACK_MAX_GAP_MS`, `TRACK_TOLERANCE_M`. Secret: `JWT_SECRET`. Konstanta tarif: `packages/core/src/fare.ts`.
 
 ## Test
 

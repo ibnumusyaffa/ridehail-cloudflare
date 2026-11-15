@@ -61,8 +61,7 @@ export function loadConfig(env: Env): Config {
     track: {
       minGapM: num(env.TRACK_MIN_GAP_M, DEFAULT_TRACK_CONFIG.minGapM),
       maxGapMs: num(env.TRACK_MAX_GAP_MS, DEFAULT_TRACK_CONFIG.maxGapMs),
-      turnDeg: num(env.TRACK_TURN_DEG, DEFAULT_TRACK_CONFIG.turnDeg),
-      turnMinLegM: DEFAULT_TRACK_CONFIG.turnMinLegM,
+      toleranceM: num(env.TRACK_TOLERANCE_M, DEFAULT_TRACK_CONFIG.toleranceM),
     },
     rideShards: parseRideShards(env.RIDE_SHARDS),
     fare: DEFAULT_FARE_CONFIG,

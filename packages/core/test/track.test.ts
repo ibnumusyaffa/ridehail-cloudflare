@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bearingDeg, DEFAULT_TRACK_CONFIG, endTrack, sampleTrack, type TrackPt, type TrackState } from "../src";
+import { DEFAULT_TRACK_CONFIG, endTrack, sampleTrack, type TrackPt, type TrackState } from "../src";
 
 // ~1 m of latitude / longitude near Jakarta
 const M_LAT = 1 / 111_320;
@@ -18,15 +18,6 @@ function run(pings: TrackPt[], cfg = DEFAULT_TRACK_CONFIG): TrackPt[] {
   return [...stored, ...endTrack(state)];
 }
 
-describe("bearingDeg", () => {
-  it("points north, east, south, west", () => {
-    expect(bearingDeg(pt(0, 0, 0), pt(100, 0, 0))).toBeCloseTo(0, 0);
-    expect(bearingDeg(pt(0, 0, 0), pt(0, 100, 0))).toBeCloseTo(90, 0);
-    expect(bearingDeg(pt(0, 0, 0), pt(-100, 0, 0))).toBeCloseTo(180, 0);
-    expect(bearingDeg(pt(0, 0, 0), pt(0, -100, 0))).toBeCloseTo(270, 0);
-  });
-});
-
 describe("sampleTrack", () => {
   it("a straight 2 km at one ping per 30 m keeps one point per 200 m, plus the first and the last", () => {
     const pings = Array.from({ length: 67 }, (_, i) => pt(i * 30, 0, i * 3_000)); // 0 … 1,980 m
@@ -42,6 +33,17 @@ describe("sampleTrack", () => {
     const pings = [pt(0, 0, 0), pt(30, 0, 1), pt(60, 0, 2), pt(90, 0, 3), pt(90, 30, 4), pt(90, 60, 5)];
     const stored = run(pings);
     expect(stored).toEqual([pings[0], pings[3], pings[5]]);
+  });
+
+  it("one ping a second (~8 m apart): the corner is still kept, the line never strays past toleranceM", async () => {
+    // 150 m north, then 150 m east, 8 m per ping
+    const pings: TrackPt[] = [];
+    for (let m = 0; m <= 150; m += 8) pings.push(pt(m, 0, pings.length * 1_000));
+    for (let m = 8; m <= 150; m += 8) pings.push(pt(150, m, pings.length * 1_000));
+    const stored = run(pings);
+    expect(stored.length).toBeLessThanOrEqual(4);
+    // a stored point near the corner (150, 0)
+    expect(stored.some((p) => Math.hypot((p.lat - pt(150, 0, 0).lat) / M_LAT, (p.lng - pt(150, 0, 0).lng) / M_LNG) <= DEFAULT_TRACK_CONFIG.toleranceM)).toBe(true);
   });
 
   it("GPS jitter while standing still makes no corners", () => {

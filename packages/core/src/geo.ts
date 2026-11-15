@@ -115,14 +115,3 @@ export function distanceInsideCellM(p: LatLng, hash: string): number {
     (b.lngMax - p.lng) * mPerDegLng,
   );
 }
-
-/** Initial bearing from `a` to `b`, degrees clockwise from north in [0, 360). */
-export function bearingDeg(a: LatLng, b: LatLng): number {
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const φ1 = toRad(a.lat);
-  const φ2 = toRad(b.lat);
-  const Δλ = toRad(b.lng - a.lng);
-  const y = Math.sin(Δλ) * Math.cos(φ2);
-  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
-  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
-}
