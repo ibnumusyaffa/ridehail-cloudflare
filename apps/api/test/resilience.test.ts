@@ -243,3 +243,138 @@ describe("Postgres outages", () => {
     expect(pg?.id).toBe(again.json.rideId);
   });
 });
+
+// ---------------------------------------------------------------- A6: a driver never holds two rides
+
+/** A pickup just inside the north edge of its zone and a driver spot just across it (another zone). */
+function acrossZones() {
+  const b = geohashBounds(zoneOf(spot()));
+  const pickup = { lat: b.latMax - 0.0005, lng: (b.lngMin + b.lngMax) / 2 };
+  const driverAt = { lat: b.latMax + 0.0005, lng: pickup.lng };
+  expect(zoneOf(driverAt)).not.toBe(zoneOf(pickup));
+  return { pickup, driverAt, rideZone: zoneOf(pickup), driverZone: zoneOf(driverAt) };
+}
+
+/** The driver's zone loses the reply of its `acceptOffer` RPC: the call lands, then the caller sees an error. */
+async function lostAcceptReply(zone: string, on: boolean) {
+  const ns = (env as unknown as { ZONE: DurableObjectNamespace }).ZONE;
+  const run = runInDurableObject as unknown as (stub: unknown, fn: (inst: any) => void) => Promise<void>;
+  await run(ns.get(ns.idFromName(zone)), (inst) => {
+    delete inst.stub; // back to the prototype's real implementation
+    if (!on) return;
+    const real = inst.stub.bind(inst);
+    inst.stub = (z: string) => {
+      const s = real(z);
+      return new Proxy(s, {
+        get: (t, k) =>
+          k === "acceptOffer"
+            ? async (...a: unknown[]) => {
+                await t.acceptOffer(...a);
+                throw new Error("simulated lost RPC reply");
+              }
+            : (...a: unknown[]) => t[k](...a),
+      });
+    };
+  });
+}
+
+describe("A6: a driver never holds two rides", () => {
+  it("Postgres says the driver already has an active ride → DRIVER_BUSY, the next driver is offered", async () => {
+    const p = spot();
+    const busy = await onlineDriver(off(p, 0.001).lat, p.lng, "Dodi");
+    const next = await onlineDriver(off(p, 0.004).lat, p.lng, "Eko");
+    // the driver's other ride: active in Postgres, unknown to this zone (e.g. another zone's ride)
+    const other = await customer();
+    await withSql(env as unknown as Env, (sql) => sql`
+      INSERT INTO rides (id, customer_id, driver_id, pickup_lat, pickup_lng, drop_lat, drop_lng, status,
+        fare_estimate, distance_m, payment_method, requested_at, accepted_at)
+      VALUES (${`zzzzz_${crypto.randomUUID()}`}, ${other.id}, ${busy.id}, ${p.lat}, ${p.lng}, ${p.lat}, ${p.lng},
+        'ACCEPTED', 10000, 1000, 'CASH', ${Date.now()}, ${Date.now()})`);
+
+    const c = await customer();
+    const rideId: string = (await order(c.token, p)).json.rideId;
+    expect((await busy.ws.next("offer")).rideId).toBe(rideId);
+    busy.ws.send({ t: "offer.accept", rideId });
+    expect((await busy.ws.next("error")).code).toBe("DRIVER_BUSY");
+
+    expect((await next.ws.next("offer")).rideId).toBe(rideId);
+    next.ws.send({ t: "offer.accept", rideId });
+    expect((await next.ws.next(status("ACCEPTED"))).ride.driverId).toBe(next.id);
+    expect(busy.ws.inbox.some((m) => m.t === "offer" && m.rideId === rideId)).toBe(false); // never again
+    expect((await pgRide(rideId))?.driverId).toBe(next.id);
+    busy.ws.close();
+    next.ws.close();
+  });
+
+  it("cross-zone accept: Postgres reply lost, nobody retries → it lands on recovery and the driver's zone hands the driver over", async () => {
+    const { pickup, driverAt, rideZone } = acrossZones();
+    const c = await customer();
+    const drv = await onlineDriver(driverAt.lat, driverAt.lng, "Fajar");
+    const rideId: string = (await order(c.token, pickup)).json.rideId;
+    await drv.ws.next("offer");
+
+    await postgres(rideZone, "lost-reply");
+    drv.ws.send({ t: "offer.accept", rideId });
+    expect((await drv.ws.next("error")).code).toBe("UNAVAILABLE");
+    await postgres(rideZone, "off");
+    expect((await pgRide(rideId))?.driverId).toBe(drv.id); // it did land
+
+    // the ride's zone learns it on its own (`sync:`), then tells the driver's zone (`handover:`)
+    const moved = await drv.ws.next("zone.moved", 15_000);
+    expect(moved).toMatchObject({ zone: rideZone, rideId });
+    const d2 = await Client.connect({ token: drv.token, zone: rideZone, lat: driverAt.lat, lng: driverAt.lng });
+    expect(await d2.next("hello")).toMatchObject({ zone: rideZone, driverStatus: "ON_RIDE", rideId });
+    d2.close();
+    drv.ws.close();
+  });
+
+  it("cross-zone accept: the RPC reply between zones is lost → error to the driver, then handed over anyway", async () => {
+    const { pickup, driverAt, rideZone, driverZone } = acrossZones();
+    const c = await customer();
+    const drv = await onlineDriver(driverAt.lat, driverAt.lng, "Gilang");
+    const rideId: string = (await order(c.token, pickup)).json.rideId;
+    await drv.ws.next("offer");
+
+    await lostAcceptReply(driverZone, true);
+    drv.ws.send({ t: "offer.accept", rideId });
+    expect((await drv.ws.next("error")).code).toBe("UNAVAILABLE");
+    await lostAcceptReply(driverZone, false);
+
+    const moved = await drv.ws.next("zone.moved", 10_000);
+    expect(moved).toMatchObject({ zone: rideZone, rideId });
+    expect((await pgRide(rideId))?.status).toBe("ACCEPTED");
+    // gone from its old zone: it is never offered there again
+    const d2 = await Client.connect({ token: drv.token, zone: rideZone, lat: driverAt.lat, lng: driverAt.lng });
+    expect(await d2.next("hello")).toMatchObject({ driverStatus: "ON_RIDE", rideId });
+    d2.close();
+    drv.ws.close();
+  });
+
+  it("cross-zone accept never reaches the ride's zone → the driver is held, then released by the offer timeout", async () => {
+    const { pickup, driverAt, driverZone } = acrossZones();
+    const c = await customer();
+    const drv = await onlineDriver(driverAt.lat, driverAt.lng, "Hadi");
+    const rideId: string = (await order(c.token, pickup)).json.rideId;
+    await drv.ws.next("offer");
+
+    const ns = (env as unknown as { ZONE: DurableObjectNamespace }).ZONE;
+    const run = runInDurableObject as unknown as (stub: unknown, fn: (inst: any) => void) => Promise<void>;
+    await run(ns.get(ns.idFromName(driverZone)), (inst) => {
+      const real = inst.stub.bind(inst);
+      inst.stub = (z: string) => {
+        const s = real(z);
+        return new Proxy(s, {
+          get: (t, k) => (k === "acceptOffer" ? () => Promise.reject(new Error("simulated network error")) : (...a: unknown[]) => t[k](...a)),
+        });
+      };
+    });
+    drv.ws.send({ t: "offer.accept", rideId });
+    expect((await drv.ws.next("error")).code).toBe("UNAVAILABLE");
+    await lostAcceptReply(driverZone, false);
+
+    // not taken: the ride's offer timer gives up on this driver and frees them
+    expect((await drv.ws.next("offer.cancelled", 10_000)).rideId).toBe(rideId);
+    expect((await pgRide(rideId))?.driverId).toBeNull();
+    drv.ws.close();
+  });
+});

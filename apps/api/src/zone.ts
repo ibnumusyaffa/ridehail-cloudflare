@@ -57,6 +57,11 @@ interface HotRide extends RideView {
   driverLostAt?: number;
   /** drivers who accepted this ride, then dropped it (REQUEUE); each one is also in `rejected` */
   dropoutDrivers?: string[];
+  /**
+   * The accept committed while the driver is registered in another zone: that zone is told (the
+   * `handover:` timer, retried) so it stops treating the driver as free once their reservation lapses.
+   */
+  handover?: { zone: string; driverId: string; attempts: number };
 }
 
 /**
@@ -143,6 +148,7 @@ export interface ZoneApi {
   nearest(cells: string[], pickup: Place, exclude: string[]): Promise<Candidate[]>;
   reserveAndOffer(driverId: string, offer: OfferPayload, ttlMs: number): Promise<boolean>;
   release(driverId: string, rideId: string, reason: string): Promise<void>;
+  handOverToRide(driverId: string, rideId: string, rideZone: string): Promise<void>;
   acceptOffer(rideId: string, driver: DriverInfo & { lat: number | null; lng: number | null; heading: number | null }): Promise<Result<{ ride: RideView }>>;
   offerRejected(rideId: string, driverId: string): Promise<void>;
   driverLost(rideId: string, customerId: string, action: DriverLostAction): Promise<Result<{ ride: RideView }>>;
@@ -164,6 +170,11 @@ const CREATE_RECOVERY_MS = 5_000;
 const DISPATCH_RETRY_MS = 2_000;
 /** attempts to reserve one candidate whose `reserveAndOffer` RPC failed before moving on to the next */
 const RESERVE_TRIES = 3;
+/**
+ * The ride's zone tells the driver's zone about a committed accept this long after it. The driver's
+ * own accept usually moves them first (it got the reply); this is for when that reply never came.
+ */
+const HANDOVER_DELAY_MS = 1_000;
 
 /** Backoff for Postgres retries (pending transitions, settlement): 2 s, 4 s, … capped at 60 s. */
 const retryDelay = (attempt: number) => Math.min(60_000, 1_000 * 2 ** Math.min(attempt, 6));
@@ -432,6 +443,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       else if (kind === "create") await this.recoverCreate(id);
       else if (kind === "watch") await this.watchDriver(id);
       else if (kind === "track") await this.flushTrack(id);
+      else if (kind === "handover") await this.handOver(id);
       else if (kind === "purge") this.purge();
     } catch (err) {
       console.error("timer failed", key, err);
@@ -479,7 +491,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
   private view(r: HotRide): RideView {
     const {
       idempotencyKey: _k, queue: _q, rejected: _r, offer: _o, searchDeadline: _d,
-      pgPending: _p, settleAttempts: _a, pending: _t, pgVersion: _v, driverLostAt: _l, dropoutDrivers: _x, ...v
+      pgPending: _p, settleAttempts: _a, pending: _t, pgVersion: _v, driverLostAt: _l, dropoutDrivers: _x, handover: _h, ...v
     } = r;
     return v;
   }
@@ -630,7 +642,13 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       ride.dropoutDrivers = [...(ride.dropoutDrivers ?? []), before];
       ride.searchDeadline = Date.now() + this.cfg.searchTimeoutMs;
     }
+    // the driver who accepted is registered in another zone: it must learn they are on this ride now,
+    // also when the accept's reply was lost or it only committed on the recovery path (A6)
+    const handover = event === "ACCEPT" && offer && offer.driverId === ride.driverId && offer.zone !== this.zone;
+    if (handover) ride.handover = { zone: offer.zone, driverId: offer.driverId, attempts: 0 };
     this.saveRide(ride);
+    // same storage step as the save above: a pending handover always has its timer
+    if (handover) await this.schedule(`handover:${ride.id}`, Date.now() + HANDOVER_DELAY_MS);
     // same storage step as the save above: a ride back in the search always has its timers
     if (event === "REQUEUE") {
       await this.schedule(`search:${ride.id}`, ride.searchDeadline);
@@ -891,6 +909,53 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     this.saveDriver(d);
     this.send(driverId, { t: "offer.cancelled", rideId, reason });
     this.maybeHandOff(d);
+  }
+
+  /**
+   * The driver's accept of `rideId` committed in `rideZone`: they live there for the trip. Normally the
+   * driver's own accept already moved them; this covers the accept whose reply was lost (A6). Idempotent.
+   */
+  async handOverToRide(driverId: string, rideId: string, rideZone: string): Promise<void> {
+    const d = this.loadDriver(driverId);
+    if (!d || d.status === "ON_RIDE") return; // already moved (or a ride of this zone: not ours to touch)
+    // reserved for another ride after this one's reservation lapsed: that offer can't be taken now
+    if (d.status === "RESERVED" && d.rideId && d.rideId !== rideId)
+      this.send(driverId, { t: "offer.cancelled", rideId: d.rideId, reason: "CANCELLED" });
+    this.removeDriver(driverId);
+    for (const ws of this.ctx.getWebSockets(`user:${driverId}`)) {
+      this.sendWs(ws, { t: "zone.moved", zone: rideZone, rideId });
+      try {
+        ws.close(4001, "zone moved");
+      } catch {
+        /* already closing */
+      }
+    }
+  }
+
+  /** `handover:` timer: tell the accepting driver's zone, retried until it has heard. */
+  private async handOver(rideId: string): Promise<void> {
+    const ride = this.loadRide(rideId);
+    const h = ride?.handover;
+    if (!ride || !h) return;
+    const rideZone = zoneOfRide(rideId)!;
+    const onIt = ride.driverId === h.driverId && ["ACCEPTED", "ARRIVED", "ON_TRIP"].includes(ride.status);
+    try {
+      if (onIt) await this.stub(h.zone).handOverToRide(h.driverId, rideId, rideZone);
+      // the ride moved on before its driver was told (cancelled, requeued): only free their reservation
+      else await this.stub(h.zone).release(h.driverId, rideId, "CANCELLED");
+    } catch (e) {
+      const cur = this.loadRide(rideId);
+      if (!cur?.handover) return;
+      const attempts = ++cur.handover.attempts;
+      console.error("handover failed", rideId, h.zone, `attempt ${attempts}`, e);
+      this.saveRide(cur);
+      return void (await this.schedule(`handover:${rideId}`, Date.now() + retryDelay(attempts)));
+    }
+    const cur = this.loadRide(rideId);
+    if (cur?.handover) {
+      cur.handover = undefined;
+      this.saveRide(cur);
+    }
   }
 
   // ============================================================ RPC: ride lifecycle (ride's zone)
@@ -1648,15 +1713,27 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
         if (d.status !== "RESERVED" || d.rideId !== msg.rideId) throw new DomainError("OFFER_EXPIRED");
         const rideZone = zoneOfRide(msg.rideId);
         if (!rideZone) throw new DomainError("RIDE_NOT_FOUND");
-        const res = await this.stub(rideZone).acceptOffer(msg.rideId, {
-          id: d.id, name: d.name, vehicle: d.vehicle, lat: d.lat, lng: d.lng, heading: d.heading,
-        });
+        let res: Result<{ ride: RideView }>;
+        try {
+          res = await this.stub(rideZone).acceptOffer(msg.rideId, {
+            id: d.id, name: d.name, vehicle: d.vehicle, lat: d.lat, lng: d.lng, heading: d.heading,
+          });
+        } catch (e) {
+          // the call to the ride's zone failed: the accept may or may not have reached it
+          console.error("accept: ride zone unreachable", msg.rideId, d.id, e);
+          res = fail("UNAVAILABLE", "ride zone unreachable, retry");
+        }
         if (!res.ok) {
           const cur = this.loadDriver(d.id);
-          // UNAVAILABLE: the accept may still land (Postgres outcome unknown) — keep the reservation so the
-          // driver can retry; the ride's zone releases it if the accept turns out not to have happened
-          if (cur && cur.status === "RESERVED" && cur.rideId === msg.rideId && res.code !== "UNAVAILABLE") {
-            this.setDriverFree(cur);
+          if (cur && cur.status === "RESERVED" && cur.rideId === msg.rideId) {
+            if (res.code === "UNAVAILABLE") {
+              // outcome unknown: the accept may still land. Hold the driver for this ride a while longer so
+              // they can retry; if it landed, the ride's zone hands them over (`handOverToRide`), if not,
+              // its offer timer releases them.
+              cur.reservedUntil = Math.max(cur.reservedUntil ?? 0, Date.now() + this.cfg.reserveTtlMs);
+            } else {
+              this.setDriverFree(cur);
+            }
             this.saveDriver(cur);
           }
           throw new DomainError(res.code, res.message);

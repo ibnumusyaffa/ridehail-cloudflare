@@ -52,10 +52,12 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
   - Pakai posisi terakhir di memori (`pos`). `pos` bisa kosong setelah DO restart atau pindah zona: jatuh ke `lat/lng` di `DriverRow` (snapshot ≤30 detik), dan kalau tetap tidak ada, tolak dengan error yang jelas.
   - Selesai jika: Tiba dari 2 km ditolak dengan error yang jelas.
 
-- [ ] **A6. Driver tidak boleh punya dua ride** (§3.5, §3.11)
-  - ~~Dua zona: Postgres menolak accept karena `one_active_ride_driver` → tawarkan ke kandidat berikutnya.~~ Selesai bersama A2 (`DRIVER_BUSY` → `dropOffer` + `dispatch`); belum ada test khusus.
-  - Accept `UNAVAILABLE` (A2): zona driver kini tetap memegang reservasi, dan kalau ternyata tidak commit, timer tawaran melepasnya. Tapi kalau accept ternyata commit lewat pemulihan `sync:`, zona driver belum diberi tahu (driver tidak dipindah ke zona ride sampai mengulang accept). Perlu RPC pemberitahuan ke zona driver.
-  - Accept gagal di jaringan: kalau RPC `acceptOffer` melempar error (bukan `!res.ok`), jangan biarkan driver jatuh ke status bebas setelah reservasi habis; tanya ulang zona ride atau perpanjang reservasi sampai jelas.
+- [x] **A6. Driver tidak boleh punya dua ride** (§3.5, §3.11)
+  - Dua zona, Postgres menolak accept karena `one_active_ride_driver` → `DRIVER_BUSY` → `dropOffer` + `dispatch` (bersama A2).
+  - Accept yang commit tapi zona driver tidak tahu (balasan Postgres hilang lalu commit lewat `sync:`, atau balasan RPC antar zona hilang): `adopt` ACCEPT dengan driver dari zona lain mencatat `ride.handover` dan memasang timer `handover:`. Timer memanggil RPC `handOverToRide` di zona driver (hapus driver dari zona itu, kirim `zone.moved` + `rideId`, tutup socket), diulang dengan backoff sampai berhasil. Kalau ride sudah lanjut (batal / requeue) sebelum sempat, timer hanya `release` reservasi driver.
+  - RPC `acceptOffer` melempar error → diperlakukan `UNAVAILABLE`: reservasi driver dipertahankan dan diperpanjang `reserveTtlMs`, driver boleh mengulang. Kalau ternyata commit → `handover:`; kalau tidak → timer tawaran zona ride melepasnya.
+  - Dites: `test/resilience.test.ts` (describe "A6").
+  - Sisa: driver bisa sempat ditawari ride lain di zona lama selama `handover:` belum sampai (mis. zona driver tidak terjangkau); accept kedua tetap ditolak Postgres (`DRIVER_BUSY`).
 
 ### P2 — Perbaikan kecil & pengalaman
 
