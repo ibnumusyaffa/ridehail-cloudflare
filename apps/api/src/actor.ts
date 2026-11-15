@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { acceptPing, DomainError, type DriverStatus, geohashEncode, isValidLatLng, type Role } from "@gojek/core";
-import { type Config, loadConfig, zoneOfActor } from "./config";
+import { type Config, keyOfActor, loadConfig, zoneOfKey } from "./config";
 import * as db from "./db";
 import { type Sql, withDb } from "./pg";
 import type { ClientMsg, OfferPayload, ServerMsg, Vehicle } from "./protocol";
@@ -60,11 +60,15 @@ async function runLimited<T>(items: T[], limit: number, fn: (item: T) => Promise
  * What both actors of a zone share: config, the zone name, SQLite timers multiplexed on the DO alarm,
  * sockets, the Postgres seam, and driver rows with their live positions (memory + geohash grid).
  *
- * A zone has two actors (see `MatchDO`, `RideDO`), named `match:<zone>` and `ride:<zone>`.
+ * A zone has a match actor `match:<zone>` (see `MatchDO`) and one or more ride actors `ride:<home>`
+ * (see `RideDO`; home = the zone, or `<zone>.<k>` for shard k of a busy zone).
  */
 export abstract class ZoneActor extends DurableObject<Env> {
   protected cfg: Config;
   protected sql: SqlStorage;
+  /** this actor's key: the zone (match actor) or the ride home `<zone>[.<k>]` (ride actor) */
+  protected key: string | null;
+  /** the geohash zone this actor serves (its key without a shard) */
   protected zone: string | null;
   protected registered: boolean;
   protected pos = new Map<string, Pos>();
@@ -79,7 +83,8 @@ export abstract class ZoneActor extends DurableObject<Env> {
     this.sql = ctx.storage.sql;
     this.gridPrecision = Math.max(...this.cfg.match.ringPrecisions);
     this.initSchema();
-    this.zone = zoneOfActor(ctx.id.name) ?? this.meta("zone");
+    this.key = keyOfActor(ctx.id.name) ?? this.meta("zone");
+    this.zone = this.key ? zoneOfKey(this.key) : null;
     this.registered = this.meta("registered") === "1";
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}'));
     this.loadPositions();
@@ -140,16 +145,18 @@ export abstract class ZoneActor extends DurableObject<Env> {
 
   // ============================================================ helpers
 
-  protected learnZone(zone: string | null) {
-    if (!zone) return;
-    if (this.zone !== zone) {
-      this.zone = zone;
-      this.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('zone', ?)", zone);
+  /** Remember this actor's key (zone, or ride home) when its name was not available. */
+  protected learnZone(key: string | null) {
+    if (!key) return;
+    if (this.key !== key) {
+      this.key = key;
+      this.zone = zoneOfKey(key);
+      this.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('zone', ?)", key);
     }
     if (!this.registered) {
-      // record this zone in Postgres once, so its actors can be enumerated (ops, dev reset)
+      // record this actor's key in Postgres once, so every actor can be enumerated (ops, dev reset)
       this.registered = true;
-      void this.pg((sql) => db.registerZone(sql, zone)).then(
+      void this.pg((sql) => db.registerZone(sql, key)).then(
         () => this.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('registered', '1')"),
         (e) => {
           this.registered = false; // try again on the next call
@@ -171,7 +178,8 @@ export abstract class ZoneActor extends DurableObject<Env> {
     await this.ctx.storage.deleteAlarm();
     await this.ctx.storage.deleteAll();
     this.initSchema();
-    this.zone = zoneOfActor(this.ctx.id.name);
+    this.key = keyOfActor(this.ctx.id.name);
+    this.zone = this.key ? zoneOfKey(this.key) : null;
     this.registered = false;
     this.pos.clear();
     this.grid.clear();

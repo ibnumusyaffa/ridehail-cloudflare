@@ -3,6 +3,7 @@ import {
   DEFAULT_MATCH_CONFIG,
   DEFAULT_PRESENCE_CONFIG,
   type FareConfig,
+  isGeohash,
   type MatchConfig,
   type PresenceConfig,
 } from "@gojek/core";
@@ -24,6 +25,8 @@ export interface Config {
   driverLostCancelMs: number;
   /** ON_TRIP route points buffered in the zone actor are sent to Postgres this often */
   trackFlushMs: number;
+  /** ride actors per zone (see `rideHome`) */
+  rideShards: RideShards;
   fare: FareConfig;
   match: MatchConfig;
   presence: PresenceConfig;
@@ -51,6 +54,7 @@ export function loadConfig(env: Env): Config {
     driverLostAskMs: num(env.DRIVER_LOST_ASK_MS, 60 * 60_000),
     driverLostCancelMs: num(env.DRIVER_LOST_CANCEL_MS, 3 * 60 * 60_000),
     trackFlushMs: num(env.TRACK_FLUSH_MS, 60_000),
+    rideShards: parseRideShards(env.RIDE_SHARDS),
     fare: DEFAULT_FARE_CONFIG,
     match,
     presence: {
@@ -63,25 +67,88 @@ export function loadConfig(env: Env): Config {
   };
 }
 
-/** Ride ids embed the owning zone: `<zone>_<uuid>`. */
-export function zoneOfRide(rideId: string): string | null {
-  const i = rideId.indexOf("_");
-  return i > 0 ? rideId.slice(0, i) : null;
+// ------------------------------------------------------------- ride actor shards
+//
+// A busy zone's rides are spread over several ride actors (shards). A ride actor is named by its
+// "home": the zone for shard 0, `<zone>.<k>` for shard k ≥ 1. A ride id starts with its home
+// (`<home>_<uuid>`), so anyone can route to a ride's actor without a lookup, and changing a zone's
+// shard count never moves a ride already running (old ids `<zone>_<uuid>` are shard 0).
+
+/** Hard upper bound on shards per zone (also bounds which actor names a client can make us create). */
+export const MAX_RIDE_SHARDS = 64;
+const SHARD_SEP = ".";
+
+/**
+ * `RIDE_SHARDS`: "4" (every zone), or per zone with a default: "qqguw=8,qqgux=4,*=1".
+ * Unknown / invalid entries are ignored; counts are clamped to 1..MAX_RIDE_SHARDS.
+ */
+export function parseRideShards(v: unknown): RideShards {
+  const out: RideShards = { default: 1, byZone: {} };
+  if (typeof v !== "string") return out;
+  const clamp = (n: number) => Math.max(1, Math.min(MAX_RIDE_SHARDS, Math.floor(n)));
+  for (const part of v.split(",")) {
+    const [k, n] = part.includes("=") ? part.split("=").map((s) => s.trim()) : ["*", part.trim()];
+    const count = Number(n);
+    if (!k || !Number.isFinite(count) || count < 1) continue;
+    if (k === "*") out.default = clamp(count);
+    else if (isGeohash(k)) out.byZone[k] = clamp(count);
+  }
+  return out;
 }
+
+export interface RideShards {
+  default: number;
+  byZone: Record<string, number>;
+}
+
+export const shardCount = (cfg: Config, zone: string) => cfg.rideShards.byZone[zone] ?? cfg.rideShards.default;
+
+/** The shard of a customer's rides: stable while the count is unchanged, so a retried order lands on the same actor. */
+export function shardFor(customerId: string, count: number): number {
+  if (count <= 1) return 0;
+  let h = 0x811c9dc5; // FNV-1a
+  for (let i = 0; i < customerId.length; i++) h = Math.imul(h ^ customerId.charCodeAt(i), 0x01000193);
+  return (h >>> 0) % count;
+}
+
+export const rideHome = (zone: string, shard: number) => (shard > 0 ? `${zone}${SHARD_SEP}${shard}` : zone);
+
+/** `<zone>` / `<zone>.<k>` → its parts; null unless canonical (k in 1..MAX-1, no leading zero). */
+export function parseRideHome(home: string): { zone: string; shard: number } | null {
+  const i = home.indexOf(SHARD_SEP);
+  const zone = i < 0 ? home : home.slice(0, i);
+  if (!isGeohash(zone)) return null;
+  if (i < 0) return { zone, shard: 0 };
+  const k = home.slice(i + 1);
+  if (!/^[1-9]\d*$/.test(k) || Number(k) >= MAX_RIDE_SHARDS) return null;
+  return { zone, shard: Number(k) };
+}
+
+/** Ride ids embed the owning ride actor: `<home>_<uuid>`. Null when the prefix is not a valid home. */
+export function homeOfRide(rideId: string): string | null {
+  const i = rideId.indexOf("_");
+  if (i <= 0) return null;
+  const home = rideId.slice(0, i);
+  return parseRideHome(home) ? home : null;
+}
+
 
 const LOCATION_HINTS = new Set(["wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me"]);
 
-/** A zone has two actors: `match:<zone>` (free drivers, search) and `ride:<zone>` (its rides). */
+/** A zone has a match actor `match:<zone>` (free drivers, search) and ride actors `ride:<home>` (its rides). */
 export type ActorKind = "match" | "ride";
 
-export const actorName = (kind: ActorKind, zone: string) => `${kind}:${zone}`;
+export const actorName = (kind: ActorKind, key: string) => `${kind}:${key}`;
 
-/** The zone an actor serves, from its name (`match:<zone>` / `ride:<zone>`). */
-export function zoneOfActor(name: string | undefined): string | null {
+/** An actor's key, from its name: the zone (`match:<zone>`) or the ride home (`ride:<zone>[.<k>]`). */
+export function keyOfActor(name: string | undefined): string | null {
   if (!name) return null;
   const i = name.indexOf(":");
   return i >= 0 ? name.slice(i + 1) : null;
 }
+
+/** The geohash zone of an actor key (a ride home loses its shard). */
+export const zoneOfKey = (key: string) => parseRideHome(key)?.zone ?? key;
 
 /**
  * An actor's stub. `DO_LOCATION_HINT` places new actors near the Postgres region (every ride
@@ -97,6 +164,7 @@ export function matchStub(env: Env, zone: string): DurableObjectStub {
   return stubOf(env.MATCH as unknown as DurableObjectNamespace, env, actorName("match", zone));
 }
 
-export function rideStub(env: Env, zone: string): DurableObjectStub {
-  return stubOf(env.RIDE as unknown as DurableObjectNamespace, env, actorName("ride", zone));
+/** The ride actor of `home` (a zone, or `<zone>.<k>` for shard k: see `rideHome`). */
+export function rideStub(env: Env, home: string): DurableObjectStub {
+  return stubOf(env.RIDE as unknown as DurableObjectNamespace, env, actorName("ride", home));
 }

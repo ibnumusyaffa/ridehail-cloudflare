@@ -93,9 +93,16 @@ Jangan dikerjakan sebelum Tahap A selesai dan ada hasil ukur.
 
 - [ ] **C1. Load test** — 1k → 5k driver di satu zona. Catat latensi tawaran, durasi DO, rows written, koneksi Postgres.
 - [ ] **C2. Tulis Postgres lewat Queues** — hanya bila C1 menunjukkan tulis ke Postgres jadi penghambat. Setelah A2 status ride ditulis langsung; ini hanya relevan untuk data non-kritis (riwayat, statistik).
-- [ ] **C3. Shard RideDO untuk zona panas** — ride sudah terpisah dari pencarian (B2). Langkah berikut: zona ramai dipecah ke K RideDO (`ride:<zona>:<k>`), nomor shard disimpan di ID ride supaya K bisa dinaikkan tanpa merusak ride berjalan.
+- [x] **C3. Shard RideDO untuk zona panas**
+  - Config `RIDE_SHARDS` (`"1"`, `"4"`, atau `"qqguw=8,*=1"`). Shard 0 = `ride:<zona>` (nama lama), shard k = `ride:<zona>.<k>`; ID ride `<home>_<uuid>`, jadi ID lama tetap jalan dan K bisa diubah tanpa merusak ride berjalan.
+  - Shard dipilih dari hash id customer (`shardFor`): pesan ulang dengan `Idempotency-Key` sama mendarat di shard sama. Kalau K berubah di antara dua percobaan, Postgres (`rides_idem`) tetap mencegah ride dobel.
+  - Nama aktor dari input divalidasi (`parseRideHome`: geohash panjang `ZONE_PRECISION`, shard 1..63 tanpa nol di depan) — sebagian A7.
+  - Dev reset juga mereset tiap shard (shard mendaftarkan dirinya di tabel `zones`).
+  - Dites: `test/shard.test.ts`.
+  - Sisa: belum ada metrik untuk memilih zona yang perlu di-shard (tunggu C1).
 - [ ] **C4. ETA lewat jalan & batch matching** — layanan terpisah; MatchDO tetap punya cadangan jarak lurus.
 - [ ] **C5. Zona adaptif, partisi tabel `rides`, read replica.**
+  - Zona adaptif untuk MatchDO sengaja ditunda (2026-11-15): zona lebih kecil = driver keliling lebih sering pindah zona (reconnect) dan pencarian bertanya ke lebih banyak DO. Kerja MatchDO hampir semua di memori; putuskan setelah C1 menunjukkan MatchDO jadi penghambat.
 
 ### Aturan biaya (jangan dilanggar saat refactor)
 

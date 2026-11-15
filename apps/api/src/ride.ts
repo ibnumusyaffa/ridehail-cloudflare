@@ -12,7 +12,7 @@ import {
   searchCells,
 } from "@gojek/core";
 import { type DriverRow, PURGE_EVERY_MS, retryDelay, type SocketMeta, ZoneActor } from "./actor";
-import { matchStub, zoneOfRide } from "./config";
+import { homeOfRide, matchStub, zoneOfKey } from "./config";
 import * as db from "./db";
 import type { MatchApi } from "./match";
 import { type ClientMsg, type DriverInfo, fail, type OfferPayload, type Result, type RideView, type ServerMsg } from "./protocol";
@@ -92,7 +92,8 @@ export interface CreateRideInput {
 
 /** Methods match actors / the Worker call over RPC. Results never throw across the wire. */
 export interface RideApi {
-  createRide(zone: string, input: CreateRideInput): Promise<Result<{ ride: RideView }>>;
+  /** `home`: the ride actor this call reached (a zone or one of its shards, see `rideHome`) */
+  createRide(home: string, input: CreateRideInput): Promise<Result<{ ride: RideView }>>;
   cancelRide(rideId: string, userId: string, role: Role, reason: string): Promise<Result<{ ride: RideView }>>;
   acceptOffer(rideId: string, driver: DriverInfo & { lat: number | null; lng: number | null; heading: number | null }): Promise<Result<{ ride: RideView }>>;
   offerRejected(rideId: string, driverId: string): Promise<void>;
@@ -125,12 +126,16 @@ const RESERVE_TRIES = 3;
 const HANDOVER_DELAY_MS = 1_000;
 
 /**
- * Ride actor (`ride:<zone>`): single writer for every ride whose pickup is in one geohash zone, from
+ * Ride actor (`ride:<home>`): single writer for the rides whose pickup is in one geohash zone, from
  * order to payment — dispatch (asking match actors for drivers), status transitions (Postgres first),
  * timers, the trip route — plus the sockets of its customers and of its drivers while ON_RIDE.
  *
  * Free drivers live in the match actors (`match:<zone>`). The driver who accepts moves here for the
  * trip (their pings feed the customer's map and the route) and goes back (`returnDriver`) when it ends.
+ *
+ * A busy zone has several ride actors (shards): home = `<zone>` for shard 0, `<zone>.<k>` for shard k
+ * (`RIDE_SHARDS`). Each ride stays in the shard its id names; shards share nothing but the zone's
+ * match actors, so splitting a zone's rides needs no coordination between them.
  */
 export class RideDO extends ZoneActor implements RideApi {
   /** rides whose Postgres insert is in flight right now */
@@ -510,10 +515,10 @@ export class RideDO extends ZoneActor implements RideApi {
     const ride = this.loadRide(rideId);
     const h = ride?.handover;
     if (!ride || !h) return;
-    const rideZone = zoneOfRide(rideId)!;
+    const home = homeOfRide(rideId)!;
     const onIt = ride.driverId === h.driverId && ["ACCEPTED", "ARRIVED", "ON_TRIP"].includes(ride.status);
     try {
-      if (onIt) await this.stub(h.zone).handOverToRide(h.driverId, rideId, rideZone);
+      if (onIt) await this.stub(h.zone).handOverToRide(h.driverId, rideId, home);
       // the ride moved on before its driver was told (cancelled, requeued): only free their reservation
       else await this.stub(h.zone).release(h.driverId, rideId, "CANCELLED");
     } catch (e) {
@@ -533,8 +538,8 @@ export class RideDO extends ZoneActor implements RideApi {
 
   // ============================================================ RPC: ride lifecycle (ride's zone)
 
-  async createRide(zone: string, input: CreateRideInput): Promise<Result<{ ride: RideView }>> {
-    this.learnZone(zone);
+  async createRide(home: string, input: CreateRideInput): Promise<Result<{ ride: RideView }>> {
+    this.learnZone(home);
     if (input.idempotencyKey) {
       const prev = this.sql
         .exec<{ ride_id: string }>("SELECT ride_id FROM ride_idem WHERE customer_id = ? AND key = ?", input.customerId, input.idempotencyKey)
@@ -546,7 +551,7 @@ export class RideDO extends ZoneActor implements RideApi {
     const now = Date.now();
     const est = estimate(input.pickup, input.dropoff, this.cfg.fare);
     const ride: HotRide = {
-      id: `${zone}_${crypto.randomUUID().replaceAll("-", "")}`,
+      id: `${home}_${crypto.randomUUID().replaceAll("-", "")}`,
       status: "REQUESTED",
       customerId: input.customerId,
       driverId: null,
@@ -799,7 +804,7 @@ export class RideDO extends ZoneActor implements RideApi {
   }
 
   async offerRejected(rideId: string, driverId: string): Promise<void> {
-    this.learnZone(zoneOfRide(rideId));
+    this.learnZone(homeOfRide(rideId));
     // in the lane: a reject that races the offer's reservation waits for it instead of being dropped
     await this.serial(rideId, async () => {
       const ride = this.loadRide(rideId);
@@ -822,7 +827,7 @@ export class RideDO extends ZoneActor implements RideApi {
     rideId: string,
     driver: DriverInfo & { lat: number | null; lng: number | null; heading: number | null },
   ): Promise<Result<{ ride: RideView }>> {
-    this.learnZone(zoneOfRide(rideId));
+    this.learnZone(homeOfRide(rideId));
     return this.serial(rideId, async (): Promise<Result<{ ride: RideView }>> => {
       const r = await this.ready(rideId);
       if (!r.ok) return r;
@@ -853,7 +858,7 @@ export class RideDO extends ZoneActor implements RideApi {
   }
 
   async cancelRide(rideId: string, userId: string, role: Role, reason: string): Promise<Result<{ ride: RideView }>> {
-    this.learnZone(zoneOfRide(rideId));
+    this.learnZone(homeOfRide(rideId));
     return this.serial(rideId, async () => {
       const r = await this.ready(rideId);
       if (!r.ok) return r;
@@ -978,7 +983,7 @@ export class RideDO extends ZoneActor implements RideApi {
 
   /** The customer answers "driver gone silent": the trip ended fine (complete + pay) or it did not (cancel). */
   async driverLost(rideId: string, customerId: string, action: DriverLostAction): Promise<Result<{ ride: RideView }>> {
-    this.learnZone(zoneOfRide(rideId));
+    this.learnZone(homeOfRide(rideId));
     return this.serial(rideId, async () => {
       const r = await this.ready(rideId);
       if (!r.ok) return r;
@@ -1171,7 +1176,7 @@ export class RideDO extends ZoneActor implements RideApi {
           .toArray()[0];
         if (!active) {
           // not on a ride here (it ended meanwhile): free drivers live in the match actors
-          const zone = m.lat !== null && m.lng !== null ? this.zoneOf(m.lat, m.lng) : (this.zone ?? m.zone);
+          const zone = m.lat !== null && m.lng !== null ? this.zoneOf(m.lat, m.lng) : (this.zone ?? zoneOfKey(m.zone));
           this.sendWs(server, { t: "zone.moved", zone });
           server.close(4001, "zone moved");
           return new Response(null, { status: 101, webSocket: client });
@@ -1203,9 +1208,9 @@ export class RideDO extends ZoneActor implements RideApi {
     if (meta.role !== "driver") throw new DomainError("FORBIDDEN", `${msg.t} is driver-only`);
 
     if ("rideId" in msg && msg.rideId && msg.t.startsWith("ride.")) {
-      // another zone's ride: point the driver there
-      const rz = zoneOfRide(msg.rideId);
-      if (rz && rz !== this.zone) return this.sendWs(ws, { t: "zone.moved", zone: rz, rideId: msg.rideId });
+      // another ride actor's ride: point the driver there
+      const rz = homeOfRide(msg.rideId);
+      if (rz && rz !== this.key) return this.sendWs(ws, { t: "zone.moved", zone: rz, rideId: msg.rideId });
       const type = msg.t === "ride.arrived" ? "ARRIVE" : msg.t === "ride.start" ? "START" : "COMPLETE";
       return this.rideEventByDriver(meta.userId, msg.rideId, type);
     }
@@ -1245,8 +1250,8 @@ export class RideDO extends ZoneActor implements RideApi {
     if (!rideId) return;
     const ride = this.loadRide(rideId);
     if (!ride) {
-      const rz = zoneOfRide(rideId);
-      if (rz && rz !== this.zone) return this.sendWs(ws, { t: "zone.moved", zone: rz, rideId });
+      const rz = homeOfRide(rideId);
+      if (rz && rz !== this.key) return this.sendWs(ws, { t: "zone.moved", zone: rz, rideId });
       return this.sendWs(ws, { t: "error", code: "RIDE_NOT_FOUND", message: rideId });
     }
     if (ride.customerId !== meta.userId && ride.driverId !== meta.userId) {

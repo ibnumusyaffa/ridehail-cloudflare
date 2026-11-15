@@ -57,7 +57,7 @@ Tarif di backend tetap memakai jarak lurus × 1,3.
 |---|---|---|
 | Worker | `apps/api/src/index.ts` | Pintu masuk. Cek token, validasi input, teruskan ke zona yang tepat. |
 | MatchDO | `apps/api/src/match.ts` | Petugas pencarian satu zona (`match:<zona>`, geohash 5, ±5 km). Memegang driver bebas (`OFFLINE`/`AVAILABLE`/`RESERVED`) dan posisinya, menjawab pencarian, mereservasi driver. |
-| RideDO | `apps/api/src/ride.ts` | Petugas ride satu zona (`ride:<zona>`). Memegang ride yang titik jemputnya di zona itu: dispatch, status, timer, rute, pembayaran; plus socket customer dan driver yang sedang `ON_RIDE`. |
+| RideDO | `apps/api/src/ride.ts` | Petugas ride satu zona (`ride:<zona>`), atau beberapa petugas untuk zona ramai (shard, `ride:<zona>.<k>`). Memegang ride yang titik jemputnya di zona itu: dispatch, status, timer, rute, pembayaran; plus socket customer dan driver yang sedang `ON_RIDE`. |
 | (bersama) | `apps/api/src/actor.ts` | Dasar kedua DO: timer di satu alarm, socket, posisi driver, jalur Postgres. |
 | Postgres | `apps/api/src/db.ts`, `apps/api/migrations` | User, kendaraan, riwayat ride, saldo, transaksi, saldo tertahan. |
 
@@ -76,7 +76,8 @@ Status driver: `OFFLINE`, `AVAILABLE`, `RESERVED` (sedang ditawari), `ON_RIDE`.
 
 ### Zona dan pencarian driver
 
-- ID ride = `<zona>_<uuid>`, jadi siapa pun tahu zona pemilik ride tanpa lookup.
+- ID ride = `<home>_<uuid>`, dengan home = `<zona>` (shard 0) atau `<zona>.<k>` (shard k). Siapa pun tahu petugas pemilik ride tanpa lookup.
+- **Shard RideDO** untuk zona ramai: `RIDE_SHARDS` (mis. `qqguw=8,*=1`). Ride baru dibagi ke shard menurut customer (`shardFor`, hash id customer), jadi pesan ulang dengan `Idempotency-Key` yang sama sampai ke shard yang sama. Ride berjalan tetap di shard yang tertulis di ID-nya, jadi jumlah shard boleh dinaikkan/diturunkan kapan saja. Semua shard satu zona memakai MatchDO yang sama (satu kumpulan driver bebas).
 - Posisi driver disimpan **di memori** DO yang memegangnya (+ grid geohash 6 di MatchDO), disalin ke SQLite tiap 30 detik. Satu ping lokasi tidak menulis ke storage.
 - Pencarian: sel geohash 6 + 8 tetangga dulu; kalau kosong, geohash 5 + 8 tetangga. Maksimal 2 km dari titik jemput (`maxRadiusM` di `packages/core/src/matcher.ts`, jarak lurus), 10 kandidat terdekat. Zona tetangga ditanya paralel.
 - Tawaran berurutan. `reserveAndOffer` hanya berhasil untuk driver `AVAILABLE` yang tersambung; kalau gagal lanjut kandidat berikutnya. Tawaran 15 detik, reservasi 20 detik.
@@ -140,7 +141,7 @@ Definisi lengkap: `packages/client/src/protocol.ts`.
 
 ## Config (`apps/api/wrangler.jsonc`)
 
-`ZONE_PRECISION` (≤ 5), `COMMISSION_RATE`, `DRIVER_MIN_BALANCE`, `OFFER_TIMEOUT_MS`, `RESERVE_TTL_MS`,
+`ZONE_PRECISION` (≤ 5), `RIDE_SHARDS`, `COMMISSION_RATE`, `DRIVER_MIN_BALANCE`, `OFFER_TIMEOUT_MS`, `RESERVE_TTL_MS`,
 `SEARCH_TIMEOUT_MS`, `RESEARCH_DELAY_MS`, `TOPUP_MAX`, `DRIVER_LOST_ASK_MS`, `DRIVER_LOST_CANCEL_MS`, `TRACK_FLUSH_MS`, `LOC_MIN_INTERVAL_MS`, `LOC_MIN_INTERVAL_ON_RIDE_MS`,
 `LOC_MIN_MOVE_M`, `HANDOFF_MARGIN_M`, `HANDOFF_PINGS`. Secret: `JWT_SECRET`. Konstanta tarif: `packages/core/src/fare.ts`.
 

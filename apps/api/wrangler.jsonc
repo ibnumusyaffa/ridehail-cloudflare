@@ -38,6 +38,9 @@
     "DO_LOCATION_HINT": "apac",
     // geohash length of one zone actor (<= 5 so a zone always covers whole search cells)
     "ZONE_PRECISION": "5",
+    // ride actors per zone: "1" (no sharding), "4" (every zone), or "qqguw=8,qqgux=4,*=1" (busy zones only).
+    // Raising or lowering it is safe at any time: a ride stays in the shard its id names.
+    "RIDE_SHARDS": "1",
     "COMMISSION_RATE": "0.2",
     "DRIVER_MIN_BALANCE": "-50000",
     "OFFER_TIMEOUT_MS": "15000",

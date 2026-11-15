@@ -9,7 +9,7 @@ import {
   shouldHandOff,
 } from "@gojek/core";
 import { type DriverRow, PURGE_EVERY_MS, type SocketMeta, ZoneActor } from "./actor";
-import { rideStub, zoneOfRide } from "./config";
+import { homeOfRide, rideStub } from "./config";
 import * as db from "./db";
 import { type ClientMsg, type DriverInfo, fail, type OfferPayload, type Result, type RideView } from "./protocol";
 import type { RideApi } from "./ride";
@@ -29,7 +29,7 @@ export interface MatchApi {
   nearest(cells: string[], pickup: Place, exclude: string[]): Promise<Candidate[]>;
   reserveAndOffer(driverId: string, offer: OfferPayload, ttlMs: number): Promise<boolean>;
   release(driverId: string, rideId: string, reason: string): Promise<void>;
-  handOverToRide(driverId: string, rideId: string, rideZone: string): Promise<void>;
+  handOverToRide(driverId: string, rideId: string, rideHome: string): Promise<void>;
   returnDriver(driver: DriverHandoff, status: "AVAILABLE" | "OFFLINE"): Promise<void>;
   reset(): Promise<void>;
 }
@@ -39,7 +39,7 @@ export interface MatchApi {
  * AVAILABLE and RESERVED (being offered a ride). Holds their positions in memory (+ a geohash grid),
  * answers searches (`nearest`) and reserves drivers atomically (`reserveAndOffer`).
  *
- * A driver who accepts a ride moves to that ride's actor (`ride:<zone>`) for the trip and comes back
+ * A driver who accepts a ride moves to that ride's actor (`ride:<home>`) for the trip and comes back
  * here (`returnDriver`) when it is over. Rides themselves never live here.
  */
 export class MatchDO extends ZoneActor implements MatchApi {
@@ -59,8 +59,9 @@ export class MatchDO extends ZoneActor implements MatchApi {
     this.moved.clear();
   }
 
-  private stub(zone: string): RideApi {
-    return rideStub(this.env, zone) as unknown as RideApi;
+  /** The ride actor of `home` (see `rideHome`: a zone, or one of its shards). */
+  private stub(home: string): RideApi {
+    return rideStub(this.env, home) as unknown as RideApi;
   }
 
   private purge() {
@@ -98,11 +99,11 @@ export class MatchDO extends ZoneActor implements MatchApi {
   }
 
   /** The driver now lives in the ride's actor: forget them here and point their sockets there. */
-  private handToRide(driverId: string, rideId: string, rideZone: string) {
+  private handToRide(driverId: string, rideId: string, rideHome: string) {
     this.removeDriver(driverId);
     this.moved.set(driverId, { rideId, until: Date.now() + MOVED_MEMORY_MS });
     // not closed here: the client closes and reconnects; a message it sends meanwhile is forwarded
-    this.moveSockets(driverId, { t: "zone.moved", zone: rideZone, rideId }, false);
+    this.moveSockets(driverId, { t: "zone.moved", zone: rideHome, rideId }, false);
   }
 
   // ============================================================ RPC: matching
@@ -172,13 +173,13 @@ export class MatchDO extends ZoneActor implements MatchApi {
    * Normally the driver's own accept already moved them; this covers the accept whose reply was lost
    * (A6). Idempotent.
    */
-  async handOverToRide(driverId: string, rideId: string, rideZone: string): Promise<void> {
+  async handOverToRide(driverId: string, rideId: string, rideHome: string): Promise<void> {
     const d = this.loadDriver(driverId);
     if (!d) return; // already moved
     // reserved for another ride after this one's reservation lapsed: that offer can't be taken now
     if (d.status === "RESERVED" && d.rideId && d.rideId !== rideId)
       this.send(driverId, { t: "offer.cancelled", rideId: d.rideId, reason: "CANCELLED" });
-    this.handToRide(driverId, rideId, rideZone);
+    this.handToRide(driverId, rideId, rideHome);
   }
 
   /** A trip is over: the ride's actor hands its driver back (free, or OFFLINE when their balance is too low). */
@@ -257,7 +258,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
         d.reservedUntil = null;
         this.saveDriver(d);
         this.sendDriverState(d);
-        if (pending) await this.stub(zoneOfRide(pending)!).offerRejected(pending, d.id);
+        if (pending) await this.stub(homeOfRide(pending)!).offerRejected(pending, d.id);
         return;
       }
       case "loc": {
@@ -267,11 +268,11 @@ export class MatchDO extends ZoneActor implements MatchApi {
       }
       case "offer.accept": {
         if (d.status !== "RESERVED" || d.rideId !== msg.rideId) throw new DomainError("OFFER_EXPIRED");
-        const rideZone = zoneOfRide(msg.rideId);
-        if (!rideZone) throw new DomainError("RIDE_NOT_FOUND");
+        const rideHome = homeOfRide(msg.rideId);
+        if (!rideHome) throw new DomainError("RIDE_NOT_FOUND");
         let res: Result<{ ride: RideView }>;
         try {
-          res = await this.stub(rideZone).acceptOffer(msg.rideId, {
+          res = await this.stub(rideHome).acceptOffer(msg.rideId, {
             id: d.id, name: d.name, vehicle: d.vehicle, lat: d.lat, lng: d.lng, heading: d.heading,
           });
         } catch (e) {
@@ -297,7 +298,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
         // the driver lives in the ride's actor for the trip
         this.sendWs(ws, { t: "ride.status", rideId: res.ride.id, status: res.ride.status, driver: res.ride.driver, at: Date.now(), ride: res.ride });
         const cur = this.loadDriver(d.id);
-        if (cur && cur.rideId === msg.rideId) this.handToRide(d.id, msg.rideId, rideZone);
+        if (cur && cur.rideId === msg.rideId) this.handToRide(d.id, msg.rideId, rideHome);
         return;
       }
       case "offer.reject": {
@@ -305,7 +306,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
         this.setDriverFree(d);
         this.saveDriver(d);
         this.sendDriverState(d);
-        await this.stub(zoneOfRide(msg.rideId)!).offerRejected(msg.rideId, d.id);
+        await this.stub(homeOfRide(msg.rideId)!).offerRejected(msg.rideId, d.id);
         this.maybeHandOff(this.loadDriver(d.id) ?? d);
         return;
       }
@@ -321,26 +322,26 @@ export class MatchDO extends ZoneActor implements MatchApi {
    */
   private async handleMoved(ws: WebSocket, meta: SocketMeta, msg: ClientMsg) {
     const m = this.moved.get(meta.userId);
-    const rideZone = m && m.until > Date.now() ? zoneOfRide(m.rideId) : null;
-    if (!m || !rideZone) {
+    const rideHome = m && m.until > Date.now() ? homeOfRide(m.rideId) : null;
+    if (!m || !rideHome) {
       this.sendWs(ws, { t: "zone.moved", zone: this.zone ?? "" });
       return ws.close(4001, "zone moved");
     }
     if (isRideEvent(msg)) return this.forwardRideEvent(ws, meta.userId, msg);
     if (msg.t === "loc") {
-      await this.stub(rideZone).driverLoc(meta.userId, m.rideId, msg);
+      await this.stub(rideHome).driverLoc(meta.userId, m.rideId, msg);
       return;
     }
     if (msg.t === "offer.accept" && msg.rideId === m.rideId) {
-      const ride = await this.stub(rideZone).rideOf(msg.rideId, meta.userId);
+      const ride = await this.stub(rideHome).rideOf(msg.rideId, meta.userId);
       if (ride) this.sendWs(ws, { t: "ride.status", rideId: ride.id, status: ride.status, driver: ride.driver, at: Date.now(), ride });
       return;
     }
-    this.sendWs(ws, { t: "zone.moved", zone: rideZone, rideId: m.rideId });
+    this.sendWs(ws, { t: "zone.moved", zone: rideHome, rideId: m.rideId });
   }
 
   private async forwardRideEvent(ws: WebSocket, driverId: string, msg: RideEventMsg) {
-    const rz = zoneOfRide(msg.rideId);
+    const rz = homeOfRide(msg.rideId);
     if (!rz) throw new DomainError("RIDE_NOT_FOUND");
     const type = msg.t === "ride.arrived" ? "ARRIVE" : msg.t === "ride.start" ? "START" : "COMPLETE";
     const res = await this.stub(rz).driverRideEvent(driverId, msg.rideId, type);
@@ -355,7 +356,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
       if (d.status === "RESERVED" && d.offer && d.offer.expiresAt > Date.now()) this.sendWs(ws, { t: "offer", ...d.offer });
     }
     // a ride lives in its ride actor
-    const rz = rideId ? zoneOfRide(rideId) : null;
+    const rz = rideId ? homeOfRide(rideId) : null;
     if (rideId && rz && !(d?.status === "RESERVED" && d.rideId === rideId)) this.sendWs(ws, { t: "zone.moved", zone: rz, rideId });
   }
 }
