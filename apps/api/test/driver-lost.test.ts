@@ -1,7 +1,6 @@
-import { env, runInDurableObject } from "cloudflare:test";
 import { geohashBounds, geohashEncode } from "@gojek/core";
 import { describe, expect, it } from "vitest";
-import { api, Client, login, onlineDriver, sleep, status } from "./helpers";
+import { api, Client, inZone, login, onlineDriver, sleep, status } from "./helpers";
 
 // A driver whose phone dies mid-trip: after DRIVER_LOST_ASK_MS without a location ping the customer is
 // asked what happened (and asked again every interval); after DRIVER_LOST_CANCEL_MS the ride is cancelled
@@ -17,9 +16,7 @@ const off = (p: { lat: number; lng: number }, dLat: number, dLng = 0) => ({ lat:
 const zoneOf = (p: { lat: number; lng: number }) => geohashEncode(p.lat, p.lng, 5);
 
 async function lostAfter(zone: string, askMs: number, cancelMs: number) {
-  const ns = (env as unknown as { ZONE: DurableObjectNamespace }).ZONE;
-  const run = runInDurableObject as unknown as (stub: unknown, fn: (inst: any) => void) => Promise<void>;
-  await run(ns.get(ns.idFromName(zone)), (inst) => {
+  await inZone(zone, "ride", (inst) => {
     inst.cfg.driverLostAskMs = askMs;
     inst.cfg.driverLostCancelMs = cancelMs;
   });

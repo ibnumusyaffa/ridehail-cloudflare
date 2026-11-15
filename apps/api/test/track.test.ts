@@ -1,7 +1,7 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:test";
 import { geohashBounds, geohashEncode } from "@gojek/core";
 import { describe, expect, it } from "vitest";
-import { api, Client, login, onlineDriver, sleep, status, withSql } from "./helpers";
+import { api, Client, inZone, login, onlineDriver, postgresOutage, sleep, status, withSql } from "./helpers";
 
 // The driver's route during ON_TRIP is kept: each accepted location ping is buffered in the zone
 // actor's SQLite and sent to Postgres (`ride_track`) every TRACK_FLUSH_MS, plus once more when the
@@ -16,26 +16,14 @@ function spot() {
 const off = (p: { lat: number; lng: number }, dLat: number, dLng = 0) => ({ lat: p.lat + dLat, lng: p.lng + dLng });
 const zoneOf = (p: { lat: number; lng: number }) => geohashEncode(p.lat, p.lng, 5);
 
-// loosely typed on purpose: inferring ZoneDO's RPC types here exceeds tsc's depth limit
-const run = runInDurableObject as unknown as (stub: unknown, fn: (inst: any) => void) => Promise<void>;
-const zoneDo = (zone: string) => {
-  const ns = (env as unknown as { ZONE: DurableObjectNamespace }).ZONE;
-  return ns.get(ns.idFromName(zone));
-};
-
 async function flushEvery(zone: string, ms: number) {
-  await run(zoneDo(zone), (inst) => {
+  await inZone(zone, "ride", (inst) => {
     inst.cfg.trackFlushMs = ms;
   });
 }
 
-/** "down": every Postgres call of the zone actor fails; "off": back to normal. */
-async function postgres(zone: string, mode: "down" | "off") {
-  await run(zoneDo(zone), (inst) => {
-    delete inst.pg;
-    if (mode === "down") inst.pg = () => Promise.reject(new Error("simulated Postgres outage"));
-  });
-}
+/** "down": every Postgres call of the zone's actors fails; "off": back to normal. */
+const postgres = (zone: string, mode: "down" | "off") => postgresOutage(zone, mode);
 
 const pgTrack = (rideId: string) =>
   withSql(env as unknown as Env, async (sql) =>

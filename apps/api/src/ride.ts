@@ -1,37 +1,21 @@
-import { DurableObject } from "cloudflare:workers";
 import {
-  acceptPing,
   applyRideEvent,
   type Candidate,
   DomainError,
-  type DriverSnapshot,
   type DriverStatus,
   estimate,
-  geohashChildren,
-  geohashEncode,
-  isValidLatLng,
   type PaymentMethod,
   type Place,
-  rankCandidates,
   type RideEvent,
   type RideStatus,
   type Role,
   searchCells,
-  shouldHandOff,
 } from "@gojek/core";
-import { type Config, loadConfig, zoneOfRide, zoneStub } from "./config";
+import { type DriverRow, PURGE_EVERY_MS, retryDelay, type SocketMeta, ZoneActor } from "./actor";
+import { matchStub, zoneOfRide } from "./config";
 import * as db from "./db";
-import { type Sql, withDb } from "./pg";
-import {
-  type ClientMsg,
-  type DriverInfo,
-  fail,
-  type OfferPayload,
-  type Result,
-  type RideView,
-  type ServerMsg,
-  type Vehicle,
-} from "./protocol";
+import type { MatchApi } from "./match";
+import { type ClientMsg, type DriverInfo, fail, type OfferPayload, type Result, type RideView, type ServerMsg } from "./protocol";
 
 /** Hot ride state: the client view plus dispatch internals. */
 interface HotRide extends RideView {
@@ -95,41 +79,6 @@ const EVENT_FOR: Partial<Record<RideStatus, RideEvent["type"]>> = {
   ACCEPTED: "ACCEPT", ARRIVED: "ARRIVE", ON_TRIP: "START", COMPLETED: "COMPLETE", CANCELLED: "CANCEL", NO_DRIVER: "NO_CANDIDATE",
 };
 
-interface DriverRow {
-  id: string;
-  name: string;
-  vehicle: Vehicle | null;
-  lat: number | null;
-  lng: number | null;
-  heading: number | null;
-  status: DriverStatus;
-  rideId: string | null;
-  reservedUntil: number | null;
-  offer: OfferPayload | null;
-  updatedAt: number;
-}
-
-/** Live driver position, kept in memory only (snapshotted to SQLite every SNAPSHOT_MS). */
-interface Pos {
-  lat: number;
-  lng: number;
-  heading: number | null;
-  /** last accepted ping */
-  ts: number;
-  /** grid cell (geohash at the finest search precision) */
-  cell: string;
-  /** when the position was last written to SQLite */
-  savedAt: number;
-  /** consecutive pings outside this zone (hand-over hysteresis) */
-  outside: number;
-}
-
-interface SocketMeta {
-  userId: string;
-  role: Role;
-  name: string;
-}
-
 /** The customer's answer when the driver went silent mid-trip: "we arrived" or "something went wrong". */
 export type DriverLostAction = "arrived" | "cancel";
 
@@ -141,26 +90,25 @@ export interface CreateRideInput {
   idempotencyKey: string | null;
 }
 
-/** Methods other zones / the Worker call over RPC. Results never throw across the wire. */
-export interface ZoneApi {
+/** Methods match actors / the Worker call over RPC. Results never throw across the wire. */
+export interface RideApi {
   createRide(zone: string, input: CreateRideInput): Promise<Result<{ ride: RideView }>>;
   cancelRide(rideId: string, userId: string, role: Role, reason: string): Promise<Result<{ ride: RideView }>>;
-  nearest(cells: string[], pickup: Place, exclude: string[]): Promise<Candidate[]>;
-  reserveAndOffer(driverId: string, offer: OfferPayload, ttlMs: number): Promise<boolean>;
-  release(driverId: string, rideId: string, reason: string): Promise<void>;
-  handOverToRide(driverId: string, rideId: string, rideZone: string): Promise<void>;
   acceptOffer(rideId: string, driver: DriverInfo & { lat: number | null; lng: number | null; heading: number | null }): Promise<Result<{ ride: RideView }>>;
   offerRejected(rideId: string, driverId: string): Promise<void>;
   driverLost(rideId: string, customerId: string, action: DriverLostAction): Promise<Result<{ ride: RideView }>>;
+  /** a driver's arrive / start / complete that reached the match actor (sent just after accepting) */
+  driverRideEvent(driverId: string, rideId: string, type: "ARRIVE" | "START" | "COMPLETE"): Promise<Result>;
+  /** same, for a location ping */
+  driverLoc(driverId: string, rideId: string, loc: { lat: number; lng: number; heading?: number }): Promise<void>;
+  /** the ride, for one of its participants */
+  rideOf(rideId: string, userId: string): Promise<RideView | null>;
   reset(): Promise<void>;
 }
 
 /** Searching statuses. OFFERING lives only in this actor; Postgres keeps such a ride REQUESTED. */
 const ACTIVE_DISPATCH = new Set(["REQUESTED", "OFFERING"]);
-const PURGE_EVERY_MS = 10 * 60_000;
 const KEEP_TERMINAL_MS = 60 * 60_000;
-const KEEP_IDLE_DRIVER_MS = 60 * 60_000;
-const SNAPSHOT_MS = 30_000;
 /** route points sent to Postgres per insert (a minute of a trip is ~15) */
 const TRACK_BATCH = 500;
 const ALARM_CONCURRENCY = 16;
@@ -176,34 +124,15 @@ const RESERVE_TRIES = 3;
  */
 const HANDOVER_DELAY_MS = 1_000;
 
-/** Backoff for Postgres retries (pending transitions, settlement): 2 s, 4 s, … capped at 60 s. */
-const retryDelay = (attempt: number) => Math.min(60_000, 1_000 * 2 ** Math.min(attempt, 6));
-
-/** Run `fn` over `items` with at most `limit` in flight. */
-async function runLimited<T>(items: T[], limit: number, fn: (item: T) => Promise<void>) {
-  let next = 0;
-  const worker = async () => {
-    while (next < items.length) await fn(items[next++]!);
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-}
-
 /**
- * Zone actor: single writer for every driver and ride in one geohash zone.
- * Hot state lives in this DO's SQLite (survives hibernation); Postgres is written through for history.
- * Driver positions live in memory (+ a geohash grid for matching) and are only snapshotted to SQLite,
- * so a location ping costs no storage write.
+ * Ride actor (`ride:<zone>`): single writer for every ride whose pickup is in one geohash zone, from
+ * order to payment — dispatch (asking match actors for drivers), status transitions (Postgres first),
+ * timers, the trip route — plus the sockets of its customers and of its drivers while ON_RIDE.
+ *
+ * Free drivers live in the match actors (`match:<zone>`). The driver who accepts moves here for the
+ * trip (their pings feed the customer's map and the route) and goes back (`returnDriver`) when it ends.
  */
-export class ZoneDO extends DurableObject<Env> implements ZoneApi {
-  private cfg: Config;
-  private sql: SqlStorage;
-  private zone: string | null;
-  private registered: boolean;
-  private pos = new Map<string, Pos>();
-  private grid = new Map<string, Set<string>>();
-  private gridPrecision: number;
-  /** cached alarm time: undefined = unknown (read lazily), null = none set */
-  private nextAlarm: number | null | undefined = undefined;
+export class RideDO extends ZoneActor implements RideApi {
   /** rides whose Postgres insert is in flight right now */
   private creating = new Set<string>();
   /** per-ride queue: actions that change a ride's status run one at a time, in arrival order */
@@ -213,25 +142,23 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
   /** rides with a settlement call in flight (the inline attempt and the timer must not overlap) */
   private settling = new Set<string>();
 
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.cfg = loadConfig(env);
-    this.sql = ctx.storage.sql;
-    this.gridPrecision = Math.max(...this.cfg.match.ringPrecisions);
-    this.initSchema();
-    this.zone = (ctx.id.name as string | undefined) ?? this.meta("zone");
-    this.registered = this.meta("registered") === "1";
-    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}'));
-    this.loadPositions();
-    void ctx.blockConcurrencyWhile(() => this.rearmTimers());
+  protected initTables() {
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS rides (
+        id TEXT PRIMARY KEY, status TEXT NOT NULL, customer_id TEXT NOT NULL, driver_id TEXT,
+        data TEXT NOT NULL, updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS ride_idem (customer_id TEXT NOT NULL, key TEXT NOT NULL, ride_id TEXT NOT NULL,
+        PRIMARY KEY (customer_id, key));
+      -- ON_TRIP route points not yet in Postgres; seq (AUTOINCREMENT: never reused) is their key there
+      CREATE TABLE IF NOT EXISTS track (seq INTEGER PRIMARY KEY AUTOINCREMENT, ride_id TEXT NOT NULL,
+        lat REAL NOT NULL, lng REAL NOT NULL, at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS track_ride ON track (ride_id, seq);
+    `);
   }
 
-  /**
-   * On every start: work that waits on Postgres must always have its timer, and the alarm must be
-   * set for the earliest timer. A crash between writing a timer row and setting the alarm, or while
-   * a timer was running (its row is deleted first), must not leave work nothing will pick up.
-   */
-  private async rearmTimers() {
+  /** Work that waits on Postgres or another actor must always have its timer (see ZoneActor.rearmTimers). */
+  protected override async rearmTimers() {
     const now = Date.now();
     const rows = this.sql
       .exec<{ id: string; kind: string }>(
@@ -260,194 +187,37 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
          AND json_extract(data, '$.pgPending') IS NOT 1`,
       now,
     );
-    const next = this.sql.exec<{ at: number | null }>("SELECT MIN(at) AS at FROM timers").one().at;
-    if (next === null) return;
-    const cur = await this.ctx.storage.getAlarm();
-    this.nextAlarm = cur;
-    if (cur === null || next < cur) {
-      this.nextAlarm = next;
-      await this.ctx.storage.setAlarm(next);
-    }
+    // every accept the driver's match actor has not heard of yet
+    this.sql.exec(
+      "INSERT OR IGNORE INTO timers (key, at) SELECT 'handover:' || id, ? FROM rides WHERE json_extract(data, '$.handover') IS NOT NULL",
+      now,
+    );
+    await super.rearmTimers();
   }
 
-  /** Rebuild the in-memory positions from the last snapshot (after eviction / restart). */
-  private loadPositions() {
-    const rows = this.sql
-      .exec<{ id: string; lat: number; lng: number; heading: number | null; updated_at: number }>(
-        "SELECT id, lat, lng, heading, updated_at FROM drivers WHERE lat IS NOT NULL AND lng IS NOT NULL",
-      )
-      .toArray();
-    for (const r of rows) this.setPos(r.id, r.lat, r.lng, r.heading, r.updated_at, r.updated_at);
-  }
-
-  private initSchema() {
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS drivers (
-        id TEXT PRIMARY KEY, name TEXT NOT NULL, vehicle TEXT,
-        lat REAL, lng REAL, heading REAL, cell TEXT,
-        status TEXT NOT NULL, ride_id TEXT, reserved_until INTEGER, offer TEXT,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS drivers_cell ON drivers (cell);
-      CREATE TABLE IF NOT EXISTS rides (
-        id TEXT PRIMARY KEY, status TEXT NOT NULL, customer_id TEXT NOT NULL, driver_id TEXT,
-        data TEXT NOT NULL, updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS ride_idem (customer_id TEXT NOT NULL, key TEXT NOT NULL, ride_id TEXT NOT NULL,
-        PRIMARY KEY (customer_id, key));
-      CREATE TABLE IF NOT EXISTS timers (key TEXT PRIMARY KEY, at INTEGER NOT NULL);
-      -- ON_TRIP route points not yet in Postgres; seq (AUTOINCREMENT: never reused) is their key there
-      CREATE TABLE IF NOT EXISTS track (seq INTEGER PRIMARY KEY AUTOINCREMENT, ride_id TEXT NOT NULL,
-        lat REAL NOT NULL, lng REAL NOT NULL, at INTEGER NOT NULL);
-      CREATE INDEX IF NOT EXISTS track_ride ON track (ride_id, seq);
-      -- replaced by Postgres-first transitions (HotRide.pending); never deployed with data that matters
-      DROP TABLE IF EXISTS outbox;
-      CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
-    `);
-  }
-
-  private meta(k: string): string | null {
-    return this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v ?? null;
-  }
-
-  // ============================================================ helpers
-
-  private learnZone(zone: string | null) {
-    if (!zone) return;
-    if (this.zone !== zone) {
-      this.zone = zone;
-      this.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('zone', ?)", zone);
-    }
-    if (!this.registered) {
-      // record this zone actor in Postgres once, so it can be enumerated (ops, dev reset)
-      this.registered = true;
-      void this.pg((sql) => db.registerZone(sql, zone)).then(
-        () => this.sql.exec("INSERT OR REPLACE INTO meta (k, v) VALUES ('registered', '1')"),
-        (e) => {
-          this.registered = false; // try again on the next call
-          console.error("zone register failed", e);
-        },
-      );
-    }
-  }
-
-  /** Dev only: drop every socket (code 4002 → clients log out) and all hot state. */
-  async reset(): Promise<void> {
-    for (const ws of this.ctx.getWebSockets()) {
-      try {
-        ws.close(4002, "reset");
-      } catch {
-        /* already closed */
-      }
-    }
-    await this.ctx.storage.deleteAlarm();
-    await this.ctx.storage.deleteAll();
-    this.initSchema();
-    this.zone = this.ctx.id.name ?? null;
-    this.registered = false;
-    this.pos.clear();
-    this.grid.clear();
-    this.nextAlarm = null;
+  override async reset(): Promise<void> {
+    await super.reset();
     this.creating.clear();
     this.committing.clear();
     this.lanes.clear();
     this.settling.clear();
   }
 
-  /** Every Postgres call of this actor goes through here (one seam; tests simulate outages with it). */
-  private pg<T>(fn: (sql: Sql) => Promise<T>): Promise<T> {
-    return withDb(this.env, fn);
+  private stub(zone: string): MatchApi {
+    return matchStub(this.env, zone) as unknown as MatchApi;
   }
 
-  private zoneOf(lat: number, lng: number) {
-    return geohashEncode(lat, lng, this.cfg.zonePrecision);
-  }
-
-  private stub(zone: string): ZoneApi {
-    if (zone === this.zone) return this;
-    return zoneStub(this.env, zone) as unknown as ZoneApi;
-  }
-
-  private send(userId: string, msg: ServerMsg): number {
-    const sockets = this.ctx.getWebSockets(`user:${userId}`);
-    const data = JSON.stringify(msg);
-    for (const ws of sockets) {
-      try {
-        ws.send(data);
-      } catch {
-        /* socket closing */
-      }
-    }
-    return sockets.length;
-  }
-
-  private sendWs(ws: WebSocket, msg: ServerMsg) {
-    try {
-      ws.send(JSON.stringify(msg));
-    } catch {
-      /* closed */
-    }
-  }
-
-  private connected(userId: string) {
-    return this.ctx.getWebSockets(`user:${userId}`).length > 0;
-  }
-
-  // ------------------------------------------------------------ timers (DO alarm multiplexed)
-
-  private async schedule(key: string, at: number) {
-    this.sql.exec("INSERT OR REPLACE INTO timers (key, at) VALUES (?, ?)", key, at);
-    if (this.nextAlarm === undefined) this.nextAlarm = await this.ctx.storage.getAlarm();
-    if (this.nextAlarm === null || at < this.nextAlarm) {
-      this.nextAlarm = at;
-      await this.ctx.storage.setAlarm(at);
-    }
-  }
-
-  private cancelTimer(key: string) {
-    this.sql.exec("DELETE FROM timers WHERE key = ?", key);
-  }
-
-  /**
-   * Fires every due timer. Timers of different rides run concurrently (bounded), timers of the
-   * same ride run in order — so one slow RPC / database call doesn't delay every other ride.
-   */
-  async alarm() {
-    this.nextAlarm = null; // the alarm that fired is consumed
-    const now = Date.now();
-    const due = this.sql.exec<{ key: string }>("SELECT key FROM timers WHERE at <= ? ORDER BY at", now).toArray();
-    const byRide = new Map<string, string[]>();
-    for (const { key } of due) {
-      const id = key.slice(key.indexOf(":") + 1);
-      byRide.set(id, [...(byRide.get(id) ?? []), key]);
-    }
-    await runLimited([...byRide.values()], ALARM_CONCURRENCY, async (keys) => {
-      for (const key of keys) await this.runTimer(key);
-    });
-    const next = this.sql.exec<{ at: number | null }>("SELECT MIN(at) AS at FROM timers").one().at;
-    if (next !== null && (this.nextAlarm === null || next < this.nextAlarm)) {
-      this.nextAlarm = next;
-      await this.ctx.storage.setAlarm(next);
-    }
-  }
-
-  private async runTimer(key: string) {
-    this.sql.exec("DELETE FROM timers WHERE key = ?", key);
-    const [kind, id] = [key.slice(0, key.indexOf(":")), key.slice(key.indexOf(":") + 1)];
-    try {
-      if (kind === "dispatch") await this.dispatch(id);
-      else if (kind === "offer") await this.onOfferTimeout(id);
-      else if (kind === "search") await this.onSearchTimeout(id);
-      else if (kind === "sync") await this.push(id, "recover");
-      else if (kind === "settle") await this.settleFromTimer(id);
-      else if (kind === "create") await this.recoverCreate(id);
-      else if (kind === "watch") await this.watchDriver(id);
-      else if (kind === "track") await this.flushTrack(id);
-      else if (kind === "handover") await this.handOver(id);
-      else if (kind === "purge") this.purge();
-    } catch (err) {
-      console.error("timer failed", key, err);
-    }
+  protected async onTimer(kind: string, id: string) {
+    if (kind === "dispatch") await this.dispatch(id);
+    else if (kind === "offer") await this.onOfferTimeout(id);
+    else if (kind === "search") await this.onSearchTimeout(id);
+    else if (kind === "sync") await this.push(id, "recover");
+    else if (kind === "settle") await this.settleFromTimer(id);
+    else if (kind === "create") await this.recoverCreate(id);
+    else if (kind === "watch") await this.watchDriver(id);
+    else if (kind === "track") await this.flushTrack(id);
+    else if (kind === "handover") await this.handOver(id);
+    else if (kind === "purge") this.purge();
   }
 
   private purge() {
@@ -463,14 +233,11 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     this.sql.exec(
       "DELETE FROM ride_idem WHERE ride_id NOT IN (SELECT id FROM rides)",
     );
-    const gone = this.sql
-      .exec<{ id: string }>(
-        "SELECT id FROM drivers WHERE status IN ('OFFLINE','AVAILABLE') AND updated_at < ?",
-        now - KEEP_IDLE_DRIVER_MS,
-      )
-      .toArray();
-    for (const { id } of gone) if ((this.pos.get(id)?.ts ?? 0) < now - KEEP_IDLE_DRIVER_MS) this.removeDriver(id);
-    const left = this.sql.exec<{ n: number }>("SELECT (SELECT COUNT(*) FROM rides) + (SELECT COUNT(*) FROM drivers) AS n").one().n;
+    // drivers stay here only while on one of this actor's active rides
+    this.sql.exec(
+      "DELETE FROM drivers WHERE ride_id IS NULL OR ride_id NOT IN (SELECT id FROM rides WHERE status IN ('ACCEPTED','ARRIVED','ON_TRIP'))",
+    );
+    const left = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM rides").one().n;
     if (left > 0) void this.schedule("purge:all", now + PURGE_EVERY_MS);
   }
 
@@ -642,9 +409,9 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       ride.dropoutDrivers = [...(ride.dropoutDrivers ?? []), before];
       ride.searchDeadline = Date.now() + this.cfg.searchTimeoutMs;
     }
-    // the driver who accepted is registered in another zone: it must learn they are on this ride now,
+    // the driver who accepted is registered in a match actor: it must learn they are on this ride now,
     // also when the accept's reply was lost or it only committed on the recovery path (A6)
-    const handover = event === "ACCEPT" && offer && offer.driverId === ride.driverId && offer.zone !== this.zone;
+    const handover = event === "ACCEPT" && offer && offer.driverId === ride.driverId;
     if (handover) ride.handover = { zone: offer.zone, driverId: offer.driverId, attempts: 0 };
     this.saveRide(ride);
     // same storage step as the save above: a pending handover always has its timer
@@ -663,7 +430,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     if (event === "COMPLETE" || event === "CANCEL") await this.schedule(`track:${ride.id}`, Date.now());
 
     if (event === "ACCEPT" && ride.driverId) {
-      // The driver now lives in the ride's zone for the whole trip (one actor per active ride).
+      // The driver now lives in this ride actor for the whole trip.
       const d = this.loadDriver(ride.driverId) ?? {
         id: ride.driverId, name: ride.driver?.name ?? "", vehicle: ride.driver?.vehicle ?? null,
         lat: ctx.driverPos?.lat ?? null, lng: ctx.driverPos?.lng ?? null, heading: ctx.driverPos?.heading ?? null,
@@ -676,24 +443,12 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       this.saveDriver(d);
     }
     const freedId = event === "CANCEL" ? ride.driverId : event === "REQUEUE" ? before : null;
-    const freed = freedId ? this.loadDriver(freedId) : null;
-    if (freed && freed.rideId === ride.id) {
-      this.setDriverFree(freed);
-      freed.updatedAt = Date.now();
-      this.saveDriver(freed);
-    }
 
     if (event === "REQUEUE") this.send(ride.customerId, { t: "ride.requeued", rideId: ride.id, reason: "DRIVER_CANCELLED" });
     this.notifyRide(ride);
     if (offer && offer.driverId !== ride.driverId)
       await this.stub(offer.zone).release(offer.driverId, ride.id, event === "NO_CANDIDATE" ? "NO_DRIVER" : "CANCELLED");
-    if (freed) {
-      const d = this.loadDriver(freed.id);
-      if (d) {
-        this.sendDriverState(d);
-        this.maybeHandOff(d);
-      }
-    }
+    if (freedId) await this.releaseDriver(freedId, ride.id, "AVAILABLE");
     if (event === "COMPLETE") await this.completeRide(ride, settled);
     return this.loadRide(ride.id) ?? ride;
   }
@@ -748,188 +503,6 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     const t = applyRideEvent(r.status, ev);
     r.status = t.status;
     return t.changed;
-  }
-
-  // ------------------------------------------------------------ hot store: drivers
-
-  // ------------------------------------------------------------ driver positions (memory + grid)
-
-  private setPos(id: string, lat: number, lng: number, heading: number | null, ts: number, savedAt?: number) {
-    const cell = geohashEncode(lat, lng, this.gridPrecision);
-    const prev = this.pos.get(id);
-    if (prev && prev.cell !== cell) this.grid.get(prev.cell)?.delete(id);
-    if (!prev || prev.cell !== cell) {
-      let set = this.grid.get(cell);
-      if (!set) this.grid.set(cell, (set = new Set()));
-      set.add(id);
-    }
-    this.pos.set(id, { lat, lng, heading, ts, cell, savedAt: savedAt ?? prev?.savedAt ?? 0, outside: prev?.outside ?? 0 });
-  }
-
-  private dropPos(id: string) {
-    const p = this.pos.get(id);
-    if (!p) return;
-    const set = this.grid.get(p.cell);
-    set?.delete(id);
-    if (set?.size === 0) this.grid.delete(p.cell);
-    this.pos.delete(id);
-  }
-
-  private removeDriver(id: string) {
-    this.sql.exec("DELETE FROM drivers WHERE id = ?", id);
-    this.dropPos(id);
-  }
-
-  // ------------------------------------------------------------ hot store: drivers
-
-  /** Driver row from SQLite with the live in-memory position laid over it. */
-  private loadDriver(id: string): DriverRow | null {
-    const r = this.sql.exec("SELECT * FROM drivers WHERE id = ?", id).toArray()[0];
-    if (!r) return null;
-    const p = this.pos.get(id);
-    return {
-      id: r.id as string,
-      name: r.name as string,
-      vehicle: r.vehicle ? (JSON.parse(r.vehicle as string) as Vehicle) : null,
-      lat: p?.lat ?? (r.lat as number | null),
-      lng: p?.lng ?? (r.lng as number | null),
-      heading: p ? p.heading : (r.heading as number | null),
-      status: r.status as DriverStatus,
-      rideId: r.ride_id as string | null,
-      reservedUntil: r.reserved_until as number | null,
-      offer: r.offer ? (JSON.parse(r.offer as string) as OfferPayload) : null,
-      updatedAt: Math.max(r.updated_at as number, p?.ts ?? 0),
-    };
-  }
-
-  /** Writes the full row (status changes + position snapshot). Location pings do NOT call this. */
-  private saveDriver(d: DriverRow) {
-    const now = Date.now();
-    const cell = d.lat !== null && d.lng !== null ? geohashEncode(d.lat, d.lng, this.gridPrecision) : null;
-    this.sql.exec(
-      `INSERT OR REPLACE INTO drivers (id, name, vehicle, lat, lng, heading, cell, status, ride_id, reserved_until, offer, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      d.id, d.name, d.vehicle ? JSON.stringify(d.vehicle) : null, d.lat, d.lng, d.heading, cell, d.status,
-      d.rideId, d.reservedUntil, d.offer ? JSON.stringify(d.offer) : null, d.updatedAt,
-    );
-    if (d.lat !== null && d.lng !== null) this.setPos(d.id, d.lat, d.lng, d.heading, d.updatedAt, now);
-  }
-
-  private setDriverFree(d: DriverRow) {
-    d.status = "AVAILABLE";
-    d.rideId = null;
-    d.reservedUntil = null;
-    d.offer = null;
-  }
-
-  private sendDriverState(d: DriverRow) {
-    this.send(d.id, { t: "driver.state", status: d.status, rideId: d.rideId });
-  }
-
-  /**
-   * An AVAILABLE driver outside this zone is handed to the zone it is in now — once clearly inside
-   * it, or after several pings outside (hysteresis: GPS jitter on a border must not loop reconnects).
-   */
-  private maybeHandOff(d: DriverRow): boolean {
-    if (d.status !== "AVAILABLE" || d.lat === null || d.lng === null || !this.zone) return false;
-    const z = this.zoneOf(d.lat, d.lng);
-    const p = this.pos.get(d.id);
-    if (z === this.zone) {
-      if (p) p.outside = 0;
-      return false;
-    }
-    const outside = (p?.outside ?? 0) + 1;
-    if (p) p.outside = outside;
-    if (!shouldHandOff({ lat: d.lat, lng: d.lng }, z, outside, this.cfg.presence)) return false;
-    this.removeDriver(d.id);
-    for (const ws of this.ctx.getWebSockets(`user:${d.id}`)) {
-      this.sendWs(ws, { t: "zone.moved", zone: z });
-      ws.close(4001, "zone moved");
-    }
-    return true;
-  }
-
-  // ============================================================ RPC: matching across zones
-
-  /** Drivers in `cells` from the in-memory grid (no table scan), then their status by primary key. */
-  async nearest(cells: string[], pickup: Place, exclude: string[]): Promise<Candidate[]> {
-    const ids = new Set<string>();
-    for (const cell of cells) {
-      const keys = cell.length >= this.gridPrecision ? [cell.slice(0, this.gridPrecision)] : geohashChildren(cell, this.gridPrecision);
-      for (const k of keys) for (const id of this.grid.get(k) ?? []) ids.add(id);
-    }
-    if (ids.size === 0) return [];
-    const rows = this.sql
-      .exec<{ id: string; status: string; reserved_until: number | null }>(
-        "SELECT id, status, reserved_until FROM drivers WHERE id IN (SELECT value FROM json_each(?))",
-        JSON.stringify([...ids]),
-      )
-      .toArray();
-    const drivers: DriverSnapshot[] = [];
-    for (const r of rows) {
-      const p = this.pos.get(r.id);
-      if (!p || !this.connected(r.id)) continue;
-      drivers.push({
-        id: r.id,
-        lat: p.lat,
-        lng: p.lng,
-        status: r.status as DriverStatus,
-        reservedUntil: r.reserved_until,
-        updatedAt: p.ts,
-      });
-    }
-    return rankCandidates(pickup, drivers, { now: Date.now(), exclude: new Set(exclude), cfg: this.cfg.match });
-  }
-
-  /**
-   * Atomic reservation (single writer): only an AVAILABLE, connected driver can be reserved.
-   * Idempotent per ride, so the ride's zone can retry it when the reply was lost.
-   */
-  async reserveAndOffer(driverId: string, offer: OfferPayload, ttlMs: number): Promise<boolean> {
-    const d = this.loadDriver(driverId);
-    const now = Date.now();
-    if (!d) return false;
-    // a retry of a reservation whose reply was lost: same ride, still reserved → offer it again
-    const again = d.status === "RESERVED" && d.rideId === offer.rideId;
-    const free = again || d.status === "AVAILABLE" || (d.status === "RESERVED" && (d.reservedUntil ?? 0) < now);
-    if (!free || !this.connected(driverId)) return false;
-    d.status = "RESERVED";
-    d.rideId = offer.rideId;
-    d.reservedUntil = now + ttlMs;
-    d.offer = offer;
-    this.saveDriver(d);
-    this.send(driverId, { t: "offer", ...offer });
-    return true;
-  }
-
-  async release(driverId: string, rideId: string, reason: string): Promise<void> {
-    const d = this.loadDriver(driverId);
-    if (!d || d.status !== "RESERVED" || d.rideId !== rideId) return;
-    this.setDriverFree(d);
-    this.saveDriver(d);
-    this.send(driverId, { t: "offer.cancelled", rideId, reason });
-    this.maybeHandOff(d);
-  }
-
-  /**
-   * The driver's accept of `rideId` committed in `rideZone`: they live there for the trip. Normally the
-   * driver's own accept already moved them; this covers the accept whose reply was lost (A6). Idempotent.
-   */
-  async handOverToRide(driverId: string, rideId: string, rideZone: string): Promise<void> {
-    const d = this.loadDriver(driverId);
-    if (!d || d.status === "ON_RIDE") return; // already moved (or a ride of this zone: not ours to touch)
-    // reserved for another ride after this one's reservation lapsed: that offer can't be taken now
-    if (d.status === "RESERVED" && d.rideId && d.rideId !== rideId)
-      this.send(driverId, { t: "offer.cancelled", rideId: d.rideId, reason: "CANCELLED" });
-    this.removeDriver(driverId);
-    for (const ws of this.ctx.getWebSockets(`user:${driverId}`)) {
-      this.sendWs(ws, { t: "zone.moved", zone: rideZone, rideId });
-      try {
-        ws.close(4001, "zone moved");
-      } catch {
-        /* already closing */
-      }
-    }
   }
 
   /** `handover:` timer: tell the accepting driver's zone, retried until it has heard. */
@@ -1429,7 +1002,7 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     });
   }
 
-  private driverRideEvent(driverId: string, rideId: string, type: "ARRIVE" | "START" | "COMPLETE"): Promise<void> {
+  private rideEventByDriver(driverId: string, rideId: string, type: "ARRIVE" | "START" | "COMPLETE"): Promise<void> {
     return this.serial(rideId, () => this.driverRideEventNow(driverId, rideId, type));
   }
 
@@ -1459,31 +1032,17 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
   private async completeRide(ride: HotRide, settled: db.SettleResult | null) {
     const driverId = ride.driverId!;
     const balance = settled ? this.applyPaid(ride.id, settled) : await this.settle(ride.id);
-    const d = this.loadDriver(driverId);
-    if (!d || d.rideId !== ride.id) return;
-    this.setDriverFree(d);
-    if (balance !== null && balance < this.cfg.driverMinBalance) {
-      d.status = "OFFLINE";
-      this.send(driverId, { t: "error", code: "DRIVER_BALANCE_TOO_LOW", message: "top up before going online again" });
-    }
-    d.updatedAt = Date.now();
-    this.saveDriver(d);
-    this.sendDriverState(d);
-    this.maybeHandOff(d);
+    const low = balance !== null && balance < this.cfg.driverMinBalance;
+    if (low) this.send(driverId, { t: "error", code: "DRIVER_BALANCE_TOO_LOW", message: "top up before going online again" });
+    await this.releaseDriver(driverId, ride.id, low ? "OFFLINE" : "AVAILABLE");
   }
 
-  /** Retry path (timer / repeated "complete"): settle, then apply the driver balance rule if they are idle. */
+  /**
+   * Retry path (timer / repeated "complete"). The driver is back in a match actor by now: their
+   * balance is checked again when they next go online.
+   */
   private async settleFromTimer(rideId: string) {
-    const driverId = this.loadRide(rideId)?.driverId;
-    const balance = await this.settle(rideId);
-    if (balance === null || !driverId || balance >= this.cfg.driverMinBalance) return;
-    const d = this.loadDriver(driverId);
-    if (!d || d.status !== "AVAILABLE") return; // on another ride / offline: checked again when going online
-    d.status = "OFFLINE";
-    d.updatedAt = Date.now();
-    this.saveDriver(d);
-    this.send(driverId, { t: "error", code: "DRIVER_BALANCE_TOO_LOW", message: "top up before going online again" });
-    this.sendDriverState(d);
+    await this.settle(rideId);
   }
 
   /**
@@ -1537,45 +1096,94 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
     return res.driverBalance;
   }
 
+  // ============================================================ drivers on a trip
+
+  /**
+   * The ride no longer needs its driver (completed, cancelled, dropped): hand them back to the match
+   * actor of where they are now, then point their sockets there. If that call fails the driver
+   * reconnects OFFLINE there and goes online again.
+   */
+  private async releaseDriver(driverId: string, rideId: string, status: "AVAILABLE" | "OFFLINE") {
+    const d = this.loadDriver(driverId);
+    if (!d || d.rideId !== rideId) return;
+    const zone = d.lat !== null && d.lng !== null ? this.zoneOf(d.lat, d.lng) : this.zone!;
+    this.removeDriver(driverId);
+    this.send(driverId, { t: "driver.state", status, rideId: null });
+    try {
+      await this.stub(zone).returnDriver({ id: d.id, name: d.name, vehicle: d.vehicle, lat: d.lat, lng: d.lng, heading: d.heading }, status);
+    } catch (e) {
+      console.error("return driver failed", driverId, zone, e);
+    }
+    // not closed here: the client closes and reconnects (a ride event it sends meanwhile still lands)
+    this.moveSockets(driverId, { t: "zone.moved", zone }, false);
+  }
+
+  /** A location ping of a driver on one of this actor's rides: the customer's map and the trip route. */
+  private onDriverLoc(d: DriverRow, loc: { lat: number; lng: number; heading?: number }) {
+    const now = this.takePing(d, loc);
+    if (!now || d.status !== "ON_RIDE" || !d.rideId) return;
+    const ride = this.loadRide(d.rideId);
+    if (!ride) return;
+    // the trip's route: buffered here, sent to Postgres in batches by the `track:` timer
+    if (ride.status === "ON_TRIP")
+      this.sql.exec("INSERT INTO track (ride_id, lat, lng, at) VALUES (?, ?, ?, ?)", ride.id, d.lat, d.lng, d.updatedAt);
+    this.send(ride.customerId, { t: "driver.loc", rideId: ride.id, lat: d.lat!, lng: d.lng!, heading: d.heading });
+    this.driverBack(ride);
+  }
+
+  async driverRideEvent(driverId: string, rideId: string, type: "ARRIVE" | "START" | "COMPLETE"): Promise<Result> {
+    try {
+      await this.rideEventByDriver(driverId, rideId, type);
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof DomainError) return fail(e.code, e.message);
+      throw e;
+    }
+  }
+
+  async driverLoc(driverId: string, rideId: string, loc: { lat: number; lng: number; heading?: number }): Promise<void> {
+    const d = this.loadDriver(driverId);
+    if (d && d.rideId === rideId) this.onDriverLoc(d, loc);
+  }
+
+  async rideOf(rideId: string, userId: string): Promise<RideView | null> {
+    const ride = this.loadRide(rideId);
+    return ride && (ride.customerId === userId || ride.driverId === userId) ? this.view(ride) : null;
+  }
+
   // ============================================================ WebSocket (hibernation API)
 
   async fetch(req: Request): Promise<Response> {
     if (req.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
-    const zone = req.headers.get("x-zone");
-    const userId = req.headers.get("x-user-id");
-    const role = req.headers.get("x-role") as Role | null;
-    const name = decodeURIComponent(req.headers.get("x-user-name") ?? "");
-    if (!zone || !userId || !role) return new Response("bad request", { status: 400 });
-    this.learnZone(zone);
-
-    // one live socket per user per zone
-    for (const old of this.ctx.getWebSockets(`user:${userId}`)) old.close(4000, "replaced");
-
-    const pair = new WebSocketPair();
-    const [client, server] = [pair[0], pair[1]];
-    this.ctx.acceptWebSocket(server, [`user:${userId}`]);
-    server.serializeAttachment({ userId, role, name } satisfies SocketMeta);
+    const m = this.upgradeMeta(req);
+    if (!m) return new Response("bad request", { status: 400 });
+    this.learnZone(m.zone);
+    const { client, server } = this.acceptSocket({ userId: m.userId, role: m.role, name: m.name });
 
     let driverStatus: DriverStatus | undefined;
     let rideId: string | null = null;
-    if (role === "driver") {
-      const lat = Number(req.headers.get("x-lat"));
-      const lng = Number(req.headers.get("x-lng"));
-      const hasLoc = req.headers.has("x-lat") && isValidLatLng({ lat, lng });
-      let d = this.loadDriver(userId);
+    if (m.role === "driver") {
+      let d = this.loadDriver(m.userId);
       if (!d) {
-        // adopt a driver whose active ride lives here (reconnect / zone hand-over after accept)
+        // a driver whose active ride lives here (reconnect, or the accept's hand-over)
         const active = this.sql
-          .exec<{ id: string }>("SELECT id FROM rides WHERE driver_id = ? AND status IN ('ACCEPTED','ARRIVED','ON_TRIP')", userId)
+          .exec<{ id: string }>("SELECT id FROM rides WHERE driver_id = ? AND status IN ('ACCEPTED','ARRIVED','ON_TRIP')", m.userId)
           .toArray()[0];
+        if (!active) {
+          // not on a ride here (it ended meanwhile): free drivers live in the match actors
+          const zone = m.lat !== null && m.lng !== null ? this.zoneOf(m.lat, m.lng) : (this.zone ?? m.zone);
+          this.sendWs(server, { t: "zone.moved", zone });
+          server.close(4001, "zone moved");
+          return new Response(null, { status: 101, webSocket: client });
+        }
         d = {
-          id: userId, name, vehicle: null, lat: null, lng: null, heading: null,
-          status: active ? "ON_RIDE" : "OFFLINE", rideId: active?.id ?? null, reservedUntil: null, offer: null, updatedAt: Date.now(),
+          id: m.userId, name: m.name, vehicle: null, lat: null, lng: null, heading: null,
+          status: "ON_RIDE", rideId: active.id, reservedUntil: null, offer: null, updatedAt: Date.now(),
         };
       }
-      if (hasLoc) {
-        d.lat = lat;
-        d.lng = lng;
+      if (m.lat !== null && m.lng !== null) {
+        d.lat = m.lat;
+        d.lng = m.lng;
         d.updatedAt = Date.now();
       }
       this.saveDriver(d);
@@ -1583,186 +1191,43 @@ export class ZoneDO extends DurableObject<Env> implements ZoneApi {
       rideId = d.rideId;
     } else {
       rideId = this.sql
-        .exec<{ id: string }>("SELECT id FROM rides WHERE customer_id = ? ORDER BY updated_at DESC LIMIT 1", userId)
+        .exec<{ id: string }>("SELECT id FROM rides WHERE customer_id = ? ORDER BY updated_at DESC LIMIT 1", m.userId)
         .toArray()[0]?.id ?? null;
     }
-    this.sendWs(server, { t: "hello", zone, role, driverStatus, rideId });
+    this.sendWs(server, { t: "hello", zone: m.zone, role: m.role, driverStatus, rideId });
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer) {
-    const meta = ws.deserializeAttachment() as SocketMeta;
-    let msg: ClientMsg;
-    try {
-      msg = JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw)) as ClientMsg;
-      if (typeof msg?.t !== "string") throw new Error();
-    } catch {
-      return this.sendWs(ws, { t: "error", code: "BAD_REQUEST", message: "invalid json message" });
-    }
-    try {
-      await this.handle(ws, meta, msg);
-    } catch (e) {
-      const code = e instanceof DomainError ? e.code : "BAD_REQUEST";
-      if (!(e instanceof DomainError)) console.error("ws handler error", e);
-      this.sendWs(ws, { t: "error", code, message: (e as Error).message });
-    }
-  }
-
-  async webSocketClose(ws: WebSocket, code: number) {
-    try {
-      ws.close(code === 1005 || code === 1006 ? 1000 : code, "closed");
-    } catch {
-      /* already closed */
-    }
-    // Driver row is kept: stale filter (30s) + socket check exclude it from matching,
-    // and a reconnect within that window resumes seamlessly.
-  }
-
-  private async handle(ws: WebSocket, meta: SocketMeta, msg: ClientMsg) {
-    if (msg.t === "ping") return this.sendWs(ws, { t: "pong" });
+  protected async handle(ws: WebSocket, meta: SocketMeta, msg: ClientMsg) {
     if (msg.t === "resume") return this.resume(ws, meta, msg.rideId);
     if (meta.role !== "driver") throw new DomainError("FORBIDDEN", `${msg.t} is driver-only`);
 
-    // Location pings are the bulk of all traffic: drop the ones the throttle would drop anyway from
-    // memory alone, before touching SQLite. Checked with the looser of the two intervals, so a ping
-    // dropped here would also be dropped below whatever the driver's status turns out to be.
-    if (msg.t === "loc" && isValidLatLng(msg)) {
-      const prev = this.pos.get(meta.userId);
-      const { locMinIntervalMs, locMinIntervalOnRideMs } = this.cfg.presence;
-      const loosest = locMinIntervalOnRideMs <= locMinIntervalMs;
-      if (prev && !acceptPing({ lat: prev.lat, lng: prev.lng, at: prev.ts }, { lat: msg.lat, lng: msg.lng, at: Date.now() }, loosest, this.cfg.presence))
-        return; // throttled
+    if ("rideId" in msg && msg.rideId && msg.t.startsWith("ride.")) {
+      // another zone's ride: point the driver there
+      const rz = zoneOfRide(msg.rideId);
+      if (rz && rz !== this.zone) return this.sendWs(ws, { t: "zone.moved", zone: rz, rideId: msg.rideId });
+      const type = msg.t === "ride.arrived" ? "ARRIVE" : msg.t === "ride.start" ? "START" : "COMPLETE";
+      return this.rideEventByDriver(meta.userId, msg.rideId, type);
     }
 
     const d = this.loadDriver(meta.userId);
     if (!d) {
-      // socket outlived its row (handed off): ask client to reconnect by location
-      this.sendWs(ws, { t: "zone.moved", zone: this.zone ?? "" });
-      return ws.close(4001, "zone moved");
+      // the trip is over and the driver was handed back: a ping in flight is dropped, anything else redirected
+      if (msg.t !== "loc") this.sendWs(ws, { t: "zone.moved", zone: this.zone ?? "" });
+      return;
     }
-
-    // ride events for another zone's ride: point the driver there
-    if ("rideId" in msg && msg.rideId && msg.t.startsWith("ride.")) {
-      const rz = zoneOfRide(msg.rideId);
-      if (rz && rz !== this.zone) {
-        this.sendWs(ws, { t: "zone.moved", zone: rz, rideId: msg.rideId });
-        return ws.close(4001, "zone moved");
-      }
-    }
-
     switch (msg.t) {
-      case "online": {
-        if (d.status === "ON_RIDE" || d.status === "RESERVED") return this.sendDriverState(d);
-        if (d.lat === null || d.lng === null) throw new DomainError("BAD_REQUEST", "send a loc first");
-        const { balance, vehicle } = await this.pg(async (sql) => ({
-          balance: await db.getBalance(sql, d.id),
-          vehicle: d.vehicle ?? (await db.getVehicle(sql, d.id)),
-        }));
-        if (balance < this.cfg.driverMinBalance) throw new DomainError("DRIVER_BALANCE_TOO_LOW", `balance ${balance}`);
-        const fresh = this.loadDriver(d.id) ?? d;
-        if (fresh.status !== "OFFLINE" && fresh.status !== "AVAILABLE") return this.sendDriverState(fresh);
-        fresh.vehicle ??= vehicle;
-        fresh.status = "AVAILABLE";
-        fresh.updatedAt = Date.now();
-        this.saveDriver(fresh);
-        this.sendDriverState(fresh);
-        this.maybeHandOff(fresh);
-        return;
-      }
-      case "offline": {
-        if (d.status === "ON_RIDE") throw new DomainError("DRIVER_BUSY", "finish the ride first");
-        const pending = d.status === "RESERVED" ? d.rideId : null;
-        d.status = "OFFLINE";
-        d.rideId = null;
-        d.offer = null;
-        d.reservedUntil = null;
-        this.saveDriver(d);
-        this.sendDriverState(d);
-        if (pending) await this.stub(zoneOfRide(pending)!).offerRejected(pending, d.id);
-        return;
-      }
-      case "loc": {
-        if (!isValidLatLng(msg)) throw new DomainError("BAD_REQUEST", "invalid lat/lng");
-        const now = Date.now();
-        const prev = this.pos.get(d.id);
-        const last = prev ? { lat: prev.lat, lng: prev.lng, at: prev.ts } : null;
-        if (!acceptPing(last, { lat: msg.lat, lng: msg.lng, at: now }, d.status === "ON_RIDE", this.cfg.presence)) return; // throttled
-        d.lat = msg.lat;
-        d.lng = msg.lng;
-        d.heading = typeof msg.heading === "number" ? msg.heading : d.heading;
-        d.updatedAt = now;
-        // memory only; SQLite gets a snapshot at most every SNAPSHOT_MS
-        this.setPos(d.id, d.lat, d.lng, d.heading, now);
-        if (now - (this.pos.get(d.id)?.savedAt ?? 0) >= SNAPSHOT_MS) this.saveDriver(d);
-        if (d.status === "ON_RIDE" && d.rideId) {
-          const ride = this.loadRide(d.rideId);
-          if (ride) {
-            // the trip's route: buffered here, sent to Postgres in batches by the `track:` timer
-            if (ride.status === "ON_TRIP")
-              this.sql.exec("INSERT INTO track (ride_id, lat, lng, at) VALUES (?, ?, ?, ?)", ride.id, d.lat, d.lng, now);
-            this.send(ride.customerId, { t: "driver.loc", rideId: ride.id, lat: d.lat, lng: d.lng, heading: d.heading });
-            this.driverBack(ride);
-          }
-        } else {
-          this.maybeHandOff(d);
-        }
-        return;
-      }
-      case "offer.accept": {
-        if (d.status === "ON_RIDE" && d.rideId === msg.rideId) return this.resume(ws, meta, msg.rideId);
-        if (d.status !== "RESERVED" || d.rideId !== msg.rideId) throw new DomainError("OFFER_EXPIRED");
-        const rideZone = zoneOfRide(msg.rideId);
-        if (!rideZone) throw new DomainError("RIDE_NOT_FOUND");
-        let res: Result<{ ride: RideView }>;
-        try {
-          res = await this.stub(rideZone).acceptOffer(msg.rideId, {
-            id: d.id, name: d.name, vehicle: d.vehicle, lat: d.lat, lng: d.lng, heading: d.heading,
-          });
-        } catch (e) {
-          // the call to the ride's zone failed: the accept may or may not have reached it
-          console.error("accept: ride zone unreachable", msg.rideId, d.id, e);
-          res = fail("UNAVAILABLE", "ride zone unreachable, retry");
-        }
-        if (!res.ok) {
-          const cur = this.loadDriver(d.id);
-          if (cur && cur.status === "RESERVED" && cur.rideId === msg.rideId) {
-            if (res.code === "UNAVAILABLE") {
-              // outcome unknown: the accept may still land. Hold the driver for this ride a while longer so
-              // they can retry; if it landed, the ride's zone hands them over (`handOverToRide`), if not,
-              // its offer timer releases them.
-              cur.reservedUntil = Math.max(cur.reservedUntil ?? 0, Date.now() + this.cfg.reserveTtlMs);
-            } else {
-              this.setDriverFree(cur);
-            }
-            this.saveDriver(cur);
-          }
-          throw new DomainError(res.code, res.message);
-        }
-        if (rideZone !== this.zone) {
-          // hand the driver over to the ride's zone for the trip
-          const cur = this.loadDriver(d.id);
-          if (cur && cur.rideId === msg.rideId) this.removeDriver(d.id);
-          this.sendWs(ws, { t: "ride.status", rideId: res.ride.id, status: res.ride.status, driver: res.ride.driver, at: Date.now(), ride: res.ride });
-          this.sendWs(ws, { t: "zone.moved", zone: rideZone, rideId: msg.rideId });
-          ws.close(4001, "zone moved");
-        }
-        return;
-      }
-      case "offer.reject": {
-        if (d.status !== "RESERVED" || d.rideId !== msg.rideId) return; // late / duplicate: no-op
-        this.setDriverFree(d);
-        this.saveDriver(d);
-        this.sendDriverState(d);
-        await this.stub(zoneOfRide(msg.rideId)!).offerRejected(msg.rideId, d.id);
-        this.maybeHandOff(this.loadDriver(d.id) ?? d);
-        return;
-      }
-      case "ride.arrived":
-        return this.driverRideEvent(d.id, msg.rideId, "ARRIVE");
-      case "ride.start":
-        return this.driverRideEvent(d.id, msg.rideId, "START");
-      case "ride.complete":
-        return this.driverRideEvent(d.id, msg.rideId, "COMPLETE");
+      case "online":
+        return this.sendDriverState(d);
+      case "offline":
+        throw new DomainError("DRIVER_BUSY", "finish the ride first");
+      case "loc":
+        return this.onDriverLoc(d, msg);
+      case "offer.accept":
+        if (d.rideId === msg.rideId) return this.resume(ws, meta, msg.rideId);
+        throw new DomainError("OFFER_EXPIRED");
+      case "offer.reject":
+        return; // late / duplicate: the driver is on a ride
       default:
         throw new DomainError("BAD_REQUEST", `unknown message type ${(msg as { t: string }).t}`);
     }

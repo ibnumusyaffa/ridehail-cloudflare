@@ -1,4 +1,4 @@
-import { SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import type { ServerMsg } from "../src/protocol";
 
 const BASE = "http://api.test";
@@ -30,32 +30,68 @@ export async function login(role: "customer" | "driver", name?: string) {
 
 type Msg = ServerMsg & Record<string, any>;
 
-/** WebSocket client with an awaitable message inbox. */
+/**
+ * WebSocket client with an awaitable message inbox. Like the app's client it follows `zone.moved`:
+ * closes the socket and reconnects to the actor named (the inbox carries over; a `hello` follows).
+ */
 export class Client {
   inbox: Msg[] = [];
   private waiters: { pred: (m: Msg) => boolean; resolve: (m: Msg) => void }[] = [];
   closed = false;
+  /** messages sent while reconnecting after `zone.moved` */
+  private queued: string[] | null = null;
 
-  private constructor(public ws: WebSocket) {
+  private constructor(public ws: WebSocket, private query: Record<string, string | number>) {
+    this.attach(ws);
+  }
+
+  private attach(ws: WebSocket) {
     ws.addEventListener("message", (e) => {
       const m = JSON.parse(e.data as string) as Msg;
+      if (m.t === "zone.moved" && ws === this.ws) void this.follow(m);
       const i = this.waiters.findIndex((w) => w.pred(m));
       if (i >= 0) this.waiters.splice(i, 1)[0]!.resolve(m);
       else this.inbox.push(m);
     });
-    ws.addEventListener("close", () => (this.closed = true));
+    ws.addEventListener("close", () => {
+      if (ws === this.ws && this.queued === null) this.closed = true;
+    });
   }
 
-  static async connect(query: Record<string, string | number>): Promise<Client> {
+  private static async open(query: Record<string, string | number>): Promise<WebSocket> {
     const qs = new URLSearchParams(Object.entries(query).map(([k, v]) => [k, String(v)]));
     const res = await SELF.fetch(`${BASE}/ws?${qs}`, { headers: { Upgrade: "websocket" } });
     if (!res.webSocket) throw new Error(`ws upgrade failed: ${res.status} ${await res.text()}`);
     res.webSocket.accept();
-    return new Client(res.webSocket);
+    return res.webSocket;
+  }
+
+  static async connect(query: Record<string, string | number>): Promise<Client> {
+    return new Client(await Client.open(query), query);
+  }
+
+  private async follow(m: Msg) {
+    const { zone: _z, rideId: _r, ...rest } = this.query;
+    this.query = m.rideId ? { ...rest, rideId: m.rideId } : m.zone ? { ...rest, zone: m.zone } : rest;
+    this.queued = [];
+    const old = this.ws;
+    try {
+      old.close(1000);
+    } catch {}
+    try {
+      this.ws = await Client.open(this.query);
+      this.attach(this.ws);
+      for (const q of this.queued) this.ws.send(q);
+    } catch {
+      this.closed = true;
+    } finally {
+      this.queued = null;
+    }
   }
 
   send(msg: object) {
-    this.ws.send(JSON.stringify(msg));
+    if (this.queued) this.queued.push(JSON.stringify(msg));
+    else this.ws.send(JSON.stringify(msg));
   }
 
   next(pred: string | ((m: Msg) => boolean), timeoutMs = 8_000): Promise<Msg> {
@@ -93,6 +129,34 @@ export async function onlineDriver(lat: number, lng: number, name?: string) {
 }
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Run `fn` on a zone's actor instance: "ride" (rides, dispatch, transitions) or "match" (free drivers,
+ * reservations); "both" runs it on each. Loosely typed: the actors' RPC types exceed tsc's depth limit.
+ */
+export async function inZone(zone: string, kind: "ride" | "match" | "both", fn: (inst: any) => void) {
+  const run = runInDurableObject as unknown as (stub: unknown, fn: (inst: any) => void) => Promise<void>;
+  const e = env as unknown as { MATCH: DurableObjectNamespace; RIDE: DurableObjectNamespace };
+  for (const k of kind === "both" ? (["match", "ride"] as const) : [kind]) {
+    const ns = k === "match" ? e.MATCH : e.RIDE;
+    await run(ns.get(ns.idFromName(`${k}:${zone}`)), fn);
+  }
+}
+
+/** "down": every Postgres call of the zone's actors fails; "lost-reply": it commits, then the caller sees an error. */
+export const postgresOutage = (zone: string, mode: "off" | "down" | "lost-reply") =>
+  inZone(zone, "both", (inst) => {
+    delete inst.pg; // back to the prototype's real implementation
+    if (mode === "off") return;
+    const real = inst.pg.bind(inst);
+    inst.pg =
+      mode === "down"
+        ? () => Promise.reject(new Error("simulated Postgres outage"))
+        : async (fn: unknown) => {
+            await real(fn);
+            throw new Error("simulated lost reply");
+          };
+  });
 
 /** Run `fn` against the test database (same Hyperdrive binding the app uses). */
 export { withDb as withSql } from "../src/pg";

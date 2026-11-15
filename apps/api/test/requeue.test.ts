@@ -1,8 +1,8 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:test";
 import { geohashBounds, geohashEncode } from "@gojek/core";
 import { describe, expect, it } from "vitest";
 import * as db from "../src/db";
-import { api, Client, login, onlineDriver, sleep, status, withSql } from "./helpers";
+import { api, Client, inZone, login, onlineDriver, postgresOutage, sleep, status, withSql } from "./helpers";
 
 // A driver who drops an accepted ride does not end it: the ride goes back to the search, the driver
 // is never offered it again, and the customer keeps the order (and its wallet hold).
@@ -16,27 +16,7 @@ function spot() {
 const off = (p: { lat: number; lng: number }, dLat: number, dLng = 0) => ({ lat: p.lat + dLat, lng: p.lng + dLng });
 const zoneOf = (p: { lat: number; lng: number }) => geohashEncode(p.lat, p.lng, 5);
 
-/** Run `fn` on the zone actor's instance (loosely typed: ZoneDO's RPC types exceed tsc's depth limit). */
-async function inZone(zone: string, fn: (inst: any) => void) {
-  const ns = (env as unknown as { ZONE: DurableObjectNamespace }).ZONE;
-  const run = runInDurableObject as unknown as (stub: unknown, fn: (inst: any) => void) => Promise<void>;
-  await run(ns.get(ns.idFromName(zone)), fn);
-}
-
-/** "down": every query fails. "lost-reply": the query commits, then the caller sees an error. */
-const postgres = (zone: string, mode: "off" | "down" | "lost-reply") =>
-  inZone(zone, (inst) => {
-    delete inst.pg;
-    if (mode === "off") return;
-    const real = inst.pg.bind(inst);
-    inst.pg =
-      mode === "down"
-        ? () => Promise.reject(new Error("simulated Postgres outage"))
-        : async (fn: unknown) => {
-            await real(fn);
-            throw new Error("simulated lost reply");
-          };
-  });
+const postgres = postgresOutage;
 
 const pgRide = (id: string) => withSql(env as unknown as Env, (sql) => db.getRide(sql, id));
 
@@ -115,7 +95,7 @@ describe("driver drops an accepted ride", () => {
 
   it("dropped more than maxRequeues times → the system cancels the ride, the hold is released", async () => {
     const p = spot();
-    await inZone(zoneOf(p), (inst) => {
+    await inZone(zoneOf(p), "ride", (inst) => {
       inst.cfg.maxRequeues = 1;
     });
     const first = await onlineDriver(off(p, 0.001).lat, p.lng, "Satu");
@@ -133,7 +113,7 @@ describe("driver drops an accepted ride", () => {
     await cws.next(status("CANCELLED"));
     expect((await second.ws.next((m) => m.t === "driver.state")).status).toBe("AVAILABLE");
     expect((await api("/wallet", { token: c.token })).json.held).toBe(0);
-    await inZone(zoneOf(p), (inst) => {
+    await inZone(zoneOf(p), "ride", (inst) => {
       inst.cfg.maxRequeues = 3;
     });
     for (const w of [cws, first.ws, second.ws]) w.close();

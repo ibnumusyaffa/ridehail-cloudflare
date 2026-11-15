@@ -71,14 +71,32 @@ export function zoneOfRide(rideId: string): string | null {
 
 const LOCATION_HINTS = new Set(["wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me"]);
 
+/** A zone has two actors: `match:<zone>` (free drivers, search) and `ride:<zone>` (its rides). */
+export type ActorKind = "match" | "ride";
+
+export const actorName = (kind: ActorKind, zone: string) => `${kind}:${zone}`;
+
+/** The zone an actor serves, from its name (`match:<zone>` / `ride:<zone>`). */
+export function zoneOfActor(name: string | undefined): string | null {
+  if (!name) return null;
+  const i = name.indexOf(":");
+  return i >= 0 ? name.slice(i + 1) : null;
+}
+
 /**
- * The zone actor's stub. `DO_LOCATION_HINT` places new actors near the Postgres region (every ride
+ * An actor's stub. `DO_LOCATION_HINT` places new actors near the Postgres region (every ride
  * transition waits on Postgres); it only applies when an actor is first created, never moves one.
  */
-export function zoneStub(env: Env, zone: string): DurableObjectStub {
-  const id = env.ZONE.idFromName(zone);
+function stubOf(ns: DurableObjectNamespace, env: Env, name: string): DurableObjectStub {
+  const id = ns.idFromName(name);
   const hint = env.DO_LOCATION_HINT;
-  return hint && LOCATION_HINTS.has(hint)
-    ? env.ZONE.get(id, { locationHint: hint as DurableObjectLocationHint })
-    : env.ZONE.get(id);
+  return hint && LOCATION_HINTS.has(hint) ? ns.get(id, { locationHint: hint as DurableObjectLocationHint }) : ns.get(id);
+}
+
+export function matchStub(env: Env, zone: string): DurableObjectStub {
+  return stubOf(env.MATCH as unknown as DurableObjectNamespace, env, actorName("match", zone));
+}
+
+export function rideStub(env: Env, zone: string): DurableObjectStub {
+  return stubOf(env.RIDE as unknown as DurableObjectNamespace, env, actorName("ride", zone));
 }

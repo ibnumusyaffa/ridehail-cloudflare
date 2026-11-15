@@ -1,11 +1,10 @@
-import { env, runInDurableObject } from "cloudflare:test";
 import { geohashBounds, geohashEncode } from "@gojek/core";
 import { describe, expect, it } from "vitest";
-import { api, Client, login, onlineDriver, sleep, status } from "./helpers";
+import { api, Client, inZone, login, onlineDriver, sleep, status } from "./helpers";
 
 // The search for a driver must not stop quietly: a rejection that races the offer, a failing RPC to a
-// zone, or a driver who comes online late must never end in a false NO_DRIVER. Faults are injected per
-// zone actor by shadowing its methods (every call inside a zone goes through `this`).
+// zone, or a driver who comes online late must never end in a false NO_DRIVER. Faults are injected in
+// the ride actor by shadowing its `stub` (every call to a match actor goes through it).
 
 let area = 0;
 function spot() {
@@ -16,11 +15,22 @@ function spot() {
 const off = (p: { lat: number; lng: number }, dLat: number, dLng = 0) => ({ lat: p.lat + dLat, lng: p.lng + dLng });
 const zoneOf = (p: { lat: number; lng: number }) => geohashEncode(p.lat, p.lng, 5);
 
-/** Run `fn` on the zone actor's instance (loosely typed: ZoneDO's RPC types exceed tsc's depth limit). */
-async function inZone(zone: string, fn: (inst: any) => void) {
-  const ns = (env as unknown as { ZONE: DurableObjectNamespace }).ZONE;
-  const run = runInDurableObject as unknown as (stub: unknown, fn: (inst: any) => void) => Promise<void>;
-  await run(ns.get(ns.idFromName(zone)), fn);
+type Reserve = (driverId: string, offer: unknown, ttlMs: number) => Promise<boolean>;
+
+/** Wrap the ride actor's `reserveAndOffer` calls to the match actors (`hook` gets the real call). */
+async function onReserve(zone: string, hook: (real: Reserve, ...args: Parameters<Reserve>) => Promise<boolean>) {
+  await inZone(zone, "ride", (inst) => {
+    const realStub = inst.stub.bind(inst);
+    inst.stub = (z: string) => {
+      const s = realStub(z);
+      return new Proxy(s, {
+        get: (t, k) =>
+          k === "reserveAndOffer"
+            ? (...a: Parameters<Reserve>) => hook((...b) => t.reserveAndOffer(...b), ...a)
+            : (...a: unknown[]) => t[k](...a),
+      });
+    };
+  });
 }
 
 async function order(p: { lat: number; lng: number }) {
@@ -38,15 +48,14 @@ describe("driver search", () => {
     const p = spot();
     const first = await onlineDriver(off(p, 0.001).lat, p.lng, "Cepat");
     const second = await onlineDriver(off(p, 0.003).lat, p.lng, "Kedua");
-    await inZone(zoneOf(p), (inst) => {
+    await inZone(zoneOf(p), "ride", (inst) => {
       inst.cfg.offerTimeoutMs = 15_000; // only the rejection can move the search on in time
-      const real = inst.reserveAndOffer.bind(inst);
-      // the offer reaches the driver, then the reservation's reply is slow to come back
-      inst.reserveAndOffer = async (...args: unknown[]) => {
-        const ok = await real(...args);
-        await new Promise((r) => setTimeout(r, 400));
-        return ok;
-      };
+    });
+    // the offer reaches the driver, then the reservation's reply is slow to come back
+    await onReserve(zoneOf(p), async (real, ...args) => {
+      const ok = await real(...args);
+      await new Promise((r) => setTimeout(r, 400));
+      return ok;
     });
     const { rideId, ws } = await order(p);
 
@@ -61,14 +70,11 @@ describe("driver search", () => {
   it("reserveAndOffer fails (reply lost) → retried, the driver gets the ride", async () => {
     const p = spot();
     const drv = await onlineDriver(off(p, 0.001).lat, p.lng, "Andi");
-    await inZone(zoneOf(p), (inst) => {
-      const real = inst.reserveAndOffer.bind(inst);
-      let calls = 0;
-      inst.reserveAndOffer = async (...args: unknown[]) => {
-        const ok = await real(...args);
-        if (++calls === 1) throw new Error("simulated lost RPC reply");
-        return ok;
-      };
+    let calls = 0;
+    await onReserve(zoneOf(p), async (real, ...args) => {
+      const ok = await real(...args);
+      if (++calls === 1) throw new Error("simulated lost RPC reply");
+      return ok;
     });
     const { rideId, ws } = await order(p);
 
@@ -84,13 +90,10 @@ describe("driver search", () => {
   it("reserveAndOffer fails before reaching the driver → retried, the driver gets the ride", async () => {
     const p = spot();
     const drv = await onlineDriver(off(p, 0.001).lat, p.lng, "Bayu");
-    await inZone(zoneOf(p), (inst) => {
-      const real = inst.reserveAndOffer.bind(inst);
-      let calls = 0;
-      inst.reserveAndOffer = async (...args: unknown[]) => {
-        if (++calls === 1) throw new Error("simulated RPC failure");
-        return real(...args);
-      };
+    let calls = 0;
+    await onReserve(zoneOf(p), async (real, ...args) => {
+      if (++calls === 1) throw new Error("simulated RPC failure");
+      return real(...args);
     });
     const { rideId, ws } = await order(p);
 
@@ -103,7 +106,7 @@ describe("driver search", () => {
 
   it("a driver who comes online well after the order is still offered; NO_DRIVER only at the deadline", async () => {
     const p = spot();
-    await inZone(zoneOf(p), (inst) => {
+    await inZone(zoneOf(p), "ride", (inst) => {
       inst.cfg.searchTimeoutMs = 10_000;
     });
     const { rideId, ws } = await order(p);
@@ -120,7 +123,7 @@ describe("driver search", () => {
 
   it("nobody around: NO_DRIVER comes at the search deadline, not after two empty searches", async () => {
     const p = spot();
-    await inZone(zoneOf(p), (inst) => {
+    await inZone(zoneOf(p), "ride", (inst) => {
       inst.cfg.searchTimeoutMs = 3_000;
     });
     const t0 = Date.now();
@@ -138,7 +141,7 @@ describe("driver search", () => {
     const pickup = { lat: b.latMin + 0.0005, lng: p.lng };
     const south = geohashEncode(b.latMin - 0.0005, p.lng, 5);
     expect(south).not.toBe(z);
-    await inZone(z, (inst) => {
+    await inZone(z, "ride", (inst) => {
       const real = inst.stub.bind(inst);
       inst.stub = (zone: string) =>
         zone === south ? { nearest: () => Promise.reject(new Error("simulated zone failure")) } : real(zone);

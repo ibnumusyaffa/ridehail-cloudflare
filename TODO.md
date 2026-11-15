@@ -16,7 +16,7 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
 
 - [x] **A1. Batas waktu Postgres** (§3.10) — kecil, prasyarat A2
   - `pg.ts`: `connect_timeout` 5 detik; `withDb` batas 8 detik per operasi (`DbTimeoutError`); transaksi lewat `begin()` dengan `SET LOCAL statement_timeout` 5 detik.
-  - `locationHint` DO lewat var `DO_LOCATION_HINT` (`zoneStub()` di `config.ts`). Hanya berlaku untuk DO yang baru dibuat.
+  - `locationHint` DO lewat var `DO_LOCATION_HINT` (`matchStub()` / `rideStub()` di `config.ts`). Hanya berlaku untuk DO yang baru dibuat.
   - Sisa: query Worker di luar transaksi belum punya batas sisi klien (hanya batas 60 detik Hyperdrive).
   - Kenapa duluan: setelah A2 tiap transisi menunggu Postgres; tanpa batas waktu, Postgres lambat = semua aksi menggantung ±30 detik.
 
@@ -28,7 +28,7 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
   - Dites: `test/resilience.test.ts` (cancel/complete saat Postgres mati, balasan hilang, tidak ada yang mengulang, accept vs cancel bersamaan).
 
 - [x] **A3. Ride `ON_TRIP` tidak boleh macet selamanya** (§3.1)
-  - Timer `watch:<rideId>` di ZoneDO, dipasang saat `START` (dan ulang di `rearmTimers` untuk tiap ride `ON_TRIP`). Membaca ping terakhir di memori (`pos.ts`), tidak ada tulis per ping.
+  - Timer `watch:<rideId>` di RideDO, dipasang saat `START` (dan ulang di `rearmTimers` untuk tiap ride `ON_TRIP`). Membaca ping terakhir di memori (`pos.ts`), tidak ada tulis per ping.
   - Driver tanpa ping `DRIVER_LOST_ASK_MS` (1 jam) → customer ditanya lewat WS `ride.driver_lost`, diulang tiap 1 jam. Jawaban `POST /rides/:id/driver-lost {action}`: `arrived` → `COMPLETE` (dibayar), `cancel` → `CANCEL` oleh `system` (`driver_lost_reported`, hold dilepas penuh). "Masih jalan" = tidak kirim apa-apa.
   - Tanpa ping `DRIVER_LOST_CANCEL_MS` (3 jam) dan tidak dijawab → `CANCEL` oleh `system` (`driver_lost`), hold dilepas penuh.
   - Driver ping lagi → `ride.driver_back`, pertanyaan ditarik; jawaban customer ditolak (`INVALID_TRANSITION`).
@@ -68,7 +68,7 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
 - [x] **A8. Driver batal → cari driver lain** (§3.4)
   - Event baru `REQUEUE`: `ACCEPTED/ARRIVED → REQUESTED`. Driver tidak lagi bisa `CANCEL`; `/rides/:id/cancel` dari driver = `REQUEUE` (alasan tetap wajib).
   - Postgres: satu transaksi `transitionRide` mengosongkan `driver_id`, `accepted_at`, `arrived_at`. Hold saldo tetap `ACTIVE` (customer masih memesan). Catatan: `one_active_ride_driver` adalah partial index (`ACCEPTED/ARRIVED/ON_TRIP`), jadi driver sudah lepas begitu status `REQUESTED`; `driver_id` dikosongkan supaya REST, riwayat driver, dan pemulihan tidak menunjuk driver lama.
-  - ZoneDO (`adopt`): driver masuk `rejected` + `dropoutDrivers`, `searchDeadline` diulang, timer `search:` + `dispatch:` dipasang, driver jadi `AVAILABLE`. Customer menerima `ride.requeued` lalu `ride.status` `REQUESTED`.
+  - RideDO (`adopt`): driver masuk `rejected` + `dropoutDrivers`, `searchDeadline` diulang, timer `search:` + `dispatch:` dipasang, driver jadi `AVAILABLE`. Customer menerima `ride.requeued` lalu `ride.status` `REQUESTED`.
   - Batas `MAX_REQUEUES` (3): driver ke-(N+1) yang batal → `CANCEL` oleh `system` (`drivers_cancelled`), hold dilepas.
   - Pemulihan: `EVENT_FOR.REQUESTED = REQUEUE`, hanya diikuti kalau ride di DO punya driver (OFFERING di DO = REQUESTED di Postgres). Ulang batal dari driver yang sama setelah sukses → 200 (idempotent).
   - Dites: `test/requeue.test.ts`.
@@ -77,10 +77,13 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
 ## Tahap B — Sebelum ada pengguna & uang sungguhan
 
 - [ ] **B1. Login OTP** — sekarang siapa pun bisa masuk dengan nomor siapa pun.
-- [ ] **B2. Pisah `zone.ts`** (1.255 baris) jadi beberapa file: posisi driver, pencarian, status ride (transisi + sync), pembayaran, WebSocket. Tanpa mengubah perilaku.
-- [ ] **B3. Deploy pertama** — pastikan Hyperdrive terpakai dari ZoneDO di produksi, bukan hanya Worker.
+- [x] **B2. Pisah `zone.ts`** — sekarang dua DO per zona: `MatchDO` (`match.ts`, driver bebas + pencarian) dan `RideDO` (`ride.ts`, ride + driver `ON_RIDE`), dasar bersama di `actor.ts`.
+  - Tiap accept kini lintas DO (jalur yang dulu hanya untuk driver di zona lain): RPC `acceptOffer`, `zone.moved`, timer `handover:`.
+  - Belum: `ride.ts` masih ±1.300 baris; bisa dipecah lagi (dispatch, transisi, pembayaran) tanpa mengubah perilaku.
+  - Catatan: saldo driver di bawah batas yang baru ketahuan dari pembayaran ulang (`settle:`) tidak lagi membuat driver `OFFLINE` saat itu juga; dicek saat ia online lagi.
+- [ ] **B3. Deploy pertama** — pastikan Hyperdrive terpakai dari kedua DO di produksi, bukan hanya Worker.
 - [ ] **B4. Payment gateway & penarikan saldo driver.**
-- [ ] **B5. Catatan kecil dari review (P3)** — driver yang socket-nya putus tetap `AVAILABLE` sampai 1 jam dan tidak dicek saldo ulang saat tersambung lagi; REST (`GET /rides/:id`, Postgres) dan WebSocket (ZoneDO) kini sama setelah A2, kecuali `OFFERING` (REST menampilkan `REQUESTED`); `purge` tidak menghapus driver `RESERVED` yang kedaluwarsa; `Idempotency-Key` dibuat baru tiap panggilan di `packages/client/src/api.ts`.
+- [ ] **B5. Catatan kecil dari review (P3)** — driver yang socket-nya putus tetap `AVAILABLE` sampai 1 jam dan tidak dicek saldo ulang saat tersambung lagi; REST (`GET /rides/:id`, Postgres) dan WebSocket (RideDO) kini sama setelah A2, kecuali `OFFERING` (REST menampilkan `REQUESTED`); `purge` tidak menghapus driver `RESERVED` yang kedaluwarsa; `Idempotency-Key` dibuat baru tiap panggilan di `packages/client/src/api.ts`.
 
 ---
 
@@ -90,8 +93,8 @@ Jangan dikerjakan sebelum Tahap A selesai dan ada hasil ukur.
 
 - [ ] **C1. Load test** — 1k → 5k driver di satu zona. Catat latensi tawaran, durasi DO, rows written, koneksi Postgres.
 - [ ] **C2. Tulis Postgres lewat Queues** — hanya bila C1 menunjukkan tulis ke Postgres jadi penghambat. Setelah A2 status ride ditulis langsung; ini hanya relevan untuk data non-kritis (riwayat, statistik).
-- [ ] **C3. RideShardDO** — pisah state ride dari zona jemput (N shard tetap, `hash(rideId) % N`).
-- [ ] **C4. ETA lewat jalan & batch matching** — layanan terpisah; ZoneDO tetap punya cadangan jarak lurus.
+- [ ] **C3. Shard RideDO untuk zona panas** — ride sudah terpisah dari pencarian (B2). Langkah berikut: zona ramai dipecah ke K RideDO (`ride:<zona>:<k>`), nomor shard disimpan di ID ride supaya K bisa dinaikkan tanpa merusak ride berjalan.
+- [ ] **C4. ETA lewat jalan & batch matching** — layanan terpisah; MatchDO tetap punya cadangan jarak lurus.
 - [ ] **C5. Zona adaptif, partisi tabel `rides`, read replica.**
 
 ### Aturan biaya (jangan dilanggar saat refactor)

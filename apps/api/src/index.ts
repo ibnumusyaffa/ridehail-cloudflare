@@ -3,12 +3,14 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { issueToken, type Principal, readToken } from "./auth";
-import { loadConfig, zoneOfRide, zoneStub } from "./config";
+import { loadConfig, matchStub, rideStub, zoneOfRide } from "./config";
 import * as db from "./db";
 import { connect, type Sql } from "./pg";
-import type { ZoneApi } from "./zone";
+import type { MatchApi } from "./match";
+import type { RideApi } from "./ride";
 
-export { ZoneDO } from "./zone";
+export { MatchDO } from "./match";
+export { RideDO } from "./ride";
 
 type AppEnv = { Bindings: Env; Variables: { user: Principal; db: () => Sql } };
 
@@ -29,7 +31,8 @@ class HttpError extends Error {
   }
 }
 
-const zoneApi = (env: Env, zone: string) => zoneStub(env, zone) as unknown as ZoneApi;
+const rideApi = (env: Env, zone: string) => rideStub(env, zone) as unknown as RideApi;
+const matchApi = (env: Env, zone: string) => matchStub(env, zone) as unknown as MatchApi;
 
 async function body<T = Record<string, unknown>>(req: Request): Promise<T> {
   try {
@@ -89,8 +92,9 @@ app.post("/auth/login", async (c) => {
 });
 
 // ------------------------------------------------------------- WebSocket gateway
-// /ws?token=...  customer: &rideId=  (or active ride lookup)
-//                driver:   &rideId= | &zone= (explicit, after zone.moved) | &lat=&lng= (zone by location)
+// /ws?token=...  customer: &rideId=  (or active ride lookup)                         → ride:<zone>
+//                driver:   &rideId= (on a ride)                                       → ride:<zone>
+//                          &zone= (after zone.moved) | &lat=&lng= (zone by location)  → match:<zone>
 //                &known=1: the client already knows whether it has an active ride (every reconnect after
 //                the first hello), so the database is not consulted — a deploy's reconnect storm costs 0 queries.
 app.get("/ws", async (c) => {
@@ -106,14 +110,17 @@ app.get("/ws", async (c) => {
   const lng = Number(q.lng);
   const hasLoc = q.lat !== undefined && q.lng !== undefined && isValidLatLng({ lat, lng });
 
-  let zone: string | null = null;
-  if (q.rideId) zone = zoneOfRide(q.rideId);
-  if (!zone && q.zone && isGeohash(q.zone) && q.zone.length === cfg.zonePrecision) zone = q.zone;
-  if (!zone && q.known !== "1") {
+  // a ride's participants connect to its ride actor; a driver without one to the match actor of where they are
+  const validZone = (z: string | null | undefined) => (z && isGeohash(z) && z.length === cfg.zonePrecision ? z : null);
+  let rideZone: string | null = validZone(q.rideId ? zoneOfRide(q.rideId) : null);
+  if (!rideZone && q.known !== "1") {
     const active = await db.getActiveRide(c.var.db(), user.sub, user.role);
-    if (active && (user.role === "customer" || active.status !== "OFFERING")) zone = zoneOfRide(active.id);
+    // Postgres keeps a searching ride REQUESTED; its driver is only offered it, still in a match actor
+    if (active && (user.role === "customer" || active.status !== "REQUESTED")) rideZone = zoneOfRide(active.id);
   }
-  if (!zone && hasLoc) zone = geohashEncode(lat, lng, cfg.zonePrecision);
+  let matchZone: string | null = null;
+  if (!rideZone && user.role === "driver") matchZone = validZone(q.zone) ?? (hasLoc ? geohashEncode(lat, lng, cfg.zonePrecision) : null);
+  const zone = rideZone ?? matchZone;
   if (!zone) return c.text(user.role === "driver" ? "lat & lng required" : "no active ride", 400);
 
   const headers = new Headers(c.req.raw.headers);
@@ -125,16 +132,16 @@ app.get("/ws", async (c) => {
     headers.set("x-lat", String(lat));
     headers.set("x-lng", String(lng));
   }
-  const stub = zoneStub(c.env, zone);
+  const stub = rideZone ? rideStub(c.env, zone) : matchStub(c.env, zone);
   return stub.fetch(new Request(c.req.raw.url, { headers }));
 });
 
 // ------------------------------------------------------------- dev only
-// Wipes ALL data (D1 + every zone actor). Enabled only when DEV_RESET=1 (set in .dev.vars, never in prod).
+// Wipes ALL data (Postgres + both actors of every zone). Enabled only when DEV_RESET=1 (set in .dev.vars, never in prod).
 app.post("/dev/reset", async (c) => {
   if (c.env.DEV_RESET !== "1") return c.json({ error: { code: "NOT_FOUND", message: "not found" } }, 404);
   const zones = await db.listZones(c.var.db());
-  await Promise.all(zones.map((z) => zoneApi(c.env, z).reset()));
+  await Promise.all(zones.flatMap((z) => [matchApi(c.env, z).reset(), rideApi(c.env, z).reset()]));
   await db.wipeAll(c.var.db());
   return c.json({ ok: true, zones: zones.length });
 });
@@ -182,7 +189,7 @@ app.post("/rides", async (c) => {
   const idemKey = c.req.header("Idempotency-Key")?.slice(0, 100) ?? null;
   // Idempotency, one-active-ride and the wallet hold are enforced by Postgres inside createRide.
   const zone = geohashEncode(pickup.lat, pickup.lng, cfg.zonePrecision);
-  const res = await zoneApi(c.env, zone).createRide(zone, { customerId: u.sub, pickup, dropoff, paymentMethod, idempotencyKey: idemKey });
+  const res = await rideApi(c.env, zone).createRide(zone, { customerId: u.sub, pickup, dropoff, paymentMethod, idempotencyKey: idemKey });
   if (!res.ok) throw new HttpError(res.code, res.message);
   return c.json({ rideId: res.ride.id, status: res.ride.status, ride: res.ride }, 201);
 });
@@ -221,7 +228,7 @@ app.post("/rides/:id/cancel", async (c) => {
   const b = await body<{ reason?: unknown }>(c.req.raw).catch(() => ({}) as { reason?: unknown });
   const reason = typeof b.reason === "string" ? b.reason.slice(0, 200) : "";
   if (u.role === "driver" && !reason) throw new HttpError("BAD_REQUEST", "driver must give a reason");
-  const res = await zoneApi(c.env, zone).cancelRide(id, u.sub, u.role, reason);
+  const res = await rideApi(c.env, zone).cancelRide(id, u.sub, u.role, reason);
   if (!res.ok) throw new HttpError(res.code, res.message);
   return c.json({ ride: res.ride });
 });
@@ -235,7 +242,7 @@ app.post("/rides/:id/driver-lost", async (c) => {
   if (u.role !== "customer") throw new HttpError("FORBIDDEN");
   const { action } = await body<{ action?: unknown }>(c.req.raw);
   if (action !== "arrived" && action !== "cancel") throw new HttpError("BAD_REQUEST", "action must be arrived | cancel");
-  const res = await zoneApi(c.env, zone).driverLost(id, u.sub, action);
+  const res = await rideApi(c.env, zone).driverLost(id, u.sub, action);
   if (!res.ok) throw new HttpError(res.code, res.message);
   return c.json({ ride: res.ride });
 });

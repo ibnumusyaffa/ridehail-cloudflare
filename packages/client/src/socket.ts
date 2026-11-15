@@ -42,8 +42,9 @@ export class RideSocket {
   private url() {
     const qs = new URLSearchParams({ token: this.opts.token });
     for (const [k, v] of Object.entries(this.opts.query?.() ?? {})) if (v !== undefined) qs.set(k, String(v));
-    if (this.zone) qs.set("zone", this.zone);
-    if (this.rideId && !qs.has("rideId") && !this.zone) qs.set("rideId", this.rideId);
+    // on a ride → its ride actor (by rideId); otherwise the match actor (zone told by zone.moved, else location)
+    if (this.rideId && !qs.has("rideId")) qs.set("rideId", this.rideId);
+    else if (this.zone) qs.set("zone", this.zone);
     if (this.known) qs.set("known", "1");
     return `${this.opts.baseUrl.replace(/^http/, "ws")}/ws?${qs}`;
   }
@@ -73,10 +74,12 @@ export class RideSocket {
         else if (this.rideId === msg.rideId) this.rideId = null;
       }
       if (msg.t === "zone.moved") {
-        // on a ride: follow the ride's zone; otherwise reconnect routed by location
-        this.zone = msg.rideId ? msg.zone : null;
-        if (msg.rideId) this.rideId = msg.rideId;
+        // on a ride: reconnect to the ride's actor; otherwise to the match actor of `zone`
+        this.zone = msg.zone || null;
+        this.rideId = msg.rideId ?? null;
         this.backoff = 100;
+        // the server may leave the old socket open (so a message sent meanwhile still lands): close it here
+        ws.close();
       }
       if (msg.t === "pong") return;
       this.opts.onMessage(msg);

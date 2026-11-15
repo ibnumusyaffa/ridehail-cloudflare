@@ -221,8 +221,8 @@ describe("ride flow", () => {
     const moved = await d.ws.next("zone.moved");
     expect(moved.zone).toBe(zone);
 
-    // reconnect into the ride's zone and finish the trip there
-    const d2 = await Client.connect({ token: d.token, zone: moved.zone, lat: driverAt.lat, lng: driverAt.lng });
+    // the client follows zone.moved into the ride's actor; the trip is finished there
+    const d2 = d.ws;
     const hello = await d2.next("hello");
     expect(hello).toMatchObject({ zone, driverStatus: "ON_RIDE", rideId: o.rideId });
     const cws = await Client.connect({ token: c.token, rideId: o.rideId });

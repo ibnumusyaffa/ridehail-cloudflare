@@ -14,10 +14,18 @@
       "localConnectionString": "postgres://postgres:postgres@localhost:54329/gojek"
     }
   ],
+  // each zone has two actors: match:<zone> (free drivers, search) and ride:<zone> (its rides, drivers on a trip)
   "durable_objects": {
-    "bindings": [{ "name": "ZONE", "class_name": "ZoneDO" }]
+    "bindings": [
+      { "name": "MATCH", "class_name": "MatchDO" },
+      { "name": "RIDE", "class_name": "RideDO" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ZoneDO"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ZoneDO"] },
+    // ZoneDO split in two; never deployed with data that matters
+    { "tag": "v2", "new_sqlite_classes": ["MatchDO", "RideDO"], "deleted_classes": ["ZoneDO"] }
+  ],
   "ratelimits": [
     // per client IP
     { "name": "LOGIN_LIMITER", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } },

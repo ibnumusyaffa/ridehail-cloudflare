@@ -8,7 +8,7 @@ Dokumen lain: [PLAN.md](PLAN.md) (rencana awal) · [ARCHITECTURE-REVIEW.md](ARCH
 ```
 packages/core              logika murni tanpa I/O: geohash, pencarian driver, status ride, tarif, pembayaran
 packages/client            client bersama: REST, WebSocket (reconnect / pindah zona), tipe pesan, peta & UI React
-apps/api                   Worker (REST + gerbang WebSocket) + ZoneDO (petugas zona) + Postgres
+apps/api                   Worker (REST + gerbang WebSocket) + MatchDO & RideDO (dua petugas per zona) + Postgres
 apps/simulator-customer    aplikasi web customer (Vite + React + MapLibre)   :5173
 apps/simulator-driver      aplikasi web driver dengan autopilot              :5174
 apps/e2e                   Playwright: test e2e + demo langsung
@@ -56,7 +56,9 @@ Tarif di backend tetap memakai jarak lurus × 1,3.
 | Bagian | File | Tugas |
 |---|---|---|
 | Worker | `apps/api/src/index.ts` | Pintu masuk. Cek token, validasi input, teruskan ke zona yang tepat. |
-| ZoneDO | `apps/api/src/zone.ts` | Petugas satu zona (geohash 5, ±5 km). Memegang posisi driver, mencari driver, mengatur status ride, mengirim pesan WebSocket. |
+| MatchDO | `apps/api/src/match.ts` | Petugas pencarian satu zona (`match:<zona>`, geohash 5, ±5 km). Memegang driver bebas (`OFFLINE`/`AVAILABLE`/`RESERVED`) dan posisinya, menjawab pencarian, mereservasi driver. |
+| RideDO | `apps/api/src/ride.ts` | Petugas ride satu zona (`ride:<zona>`). Memegang ride yang titik jemputnya di zona itu: dispatch, status, timer, rute, pembayaran; plus socket customer dan driver yang sedang `ON_RIDE`. |
+| (bersama) | `apps/api/src/actor.ts` | Dasar kedua DO: timer di satu alarm, socket, posisi driver, jalur Postgres. |
 | Postgres | `apps/api/src/db.ts`, `apps/api/migrations` | User, kendaraan, riwayat ride, saldo, transaksi, saldo tertahan. |
 
 Alur satu ride:
@@ -64,7 +66,7 @@ Alur satu ride:
 ```
 Customer pesan
   → Postgres mencatat ride (+ menahan saldo kalau WALLET)
-  → ZoneDO mencari driver terdekat, menawari satu driver per kali (15 detik)
+  → RideDO bertanya ke MatchDO (zona jemput + tetangga), menawari satu driver per kali (15 detik)
   → Terima → ACCEPTED → Tiba → ARRIVED → Mulai → ON_TRIP → Selesai → COMPLETED
   → Pembayaran diproses di Postgres
 ```
@@ -75,14 +77,15 @@ Status driver: `OFFLINE`, `AVAILABLE`, `RESERVED` (sedang ditawari), `ON_RIDE`.
 ### Zona dan pencarian driver
 
 - ID ride = `<zona>_<uuid>`, jadi siapa pun tahu zona pemilik ride tanpa lookup.
-- Posisi driver disimpan **di memori** ZoneDO (+ grid geohash 6), disalin ke SQLite tiap 30 detik. Satu ping lokasi tidak menulis ke storage.
+- Posisi driver disimpan **di memori** DO yang memegangnya (+ grid geohash 6 di MatchDO), disalin ke SQLite tiap 30 detik. Satu ping lokasi tidak menulis ke storage.
 - Pencarian: sel geohash 6 + 8 tetangga dulu; kalau kosong, geohash 5 + 8 tetangga. Maksimal 2 km dari titik jemput (`maxRadiusM` di `packages/core/src/matcher.ts`, jarak lurus), 10 kandidat terdekat. Zona tetangga ditanya paralel.
 - Tawaran berurutan. `reserveAndOffer` hanya berhasil untuk driver `AVAILABLE` yang tersambung; kalau gagal lanjut kandidat berikutnya. Tawaran 15 detik, reservasi 20 detik.
 - Pencarian berhenti (`NO_DRIVER`) setelah dua kali hasil kosong (jeda 5 detik) atau lewat 2 menit. Lihat catatan di [ARCHITECTURE-REVIEW.md](ARCHITECTURE-REVIEW.md) §3.2.
-- Setelah menerima, driver **pindah ke zona ride** selama perjalanan (`zone.moved` → client reconnect), jadi customer, driver, dan ride ada di satu ZoneDO.
+- Setelah menerima, driver **pindah ke RideDO** zona ride selama perjalanan (`zone.moved` dengan `rideId` → client reconnect), jadi customer, driver, dan ride ada di satu RideDO. Selesai / batal / driver mundur → RideDO mengembalikan driver ke MatchDO zona tempat ia berada (`returnDriver`), lalu `zone.moved` tanpa `rideId`.
+- Saat pindah, server tidak menutup socket lama; client yang menutup. Pesan yang terkirim di sela itu (`loc`, `ride.*`) diteruskan MatchDO ke RideDO, tidak hilang.
 - Driver `AVAILABLE` yang keluar zona dipindah setelah ≥ 100 m di dalam zona baru atau 3 ping berturut-turut di luar.
 - Ping lokasi: server membuang ping yang datang < 2 detik (saat ride: < 1 detik) **dan** bergerak < 30 m.
-- **Rute perjalanan**: tiap ping yang lolos saat `ON_TRIP` dicatat di SQLite ZoneDO (tabel `track`), lalu dikirim ke Postgres (`ride_track`) tiap `TRACK_FLUSH_MS` (1 menit) dan sekali lagi saat ride berakhir. Postgres mati → titik menunggu di ZoneDO, tidak hilang dan tidak dobel (`seq` jadi kunci). Posisi di luar `ON_TRIP` tidak disimpan.
+- **Rute perjalanan**: tiap ping yang lolos saat `ON_TRIP` dicatat di SQLite RideDO (tabel `track`), lalu dikirim ke Postgres (`ride_track`) tiap `TRACK_FLUSH_MS` (1 menit) dan sekali lagi saat ride berakhir. Postgres mati → titik menunggu di RideDO, tidak hilang dan tidak dobel (`seq` jadi kunci). Posisi di luar `ON_TRIP` tidak disimpan.
 
 ### Yang dijaga Postgres
 
@@ -92,19 +95,19 @@ Status driver: `OFFLINE`, `AVAILABLE`, `RESERVED` (sedang ditawari), `ON_RIDE`.
 - **Pembayaran** (`settleRide`): satu transaksi, aman diulang. WALLET: customer bayar, driver dapat tarif − komisi. CASH: driver berutang komisi. `wallets.balance` selalu sama dengan jumlah transaksinya.
 - Driver di bawah `DRIVER_MIN_BALANCE` tidak bisa online.
 
-### Status ride: Postgres dulu, baru ZoneDO
+### Status ride: Postgres dulu, baru RideDO
 
-- Tiap transisi (accept, tiba, mulai, selesai, batal, `NO_DRIVER`) dicek di state machine ZoneDO, ditulis ke Postgres dalam satu transaksi (compare-and-set pada `rides.version`), **baru** diterapkan di ZoneDO dan dikirim lewat WebSocket. Batal/`NO_DRIVER` melepas saldo tertahan, selesai sekalian membayar, semuanya dalam transaksi yang sama.
-- Postgres menolak (mis. driver sudah punya ride aktif) → ZoneDO ikut Postgres, aksi gagal dengan error yang jelas.
+- Tiap transisi (accept, tiba, mulai, selesai, batal, `NO_DRIVER`) dicek di state machine RideDO, ditulis ke Postgres dalam satu transaksi (compare-and-set pada `rides.version`), **baru** diterapkan di RideDO dan dikirim lewat WebSocket. Batal/`NO_DRIVER` melepas saldo tertahan, selesai sekalian membayar, semuanya dalam transaksi yang sama.
+- Postgres menolak (mis. driver sudah punya ride aktif) → RideDO ikut Postgres, aksi gagal dengan error yang jelas.
 - Postgres mati / balasan hilang → aksi dibalas `UNAVAILABLE` (503), status tidak berubah. Transisi dicatat "pending" dengan timer `sync:` **sebelum** Postgres ditanya. Timer itu (atau aksi berikutnya) melakukan *fence*: menaikkan `version` dari nilai yang diharapkan. Fence menang → tulisan lama pasti tidak pernah commit. Fence kalah → tulisan sudah commit dan diterapkan sekarang. Jadi "ditolak" selalu berarti "tidak terjadi".
 - Aksi pada satu ride berjalan satu per satu sesuai urutan datang.
-- `OFFERING` hanya ada di ZoneDO; di Postgres ride yang sedang mencari tetap `REQUESTED`.
+- `OFFERING` hanya ada di RideDO; di Postgres ride yang sedang mencari tetap `REQUESTED`.
 
 ### Tahan gangguan database
 
-- **Pembuatan ride**: dicatat "pending" di ZoneDO sebelum Postgres ditanya; kalau hasilnya tidak jelas, timer `create:` mengecek ulang.
+- **Pembuatan ride**: dicatat "pending" di RideDO sebelum Postgres ditanya; kalau hasilnya tidak jelas, timer `create:` mengecek ulang.
 - **Pembayaran**: biasanya ikut transaksi "selesai". Kalau tidak (balasan hilang), timer `settle:` mengulang sampai terbayar; driver tetap dibebaskan.
-- Semua timer (`dispatch:`, `offer:`, `search:`, `sync:`, `settle:`, `create:`, `watch:`, `track:`, `purge:`) memakai satu alarm DO + tabel `timers`. Saat ZoneDO menyala, timer untuk pekerjaan yang masih menunggu Postgres dipasang ulang.
+- Semua timer (`dispatch:`, `offer:`, `search:`, `sync:`, `settle:`, `create:`, `watch:`, `track:`, `purge:`) memakai satu alarm DO + tabel `timers`. Saat RideDO menyala, timer untuk pekerjaan yang masih menunggu Postgres dipasang ulang.
 
 ## API
 

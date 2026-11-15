@@ -1,10 +1,10 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:test";
 import { geohashBounds, geohashEncode } from "@gojek/core";
 import { describe, expect, it } from "vitest";
 import * as db from "../src/db";
-import { api, Client, login, onlineDriver, sleep, status, withSql } from "./helpers";
+import { api, Client, inZone, login, onlineDriver, postgresOutage, sleep, status, withSql } from "./helpers";
 
-// Postgres outages are simulated per zone actor by shadowing its `pg` seam (every DB call of ZoneDO
+// Postgres outages are simulated per actor by shadowing its `pg` seam (every DB call of ZoneDO
 // goes through it); the test's own queries (withSql) still reach the real database.
 
 let area = 0;
@@ -16,26 +16,7 @@ function spot() {
 const off = (p: { lat: number; lng: number }, dLat: number, dLng = 0) => ({ lat: p.lat + dLat, lng: p.lng + dLng });
 const zoneOf = (p: { lat: number; lng: number }) => geohashEncode(p.lat, p.lng, 5);
 
-type Outage = "off" | "down" | "lost-reply";
-
-/** "down": every query fails. "lost-reply": the query commits, then the caller sees an error. */
-async function postgres(zone: string, mode: Outage) {
-  const ns = (env as unknown as { ZONE: DurableObjectNamespace }).ZONE;
-  // loosely typed on purpose: inferring ZoneDO's RPC types here exceeds tsc's depth limit
-  const run = runInDurableObject as unknown as (stub: unknown, fn: (inst: any) => void) => Promise<void>;
-  await run(ns.get(ns.idFromName(zone)), (inst) => {
-    delete inst.pg; // back to the prototype's real implementation
-    if (mode === "off") return;
-    const real = inst.pg.bind(inst);
-    inst.pg =
-      mode === "down"
-        ? () => Promise.reject(new Error("simulated Postgres outage"))
-        : async (fn: unknown) => {
-            await real(fn);
-            throw new Error("simulated lost reply");
-          };
-  });
-}
+const postgres = postgresOutage;
 
 const pgRide = (id: string) => withSql(env as unknown as Env, (sql) => db.getRide(sql, id));
 
@@ -255,11 +236,9 @@ function acrossZones() {
   return { pickup, driverAt, rideZone: zoneOf(pickup), driverZone: zoneOf(driverAt) };
 }
 
-/** The driver's zone loses the reply of its `acceptOffer` RPC: the call lands, then the caller sees an error. */
+/** The driver's match actor loses the reply of its `acceptOffer` RPC: the call lands, then the caller sees an error. */
 async function lostAcceptReply(zone: string, on: boolean) {
-  const ns = (env as unknown as { ZONE: DurableObjectNamespace }).ZONE;
-  const run = runInDurableObject as unknown as (stub: unknown, fn: (inst: any) => void) => Promise<void>;
-  await run(ns.get(ns.idFromName(zone)), (inst) => {
+  await inZone(zone, "match", (inst) => {
     delete inst.stub; // back to the prototype's real implementation
     if (!on) return;
     const real = inst.stub.bind(inst);
@@ -322,9 +301,8 @@ describe("A6: a driver never holds two rides", () => {
     // the ride's zone learns it on its own (`sync:`), then tells the driver's zone (`handover:`)
     const moved = await drv.ws.next("zone.moved", 15_000);
     expect(moved).toMatchObject({ zone: rideZone, rideId });
-    const d2 = await Client.connect({ token: drv.token, zone: rideZone, lat: driverAt.lat, lng: driverAt.lng });
-    expect(await d2.next("hello")).toMatchObject({ zone: rideZone, driverStatus: "ON_RIDE", rideId });
-    d2.close();
+    // the client follows zone.moved into the ride's actor
+    expect(await drv.ws.next("hello")).toMatchObject({ zone: rideZone, driverStatus: "ON_RIDE", rideId });
     drv.ws.close();
   });
 
@@ -344,9 +322,7 @@ describe("A6: a driver never holds two rides", () => {
     expect(moved).toMatchObject({ zone: rideZone, rideId });
     expect((await pgRide(rideId))?.status).toBe("ACCEPTED");
     // gone from its old zone: it is never offered there again
-    const d2 = await Client.connect({ token: drv.token, zone: rideZone, lat: driverAt.lat, lng: driverAt.lng });
-    expect(await d2.next("hello")).toMatchObject({ driverStatus: "ON_RIDE", rideId });
-    d2.close();
+    expect(await drv.ws.next("hello")).toMatchObject({ driverStatus: "ON_RIDE", rideId });
     drv.ws.close();
   });
 
@@ -357,9 +333,7 @@ describe("A6: a driver never holds two rides", () => {
     const rideId: string = (await order(c.token, pickup)).json.rideId;
     await drv.ws.next("offer");
 
-    const ns = (env as unknown as { ZONE: DurableObjectNamespace }).ZONE;
-    const run = runInDurableObject as unknown as (stub: unknown, fn: (inst: any) => void) => Promise<void>;
-    await run(ns.get(ns.idFromName(driverZone)), (inst) => {
+    await inZone(driverZone, "match", (inst) => {
       const real = inst.stub.bind(inst);
       inst.stub = (z: string) => {
         const s = real(z);
