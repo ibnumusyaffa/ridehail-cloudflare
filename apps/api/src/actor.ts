@@ -34,6 +34,9 @@ interface Pos {
   outside: number;
 }
 
+/** What a location ping needs of a driver: no JSON columns (vehicle, offer) to parse. */
+export type PingDriver = Pick<DriverRow, "id" | "status" | "rideId" | "lat" | "lng" | "heading" | "updatedAt">;
+
 export interface SocketMeta {
   userId: string;
   role: Role;
@@ -81,6 +84,8 @@ export abstract class ZoneActor extends DurableObject<Env> {
   protected abstract readonly ridePings: boolean;
   /** cached alarm time: undefined = unknown (read lazily), null = none set */
   protected nextAlarm: number | null | undefined = undefined;
+  /** socket `loc` messages `throttled` already let through (`takePing` doesn't check them again) */
+  private acceptedPings = new WeakSet<object>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -270,7 +275,9 @@ export abstract class ZoneActor extends DurableObject<Env> {
     const byId = new Map<string, string[]>();
     for (const { key } of due) {
       const id = key.slice(key.indexOf(":") + 1);
-      byId.set(id, [...(byId.get(id) ?? []), key]);
+      const keys = byId.get(id);
+      if (keys) keys.push(key);
+      else byId.set(id, [key]);
     }
     await runLimited([...byId.values()], ALARM_CONCURRENCY, async (keys) => {
       for (const key of keys) await this.runTimer(key);
@@ -342,6 +349,27 @@ export abstract class ZoneActor extends DurableObject<Env> {
     };
   }
 
+  /** The columns a location ping needs, with the live position laid over them (no JSON parsing). */
+  protected loadDriverPing(id: string): PingDriver | null {
+    const r = this.sql
+      .exec<{ status: string; ride_id: string | null; lat: number | null; lng: number | null; heading: number | null; updated_at: number }>(
+        "SELECT status, ride_id, lat, lng, heading, updated_at FROM drivers WHERE id = ?",
+        id,
+      )
+      .toArray()[0];
+    if (!r) return null;
+    const p = this.pos.get(id);
+    return {
+      id,
+      status: r.status as DriverStatus,
+      rideId: r.ride_id,
+      lat: p?.lat ?? r.lat,
+      lng: p?.lng ?? r.lng,
+      heading: p ? p.heading : r.heading,
+      updatedAt: Math.max(r.updated_at, p?.ts ?? 0),
+    };
+  }
+
   /** Writes the full row (status changes + position snapshot). Location pings do NOT call this. */
   protected saveDriver(d: DriverRow) {
     // the idle ping throttle (`ridePings`) relies on it: a driver on a ride lives in the ride's actor, never in a match actor
@@ -372,18 +400,29 @@ export abstract class ZoneActor extends DurableObject<Env> {
    * Take a location ping into memory (throttled). Returns the driver row, updated, or null when the
    * ping was dropped. SQLite only gets a snapshot every SNAPSHOT_MS.
    */
-  protected takePing(d: DriverRow, msg: { lat: number; lng: number; heading?: number }): DriverRow | null {
+  protected takePing<T extends PingDriver>(d: T, msg: { lat: number; lng: number; heading?: number }): T | null {
     if (!isValidLatLng(msg)) throw new DomainError("BAD_REQUEST", "invalid lat/lng");
     const now = Date.now();
-    const prev = this.pos.get(d.id);
-    const last = prev ? { lat: prev.lat, lng: prev.lng, at: prev.ts } : null;
-    if (!acceptPing(last, { lat: msg.lat, lng: msg.lng, at: now }, d.status === "ON_RIDE", this.cfg.presence)) return null;
+    // a socket ping `throttled` let through a moment ago is not checked twice
+    if (!this.acceptedPings.delete(msg)) {
+      const prev = this.pos.get(d.id);
+      const last = prev ? { lat: prev.lat, lng: prev.lng, at: prev.ts } : null;
+      if (!acceptPing(last, { lat: msg.lat, lng: msg.lng, at: now }, d.status === "ON_RIDE", this.cfg.presence)) return null;
+    }
     d.lat = msg.lat;
     d.lng = msg.lng;
     d.heading = typeof msg.heading === "number" ? msg.heading : d.heading;
     d.updatedAt = now;
     this.setPos(d.id, d.lat, d.lng, d.heading, now);
-    if (now - (this.pos.get(d.id)?.savedAt ?? 0) >= SNAPSHOT_MS) this.saveDriver(d);
+    const p = this.pos.get(d.id)!;
+    if (now - p.savedAt >= SNAPSHOT_MS) {
+      // position snapshot only: the rest of the row is unchanged
+      this.sql.exec(
+        "UPDATE drivers SET lat = ?, lng = ?, heading = ?, cell = ?, updated_at = ? WHERE id = ?",
+        p.lat, p.lng, p.heading, p.cell, now, d.id,
+      );
+      p.savedAt = now;
+    }
     return d;
   }
 
@@ -398,8 +437,9 @@ export abstract class ZoneActor extends DurableObject<Env> {
   protected throttled(userId: string, msg: ClientMsg): boolean {
     if (msg.t !== "loc" || !isValidLatLng(msg)) return false;
     const prev = this.pos.get(userId);
-    if (!prev) return false;
-    return !acceptPing({ lat: prev.lat, lng: prev.lng, at: prev.ts }, { lat: msg.lat, lng: msg.lng, at: Date.now() }, this.ridePings, this.cfg.presence);
+    const ok = !prev || acceptPing({ lat: prev.lat, lng: prev.lng, at: prev.ts }, { lat: msg.lat, lng: msg.lng, at: Date.now() }, this.ridePings, this.cfg.presence);
+    if (ok && prev) this.acceptedPings.add(msg);
+    return !ok;
   }
 
   /** Accept a hibernatable socket for `userId` (replacing any older one on this actor). */

@@ -8,7 +8,7 @@ import {
   rankCandidates,
   shouldHandOff,
 } from "@gojek/core";
-import { type DriverRow, PURGE_EVERY_MS, type SocketMeta, ZoneActor } from "./actor";
+import { type DriverRow, type PingDriver, PURGE_EVERY_MS, type SocketMeta, ZoneActor } from "./actor";
 import { homeOfRide, rideStub } from "./config";
 import * as db from "./db";
 import { type ClientMsg, type DriverInfo, fail, type OfferPayload, type Result, type RideView } from "./protocol";
@@ -84,7 +84,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
    * An AVAILABLE driver outside this zone is handed to the zone it is in now — once clearly inside
    * it, or after several pings outside (hysteresis: GPS jitter on a border must not loop reconnects).
    */
-  private maybeHandOff(d: DriverRow): boolean {
+  private maybeHandOff(d: PingDriver): boolean {
     if (d.status !== "AVAILABLE" || d.lat === null || d.lng === null || !this.zone) return false;
     const z = this.zoneOf(d.lat, d.lng);
     const p = this.pos.get(d.id);
@@ -227,6 +227,15 @@ export class MatchDO extends ZoneActor implements MatchApi {
     if (meta.role !== "driver") throw new DomainError("FORBIDDEN", `${msg.t} is driver-only`);
     if (msg.t === "resume") return this.resume(ws, meta, msg.rideId);
 
+    // the bulk of the traffic: only the columns a ping needs (no vehicle / offer JSON to parse)
+    if (msg.t === "loc") {
+      const p = this.loadDriverPing(meta.userId);
+      if (!p) return this.handleMoved(ws, meta, msg);
+      const moved = this.takePing(p, msg);
+      if (moved) this.maybeHandOff(moved);
+      return;
+    }
+
     const d = this.loadDriver(meta.userId);
     if (!d) return this.handleMoved(ws, meta, msg);
 
@@ -261,11 +270,6 @@ export class MatchDO extends ZoneActor implements MatchApi {
         this.saveDriver(d);
         this.sendDriverState(d);
         if (pending) await this.stub(homeOfRide(pending)!).offerRejected(pending, d.id);
-        return;
-      }
-      case "loc": {
-        const moved = this.takePing(d, msg);
-        if (moved) this.maybeHandOff(moved);
         return;
       }
       case "offer.accept": {

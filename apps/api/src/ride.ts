@@ -15,7 +15,7 @@ import {
   type TrackPt,
   type TrackState,
 } from "@gojek/core";
-import { type DriverRow, PURGE_EVERY_MS, retryDelay, type SocketMeta, ZoneActor } from "./actor";
+import { type PingDriver, PURGE_EVERY_MS, retryDelay, type SocketMeta, ZoneActor } from "./actor";
 import { homeOfRide, matchStub, zoneOfKey } from "./config";
 import * as db from "./db";
 import type { MatchApi } from "./match";
@@ -51,6 +51,10 @@ interface HotRide extends RideView {
    */
   handover?: { zone: string; driverId: string; attempts: number };
 }
+
+/** The fields of a ride a driver's location ping reads (see `RideDO.heads`). */
+type RideHead = Pick<HotRide, "id" | "status" | "customerId" | "driverLostAt">;
+const headOf = (r: HotRide): RideHead => ({ id: r.id, status: r.status, customerId: r.customerId, driverLostAt: r.driverLostAt });
 
 /**
  * A ride transition on its way to Postgres. The ride's status in this actor only changes once
@@ -157,6 +161,11 @@ export class RideDO extends ZoneActor implements RideApi {
    * run (one extra point), and at worst the held-back last ping of the trip is lost.
    */
   private tracks = new Map<string, TrackState>();
+  /**
+   * What a location ping needs of a ride, kept in step by `saveRide` (memory only, filled lazily):
+   * a ping then costs no `rides` read and no JSON parse of the whole ride.
+   */
+  private heads = new Map<string, RideHead>();
 
   protected initTables() {
     this.sql.exec(`
@@ -164,6 +173,9 @@ export class RideDO extends ZoneActor implements RideApi {
         id TEXT PRIMARY KEY, status TEXT NOT NULL, customer_id TEXT NOT NULL, driver_id TEXT,
         data TEXT NOT NULL, updated_at INTEGER NOT NULL
       );
+      -- a socket connecting: the driver's active ride / the customer's latest ride, without a table scan
+      CREATE INDEX IF NOT EXISTS rides_driver ON rides (driver_id, status);
+      CREATE INDEX IF NOT EXISTS rides_customer ON rides (customer_id, updated_at);
       CREATE TABLE IF NOT EXISTS ride_idem (customer_id TEXT NOT NULL, key TEXT NOT NULL, ride_id TEXT NOT NULL,
         PRIMARY KEY (customer_id, key));
       -- ON_TRIP route points not yet in Postgres; seq (AUTOINCREMENT: never reused) is their key there
@@ -217,6 +229,7 @@ export class RideDO extends ZoneActor implements RideApi {
     this.committing.clear();
     this.lanes.clear();
     this.settling.clear();
+    this.heads.clear();
   }
 
   private stub(zone: string): MatchApi {
@@ -253,6 +266,7 @@ export class RideDO extends ZoneActor implements RideApi {
     this.sql.exec(
       "DELETE FROM drivers WHERE ride_id IS NULL OR ride_id NOT IN (SELECT id FROM rides WHERE status IN ('ACCEPTED','ARRIVED','ON_TRIP'))",
     );
+    this.heads.clear(); // rides were deleted: refilled on the next ping
     const left = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM rides").one().n;
     if (left > 0) void this.schedule("purge:all", now + PURGE_EVERY_MS);
   }
@@ -269,6 +283,17 @@ export class RideDO extends ZoneActor implements RideApi {
       "INSERT OR REPLACE INTO rides (id, status, customer_id, driver_id, data, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
       r.id, r.status, r.customerId, r.driverId, JSON.stringify(r), Date.now(),
     );
+    this.heads.set(r.id, headOf(r));
+  }
+
+  private rideHead(id: string): RideHead | null {
+    let h = this.heads.get(id);
+    if (!h) {
+      const r = this.loadRide(id);
+      if (!r) return null;
+      this.heads.set(id, (h = headOf(r)));
+    }
+    return h;
   }
 
   private view(r: HotRide): RideView {
@@ -640,6 +665,7 @@ export class RideDO extends ZoneActor implements RideApi {
   /** Forget a ride that never made it into Postgres. */
   private dropRide(rideId: string) {
     this.sql.exec("DELETE FROM rides WHERE id = ?", rideId);
+    this.heads.delete(rideId);
     this.sql.exec("DELETE FROM ride_idem WHERE ride_id = ?", rideId);
     this.cancelTimer(`create:${rideId}`);
   }
@@ -1143,10 +1169,10 @@ export class RideDO extends ZoneActor implements RideApi {
   }
 
   /** A location ping of a driver on one of this actor's rides: the customer's map and the trip route. */
-  private onDriverLoc(d: DriverRow, loc: { lat: number; lng: number; heading?: number }) {
+  private onDriverLoc(d: PingDriver, loc: { lat: number; lng: number; heading?: number }) {
     const now = this.takePing(d, loc);
     if (!now || d.status !== "ON_RIDE" || !d.rideId) return;
-    const ride = this.loadRide(d.rideId);
+    const ride = this.rideHead(d.rideId);
     if (!ride) return;
     // the trip's route, thinned (straight stretches + turns): buffered here, sent to Postgres in batches by the `track:` timer
     if (ride.status === "ON_TRIP") {
@@ -1155,7 +1181,10 @@ export class RideDO extends ZoneActor implements RideApi {
       this.keepTrack(ride.id, keep);
     }
     this.send(ride.customerId, { t: "driver.loc", rideId: ride.id, lat: d.lat!, lng: d.lng!, heading: d.heading });
-    this.driverBack(ride);
+    if (ride.driverLostAt) {
+      const full = this.loadRide(ride.id);
+      if (full) this.driverBack(full);
+    }
   }
 
   async driverRideEvent(driverId: string, rideId: string, type: "ARRIVE" | "START" | "COMPLETE"): Promise<Result> {
@@ -1169,7 +1198,7 @@ export class RideDO extends ZoneActor implements RideApi {
   }
 
   async driverLoc(driverId: string, rideId: string, loc: { lat: number; lng: number; heading?: number }): Promise<void> {
-    const d = this.loadDriver(driverId);
+    const d = this.loadDriverPing(driverId);
     if (d && d.rideId === rideId) this.onDriverLoc(d, loc);
   }
 
@@ -1237,10 +1266,17 @@ export class RideDO extends ZoneActor implements RideApi {
       return this.rideEventByDriver(meta.userId, msg.rideId, type);
     }
 
+    // the bulk of the traffic: only the columns a ping needs (the trip is over and the driver handed back: dropped)
+    if (msg.t === "loc") {
+      const p = this.loadDriverPing(meta.userId);
+      if (p) this.onDriverLoc(p, msg);
+      return;
+    }
+
     const d = this.loadDriver(meta.userId);
     if (!d) {
-      // the trip is over and the driver was handed back: a ping in flight is dropped, anything else redirected
-      if (msg.t !== "loc") this.sendWs(ws, { t: "zone.moved", zone: this.zone ?? "" });
+      // the trip is over and the driver was handed back: redirect
+      this.sendWs(ws, { t: "zone.moved", zone: this.zone ?? "" });
       return;
     }
     switch (msg.t) {
@@ -1248,8 +1284,6 @@ export class RideDO extends ZoneActor implements RideApi {
         return this.sendDriverState(d);
       case "offline":
         throw new DomainError("DRIVER_BUSY", "finish the ride first");
-      case "loc":
-        return this.onDriverLoc(d, msg);
       case "offer.accept":
         if (d.rideId === msg.rideId) return this.resume(ws, meta, msg.rideId);
         throw new DomainError("OFFER_EXPIRED");

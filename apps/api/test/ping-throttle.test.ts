@@ -15,11 +15,14 @@ async function throttleOn(intervalMs: number) {
   await inZone(zone, "match", (inst) => {
     inst.cfg = { ...inst.cfg, presence: { ...inst.cfg.presence, locMinIntervalMs: intervalMs } };
     inst.reads = 0;
-    const real = Object.getPrototypeOf(inst).loadDriver;
-    inst.loadDriver = function (this: any, id: string) {
-      this.reads++;
-      return real.call(this, id);
-    };
+    // a full row (status changes) or the ping's columns (`loc`): both read SQLite
+    for (const name of ["loadDriver", "loadDriverPing"]) {
+      const real = Object.getPrototypeOf(inst)[name];
+      inst[name] = function (this: any, id: string) {
+        this.reads++;
+        return real.call(this, id);
+      };
+    }
   });
 }
 
