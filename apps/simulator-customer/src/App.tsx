@@ -4,7 +4,7 @@ import { reverseGeocode } from "@gojek/client/geocode";
 import { JAKARTA, PRESET_TRIPS } from "@gojek/client/presets";
 import type { DriverInfo, RideView, ServerMsg } from "@gojek/client/protocol";
 import {
-  AccountPage, ConnDot, fmtKm, fmtRp, fmtTime, Icon, initials, LoginForm, MapView, type MapMarker, Page, Phone, Sheet, PlaceSearch, ResetButton, Section, TabBar,
+  AccountPage, ConnDot, RideDetail, fmtKm, fmtRp, fmtTime, Icon, initials, LoginForm, MapView, type MapMarker, Page, Phone, Sheet, PlaceSearch, ResetButton, Section, TabBar,
   type TabSpec, Toast, useRoute, useStored, WalletPanel, wipeLocalAndReload,
 } from "@gojek/client/react";
 import { pathLength, trimFrom } from "@gojek/client/route";
@@ -293,7 +293,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                     </div>
                     <span className="pill tnum"><Icon name="wallet" size={14} /><b data-testid="balance">{balance === null ? "…" : fmtRp(balance)}</b></span>
                   </div>
-                  <div className="group">
+                  <div className="group edge">
                     <button className="cell inset" aria-pressed={pickMode === "pickup"} onClick={() => (setPickMode("pickup"), setSearchFor("pickup"))} data-testid="pick-pickup">
                       <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin pick" /></span>
                       <span className="grow">
@@ -504,6 +504,7 @@ const HIST_STATUS: Record<string, string> = { COMPLETED: "Selesai", CANCELLED: "
 
 function History({ api }: { api: ApiClient }) {
   const [rides, setRides] = useState<RideView[] | null>(null);
+  const [open, setOpen] = useState<RideView | null>(null);
   useEffect(() => {
     api.rides().then((r) => setRides(r.rides)).catch(() => setRides([]));
   }, [api]);
@@ -514,17 +515,29 @@ function History({ api }: { api: ApiClient }) {
           {rides === null && <li className="cell muted">Memuat…</li>}
           {rides?.length === 0 && <li className="cell muted">Belum ada ride</li>}
           {rides?.map((r) => (
-            <li key={r.id} className="cell inset">
-              <span className={`ic ${r.status === "COMPLETED" ? "green" : "gray"}`}><Icon name="car" /></span>
-              <div className="grow">
-                <div>{r.pickup.label} → {r.dropoff.label}</div>
-                <div className="sub">{fmtTime(r.requestedAt)} · {HIST_STATUS[r.status] ?? r.status}{r.rating ? ` · ${"★".repeat(r.rating)}` : ""}</div>
-              </div>
-              <span className="tnum">{fmtRp(r.fareFinal ?? r.fare)}</span>
+            <li key={r.id}>
+              <button className="cell inset" onClick={() => setOpen(r)} data-testid={`history-item-${r.id}`}>
+                <span className={`ic ${r.status === "COMPLETED" ? "green" : "gray"}`}><Icon name="car" /></span>
+                <div className="grow">
+                  <div>{r.pickup.label} → {r.dropoff.label}</div>
+                  <div className="sub">{fmtTime(r.requestedAt)} · {HIST_STATUS[r.status] ?? r.status}{r.rating ? ` · ${"★".repeat(r.rating)}` : ""}</div>
+                </div>
+                <span className="tnum">{fmtRp(r.fareFinal ?? r.fare)}</span>
+                <span className="chev"><Icon name="chevron" size={14} /></span>
+              </button>
             </li>
           ))}
         </ul>
       </Section>
+      {open && (
+        <RideDetail
+          ride={open}
+          role="customer"
+          api={api}
+          onClose={() => setOpen(null)}
+          onChange={(nr) => setRides((rs) => rs?.map((x) => (x.id === nr.id ? nr : x)) ?? rs)}
+        />
+      )}
     </Page>
   );
 }

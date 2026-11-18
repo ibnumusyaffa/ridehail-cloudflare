@@ -27,7 +27,13 @@ export interface MapViewProps {
   /** change this key to re-fit the camera to `fitPoints` */
   fitKey?: string;
   fitPoints?: LatLng[];
+  /** room kept clear around `fitPoints` (default: leaves space for a bottom sheet) */
+  fitPadding?: number | { top: number; left: number; right: number; bottom: number };
+  /** zoom buttons (default on) */
+  controls?: boolean;
 }
+
+const SHEET_PADDING = { top: 60, left: 50, right: 50, bottom: 340 };
 
 const STYLE = env.VITE_MAP_STYLE;
 const ICON: Record<MarkerKind, string> = { pickup: "📍", dropoff: "🏁", driver: "🛵", me: "🛵" };
@@ -41,7 +47,7 @@ function el(m: MapMarker) {
   return d;
 }
 
-export function MapView({ center, zoom = 14, markers, route, onClick, fitKey, fitPoints }: MapViewProps) {
+export function MapView({ center, zoom = 14, markers, route, onClick, fitKey, fitPoints, fitPadding = SHEET_PADDING, controls = true }: MapViewProps) {
   const box = useRef<HTMLDivElement>(null);
   const map = useRef<maplibregl.Map | null>(null);
   const live = useRef(new Map<string, { marker: maplibregl.Marker; spec: MapMarker }>());
@@ -50,7 +56,7 @@ export function MapView({ center, zoom = 14, markers, route, onClick, fitKey, fi
 
   useEffect(() => {
     const m = new maplibregl.Map({ container: box.current!, style: STYLE, center: [center.lng, center.lat], zoom, attributionControl: { compact: true } });
-    m.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+    if (controls) m.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     m.on("click", (e) => clickRef.current?.({ lat: e.lngLat.lat, lng: e.lngLat.lng }));
     m.on("load", () => {
       m.addSource("route", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
@@ -131,7 +137,7 @@ export function MapView({ center, zoom = 14, markers, route, onClick, fitKey, fi
     }
     const b = new maplibregl.LngLatBounds();
     for (const p of fitPoints) b.extend([p.lng, p.lat]);
-    m.fitBounds(b, { padding: { top: 60, left: 50, right: 50, bottom: 340 }, maxZoom: 16, duration: 600 });
+    m.fitBounds(b, { padding: fitPadding, maxZoom: 16, duration: 600 });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fitKey]);
 

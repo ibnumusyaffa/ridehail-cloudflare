@@ -70,10 +70,12 @@ export class ApiClient {
     return this.req<{ ride: RideView | null }>("/rides?active=1");
   }
   ride(id: string) {
-    return this.req<{ ride: RideView }>(`/rides/${id}`);
+    /** `commissionRate` only for the ride's driver */
+    return this.req<{ ride: RideView; commissionRate?: number }>(`/rides/${id}`);
   }
   rides() {
-    return this.req<{ rides: RideView[]; today?: { count: number; gross: number; net: number } }>("/rides?mine=1");
+    /** `today` and `commissionRate` only for drivers */
+    return this.req<{ rides: RideView[]; today?: { count: number; gross: number; net: number }; commissionRate?: number }>("/rides?mine=1");
   }
   cancel(id: string, reason: string) {
     return this.req<{ ride: RideView }>(`/rides/${id}/cancel`, { body: { reason } });

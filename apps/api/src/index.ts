@@ -220,8 +220,9 @@ app.get("/rides", async (c) => {
     const startOfDay = new Date();
     startOfDay.setUTCHours(-7, 0, 0, 0); // WIB midnight (UTC+7)
     if (startOfDay.getTime() > Date.now()) startOfDay.setUTCDate(startOfDay.getUTCDate() - 1);
-    const today = await db.driverEarnings(sql, u.sub, startOfDay.getTime(), loadConfig(c.env).commissionRate);
-    return c.json({ rides, today });
+    const { commissionRate } = loadConfig(c.env);
+    const today = await db.driverEarnings(sql, u.sub, startOfDay.getTime(), commissionRate);
+    return c.json({ rides, today, commissionRate });
   }
   return c.json({ rides });
 });
@@ -231,6 +232,8 @@ app.get("/rides/:id", async (c) => {
   const ride = await db.getRide(c.var.db(), c.req.param("id"));
   if (!ride) throw new HttpError("RIDE_NOT_FOUND");
   if (ride.customerId !== u.sub && ride.driverId !== u.sub) throw new HttpError("FORBIDDEN");
+  // the driver's detail screen splits the fare into commission and net earning
+  if (u.role === "driver") return c.json({ ride, commissionRate: loadConfig(c.env).commissionRate });
   return c.json({ ride });
 });
 

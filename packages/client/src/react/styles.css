@@ -304,3 +304,26 @@ input[type="range"] { flex: 1; accent-color: var(--blue); }
 .search-clear { width: 18px; height: 18px; padding: 0; border-radius: 50%; display: grid; place-items: center; background: var(--muted); color: var(--bg); }
 .search-results { overflow: auto; padding: 4px 16px calc(var(--sab) + 16px); display: grid; gap: 22px; align-content: start; }
 .search-results .list li + li .cell::before { content: ""; position: absolute; top: 0; right: 0; left: 54px; border-top: .5px solid var(--line); }
+
+/* ride detail (pushed over the history list) */
+.list > li + li > .cell::before { content: ""; position: absolute; top: 0; right: 0; left: 54px; border-top: .5px solid var(--line); }
+.detail-sheet {
+  position: absolute; inset: 0; z-index: 20; background: var(--bg); display: grid; grid-template-rows: auto 1fr;
+  padding-top: calc(var(--sat) + 4px); animation: push .32s cubic-bezier(.2, .9, .3, 1);
+}
+@keyframes push { from { transform: translateX(100%); } }
+.navbar { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 2px 8px 8px; }
+.navbar-title { font-size: 15px; font-weight: 600; }
+.navbar .back { display: inline-flex; align-items: center; gap: 2px; color: var(--blue); font-size: 15px; justify-self: start; }
+.flip { display: inline-grid; transform: scaleX(-1); }
+.detail-body { overflow: auto; padding: 0 16px calc(var(--sab) + 24px); display: grid; gap: 22px; align-content: start; }
+.detail-map { position: relative; height: 190px; border-radius: 12px; overflow: hidden; }
+.detail-head { display: grid; gap: 6px; justify-items: start; padding: 0 4px; margin-top: -8px; }
+.detail-head .sub { font-size: 13px; color: var(--muted); }
+.pill.st-completed { background: rgba(52, 199, 89, .16); color: var(--pos); }
+.pill.st-cancelled, .pill.st-no_driver { background: rgba(255, 59, 48, .14); color: var(--neg); }
+.stars span { font-size: 26px; line-height: 1; padding: 2px; color: #ffcc00; }
+.timeline .cell { min-height: 38px; }
+.tl-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; margin-left: 2px; }
+.detail-body .cell + .cell::before { left: 0; }
+.group.edge > .cell + .cell::before { left: 0; }

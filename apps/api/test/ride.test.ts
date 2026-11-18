@@ -88,11 +88,14 @@ describe("ride flow", () => {
 
     const detail = await api(`/rides/${rideId}`, { token: c.token });
     expect(detail.json.ride).toMatchObject({ status: "COMPLETED", paidVia: "WALLET", fareFinal: fare });
+    expect(detail.json.commissionRate).toBeUndefined(); // the customer is not shown the driver's cut
+    expect((await api(`/rides/${rideId}`, { token: far.token })).json.commissionRate).toBe(0.2);
     expect((await api(`/rides/${rideId}/rating`, { token: c.token, body: { stars: 5 } })).status).toBe(200);
     expect((await api(`/rides/${rideId}/rating`, { token: c.token, body: { stars: 4 } })).status).toBe(409);
     expect((await api("/rides?mine=1", { token: c.token })).json.rides[0].rating).toBe(5);
     const hist = await api("/rides?mine=1", { token: far.token });
     expect(hist.json.today.count).toBe(1);
+    expect(hist.json.commissionRate).toBe(0.2);
 
     // stranger cannot read the ride
     expect((await api(`/rides/${rideId}`, { token: near.token })).status).toBe(403);

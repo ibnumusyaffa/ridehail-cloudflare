@@ -3,7 +3,7 @@ import { env } from "@gojek/client/env";
 import { nearPickup, PRESET_TRIPS } from "@gojek/client/presets";
 import type { OfferPayload, RideView, ServerMsg } from "@gojek/client/protocol";
 import {
-  AccountPage, ConnDot, fmtKm, fmtRp, fmtTime, Icon, LoginForm, MapView, type MapMarker, Page, Phone, Sheet, ResetButton, Section, TabBar,
+  AccountPage, ConnDot, fmtKm, fmtRp, fmtTime, Icon, LoginForm, RideDetail, MapView, type MapMarker, Page, Phone, Sheet, ResetButton, Section, TabBar,
   type TabSpec, Toast, useRoute, useStored, WalletPanel, wipeLocalAndReload,
 } from "@gojek/client/react";
 import { advanceAlong, getRoute, pathLength, trimFrom } from "@gojek/client/route";
@@ -450,6 +450,7 @@ const HIST_STATUS: Record<string, string> = { COMPLETED: "Selesai", CANCELLED: "
 
 function Earnings({ api, refreshKey }: { api: ApiClient; refreshKey: unknown }) {
   const [data, setData] = useState<Awaited<ReturnType<ApiClient["rides"]>> | null>(null);
+  const [open, setOpen] = useState<RideView | null>(null);
   useEffect(() => {
     api.rides().then(setData).catch(() => {});
   }, [api, refreshKey]);
@@ -463,20 +464,33 @@ function Earnings({ api, refreshKey }: { api: ApiClient; refreshKey: unknown }) 
         </div>
       </section>
       <Section head="Riwayat">
-        <ul className="list">
+        <ul className="list" data-testid="history">
           {data?.rides.length === 0 && <li className="cell muted">Belum ada ride</li>}
           {data?.rides.map((r) => (
-            <li key={r.id} className="cell inset">
-              <span className={`ic ${r.status === "COMPLETED" ? "orange" : "gray"}`}><Icon name="wheel" /></span>
-              <div className="grow">
-                <div>{r.pickup.label} → {r.dropoff.label}</div>
-                <div className="sub">{fmtTime(r.requestedAt)} · {HIST_STATUS[r.status] ?? r.status}{r.rating ? ` · ${"★".repeat(r.rating)}` : ""}</div>
-              </div>
-              <span className="tnum">{fmtRp(r.fareFinal ?? r.fare)}</span>
+            <li key={r.id}>
+              <button className="cell inset" onClick={() => setOpen(r)} data-testid={`history-item-${r.id}`}>
+                <span className={`ic ${r.status === "COMPLETED" ? "orange" : "gray"}`}><Icon name="wheel" /></span>
+                <div className="grow">
+                  <div>{r.pickup.label} → {r.dropoff.label}</div>
+                  <div className="sub">{fmtTime(r.requestedAt)} · {HIST_STATUS[r.status] ?? r.status}{r.rating ? ` · ${"★".repeat(r.rating)}` : ""}</div>
+                </div>
+                <span className="tnum">{fmtRp(r.fareFinal ?? r.fare)}</span>
+                <span className="chev"><Icon name="chevron" size={14} /></span>
+              </button>
             </li>
           ))}
         </ul>
       </Section>
+      {open && (
+        <RideDetail
+          ride={open}
+          role="driver"
+          api={api}
+          commissionRate={data?.commissionRate}
+          onClose={() => setOpen(null)}
+          onChange={(nr) => setData((d) => (d ? { ...d, rides: d.rides.map((x) => (x.id === nr.id ? nr : x)) } : d))}
+        />
+      )}
     </Page>
   );
 }
