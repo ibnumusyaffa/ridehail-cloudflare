@@ -1,4 +1,5 @@
 import type { LatLng, Place } from "@gojek/core";
+import { env } from "./env";
 import { PRESET_TRIPS } from "./presets";
 
 export interface PlaceHit extends Place {
@@ -7,11 +8,10 @@ export interface PlaceHit extends Place {
   source: "preset" | "photon";
 }
 
-const env = ((import.meta as any).env ?? {}) as Record<string, string | undefined>;
-/** Photon (OSM) geocoder; set VITE_GEOCODER_URL=off to search only the built-in places (e.g. deterministic tests). */
-const PHOTON = env.VITE_GEOCODER_URL ?? "https://photon.komoot.io";
-/** Greater Jakarta: keeps type-ahead results local. minLon,minLat,maxLon,maxLat */
-const BBOX = "106.4,-6.65,107.2,-5.9";
+/** Photon (OSM) geocoder; VITE_GEOCODER_URL=off searches only the built-in places (e.g. deterministic tests). */
+const PHOTON = env.VITE_GEOCODER_URL;
+/** keeps type-ahead results local (Greater Jakarta by default). minLon,minLat,maxLon,maxLat */
+const BBOX = env.VITE_GEOCODER_BBOX;
 
 /** Named places the simulator already knows (preset pickups and dropoffs), deduped by label. */
 const KNOWN: PlaceHit[] = [

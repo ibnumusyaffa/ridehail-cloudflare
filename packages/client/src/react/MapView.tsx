@@ -2,6 +2,7 @@ import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useEffect, useRef } from "react";
 import type { LatLng } from "@gojek/core";
+import { env } from "../env";
 
 export type MarkerKind = "pickup" | "dropoff" | "driver" | "me";
 
@@ -28,7 +29,7 @@ export interface MapViewProps {
   fitPoints?: LatLng[];
 }
 
-const STYLE = (import.meta as any).env?.VITE_MAP_STYLE ?? "https://tiles.openfreemap.org/styles/liberty";
+const STYLE = env.VITE_MAP_STYLE;
 const ICON: Record<MarkerKind, string> = { pickup: "📍", dropoff: "🏁", driver: "🛵", me: "🛵" };
 
 function el(m: MapMarker) {

@@ -1,4 +1,5 @@
 import { haversineM, type LatLng } from "@gojek/core";
+import { env } from "./env";
 
 export interface Route {
   points: LatLng[];
@@ -7,9 +8,8 @@ export interface Route {
   source: "osrm" | "straight";
 }
 
-const env = ((import.meta as any).env ?? {}) as Record<string, string | undefined>;
-/** OSRM base URL; set VITE_OSRM_URL=off to always use straight lines (e.g. deterministic tests). */
-const OSRM = env.VITE_OSRM_URL ?? "https://router.project-osrm.org";
+/** OSRM base URL; VITE_OSRM_URL=off always uses straight lines (e.g. deterministic tests). */
+const OSRM = env.VITE_OSRM_URL;
 const AVG_SPEED_MS = 8; // fallback ETA for straight lines (~30 km/h)
 
 const cache = new Map<string, Promise<Route>>();

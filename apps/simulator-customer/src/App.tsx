@@ -1,4 +1,5 @@
 import { ApiClient, type User } from "@gojek/client/api";
+import { env } from "@gojek/client/env";
 import { reverseGeocode } from "@gojek/client/geocode";
 import { JAKARTA, PRESET_TRIPS } from "@gojek/client/presets";
 import type { DriverInfo, RideView, ServerMsg } from "@gojek/client/protocol";
@@ -11,7 +12,7 @@ import { RideSocket, type SocketState } from "@gojek/client/socket";
 import type { LatLng, PaymentMethod, Place } from "@gojek/core";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const API = import.meta.env.VITE_API_URL ?? "http://localhost:8787";
+const API = env.VITE_API_URL;
 type Session = { token: string; user: User };
 
 export function App() {

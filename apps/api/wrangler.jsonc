@@ -32,7 +32,10 @@
     // per user: WebSocket (re)connects
     { "name": "WS_LIMITER", "namespace_id": "1002", "simple": { "limit": 30, "period": 60 } }
   ],
+  // Every var below is validated (types, ranges, defaults) in src/env.ts; a bad value fails the request loudly.
   "vars": {
+    // "*" or a comma-separated list of origins allowed to call the API (the simulators' URLs in production)
+    "CORS_ORIGINS": "*",
     // Durable Object placement near the Postgres region (wnam, enam, sam, weur, eeur, apac, oc, afr, me);
     // empty = nearest to the first request. Only affects zone actors created after it is set.
     "DO_LOCATION_HINT": "apac",

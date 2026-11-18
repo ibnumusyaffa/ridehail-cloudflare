@@ -7,3 +7,4 @@ dist
 videos
 test-results
 playwright-report
+.env*.local

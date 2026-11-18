@@ -1,5 +1,6 @@
 import type { Role } from "@gojek/core";
 import { sign, verify } from "hono/jwt";
+import { serverEnv } from "./env";
 
 export interface Principal {
   sub: string;
@@ -9,10 +10,7 @@ export interface Principal {
 
 const TOKEN_TTL_S = 30 * 24 * 3600;
 
-function secret(env: Env): string {
-  if (!env.JWT_SECRET) throw new Error("JWT_SECRET is not configured");
-  return env.JWT_SECRET;
-}
+const secret = (env: Env) => serverEnv(env).JWT_SECRET;
 
 export function issueToken(env: Env, p: Principal): Promise<string> {
   return sign({ ...p, exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_S }, secret(env), "HS256");

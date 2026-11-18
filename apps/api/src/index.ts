@@ -5,6 +5,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { issueToken, type Principal, readToken } from "./auth";
 import { homeOfRide, loadConfig, matchStub, parseRideHome, rideHome, rideStub, shardCount, shardFor } from "./config";
 import * as db from "./db";
+import { serverEnv } from "./env";
 import { connect, type Sql } from "./pg";
 import type { MatchApi } from "./match";
 import type { RideApi } from "./ride";
@@ -58,8 +59,10 @@ function place(v: unknown, field: string): Place {
 
 const app = new Hono<AppEnv>();
 
-// Bearer tokens only (no cookies), so any origin may call the API.
-app.use("*", cors({ origin: "*", allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key"], maxAge: 600 }));
+// Bearer tokens only (no cookies), so any origin may call the API by default; CORS_ORIGINS narrows it.
+app.use("*", (c, next) =>
+  cors({ origin: serverEnv(c.env).CORS_ORIGINS, allowHeaders: ["Authorization", "Content-Type", "Idempotency-Key"], maxAge: 600 })(c, next),
+);
 
 app.onError((err, c) => {
   if (err instanceof HttpError) return c.json({ error: { code: err.code, message: err.message } }, STATUS[err.code] ?? 409);
@@ -108,7 +111,7 @@ app.get("/ws", async (c) => {
   const user = await readToken(c.env, c.req.query("token"));
   if (!user) return c.text("unauthorized", 401);
   // Users only ever disappear through the dev reset; production trusts the signed token alone.
-  if (c.env.DEV_RESET === "1" && !(await db.getUser(c.var.db(), user.sub))) return c.text("unauthorized", 401);
+  if (serverEnv(c.env).DEV_RESET && !(await db.getUser(c.var.db(), user.sub))) return c.text("unauthorized", 401);
   if (c.env.WS_LIMITER && !(await c.env.WS_LIMITER.limit({ key: user.sub })).success) return c.text("too many reconnects", 429);
   const cfg = loadConfig(c.env);
   const q = c.req.query();
@@ -145,7 +148,7 @@ app.get("/ws", async (c) => {
 // ------------------------------------------------------------- dev only
 // Wipes ALL data (Postgres + every actor of every zone). Enabled only when DEV_RESET=1 (set in .dev.vars, never in prod).
 app.post("/dev/reset", async (c) => {
-  if (c.env.DEV_RESET !== "1") return c.json({ error: { code: "NOT_FOUND", message: "not found" } }, 404);
+  if (!serverEnv(c.env).DEV_RESET) return c.json({ error: { code: "NOT_FOUND", message: "not found" } }, 404);
   // registered keys: a zone (its match actor + shard-0 ride actor) or a ride home `<zone>.<k>` (that shard)
   const keys = await db.listZones(c.var.db());
   await Promise.all(

@@ -15,8 +15,10 @@
   "dependencies": {
     "@gojek/client": "workspace:*",
     "@gojek/core": "workspace:*",
+    "@t3-oss/env-core": "^0.13.11",
     "hono": "^4.13.18",
-    "postgres": "^4.1.1"
+    "postgres": "^4.1.1",
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.1",
