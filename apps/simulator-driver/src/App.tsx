@@ -349,7 +349,7 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
                   <div className="group">
                     <label className="cell inset">
                       <span className="ic indigo"><Icon name="car" /></span>
-                      <span className="grow" style={{ color: "var(--text)", fontSize: 17 }}>Autopilot</span>
+                      <span className="grow" style={{ color: "var(--text)" }}>Autopilot</span>
                       <input type="checkbox" className="switch" role="switch" checked={autopilot} onChange={(e) => setAutopilot(e.target.checked)} data-testid="autopilot" />
                     </label>
                     <div className="cell inset">

@@ -286,8 +286,11 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
             <Sheet expandKey={ride ? `${ride.id}:${ride.status}` : "plan"}>
               {!ride && (
                 <div className="card" data-testid="order-card">
-                  <div className="row between">
-                    <h2 className="title2">Mau ke mana, {session.user.name.split(" ")[0]}?</h2>
+                  <div className="row between order-head">
+                    <div className="grow">
+                      <p className="hello">Halo, {session.user.name.split(" ")[0]}</p>
+                      <h2 className="title2">Mau ke mana?</h2>
+                    </div>
                     <span className="pill tnum"><Icon name="wallet" size={14} /><b data-testid="balance">{balance === null ? "…" : fmtRp(balance)}</b></span>
                   </div>
                   <div className="group">
@@ -302,7 +305,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                       <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin drop" /></span>
                       <span className="grow">
                         <span className="sub" style={{ display: "block" }}>Tujuan</span>
-                        {dropoff ? dropoff.label ?? "Tujuan" : <span className="muted">Mau ke mana?</span>}
+                        {dropoff ? dropoff.label ?? "Tujuan" : <span className="muted">Cari tujuan</span>}
                       </span>
                     </button>
                     <label className="cell inset">
