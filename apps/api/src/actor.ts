@@ -74,6 +74,11 @@ export abstract class ZoneActor extends DurableObject<Env> {
   protected pos = new Map<string, Pos>();
   protected grid = new Map<string, Set<string>>();
   protected gridPrecision: number;
+  /**
+   * Whether this actor's drivers are on a ride (ride actor) or not (match actor): picks the ping throttle
+   * interval before any storage read (see `throttled`).
+   */
+  protected abstract readonly ridePings: boolean;
   /** cached alarm time: undefined = unknown (read lazily), null = none set */
   protected nextAlarm: number | null | undefined = undefined;
 
@@ -339,6 +344,8 @@ export abstract class ZoneActor extends DurableObject<Env> {
 
   /** Writes the full row (status changes + position snapshot). Location pings do NOT call this. */
   protected saveDriver(d: DriverRow) {
+    // the idle ping throttle (`ridePings`) relies on it: a driver on a ride lives in the ride's actor, never in a match actor
+    if (!this.ridePings && d.status === "ON_RIDE") throw new Error(`match actor cannot hold driver ${d.id} ON_RIDE`);
     const now = Date.now();
     const cell = d.lat !== null && d.lng !== null ? geohashEncode(d.lat, d.lng, this.gridPrecision) : null;
     this.sql.exec(
@@ -384,16 +391,15 @@ export abstract class ZoneActor extends DurableObject<Env> {
 
   /**
    * Location pings are the bulk of all traffic: drop the ones the throttle would drop anyway from
-   * memory alone, before touching SQLite. Checked with the looser of the two intervals, so a ping
-   * dropped here would also be dropped later whatever the driver's status turns out to be.
+   * memory alone, before touching SQLite. A match actor holds no driver ON_RIDE and a ride actor holds
+   * only those, so the actor's kind gives the interval: a driver standing still costs the match actor
+   * one SQLite read per `locMinIntervalMs` instead of one per ping.
    */
   protected throttled(userId: string, msg: ClientMsg): boolean {
     if (msg.t !== "loc" || !isValidLatLng(msg)) return false;
     const prev = this.pos.get(userId);
     if (!prev) return false;
-    const { locMinIntervalMs, locMinIntervalOnRideMs } = this.cfg.presence;
-    const loosest = locMinIntervalOnRideMs <= locMinIntervalMs;
-    return !acceptPing({ lat: prev.lat, lng: prev.lng, at: prev.ts }, { lat: msg.lat, lng: msg.lng, at: Date.now() }, loosest, this.cfg.presence);
+    return !acceptPing({ lat: prev.lat, lng: prev.lng, at: prev.ts }, { lat: msg.lat, lng: msg.lng, at: Date.now() }, this.ridePings, this.cfg.presence);
   }
 
   /** Accept a hibernatable socket for `userId` (replacing any older one on this actor). */
@@ -445,7 +451,7 @@ export abstract class ZoneActor extends DurableObject<Env> {
     } catch {
       /* already closed */
     }
-    // Driver row is kept: stale filter (30s) + socket check exclude it from matching,
+    // Driver row is kept: stale filter (45s) + socket check exclude it from matching,
     // and a reconnect within that window resumes seamlessly.
   }
 }

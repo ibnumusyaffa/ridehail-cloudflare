@@ -199,7 +199,7 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
         setPos(step.pos);
         setPath(step.path);
       }
-      // ping when moved >= 30 m or every 5 s (the server also drops pings closer than 1-2 s apart)
+      // ping when moved >= 30 m or every 10 s (the server keeps a still driver's ping every 8 s, 1 s on a ride)
       const here = { ...posRef.current, at: Date.now() };
       if (shouldSendPing(lastPing.current, here, haversineM) && sendLoc()) lastPing.current = here;
     }, 1000);

@@ -142,6 +142,8 @@ const HANDOVER_DELAY_MS = 1_000;
  * match actors, so splitting a zone's rides needs no coordination between them.
  */
 export class RideDO extends ZoneActor implements RideApi {
+  /** drivers here are ON_RIDE: the on-ride ping interval */
+  protected readonly ridePings = true;
   /** rides whose Postgres insert is in flight right now */
   private creating = new Set<string>();
   /** per-ride queue: actions that change a ride's status run one at a time, in arrival order */

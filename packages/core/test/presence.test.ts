@@ -36,10 +36,14 @@ describe("acceptPing", () => {
   const at = (ms: number, dLat = 0) => ({ lat: -6.2 + dLat, lng: 106.8, at: ms });
   it("throttles idle drivers harder than drivers on a ride", () => {
     expect(acceptPing(null, at(1_000), false)).toBe(true);
-    expect(acceptPing(at(1_000), at(2_500), false)).toBe(false);
-    expect(acceptPing(at(1_000), at(3_000), false)).toBe(true);
+    expect(acceptPing(at(1_000), at(5_000), false)).toBe(false); // still, 4 s: dropped
+    expect(acceptPing(at(1_000), at(9_000), false)).toBe(true); // still, 8 s: heartbeat kept
     expect(acceptPing(at(1_000), at(2_000), true)).toBe(true);
     expect(acceptPing(at(1_000), at(1_500), true)).toBe(false);
+  });
+  it("keeps every heartbeat of a still driver pinging at the client's idle interval", () => {
+    // the client pings a still driver every 10 s; arriving up to 2 s early must still be kept
+    expect(acceptPing(at(0), at(8_000), false)).toBe(true);
   });
   it("never drops a ping that really moved", () => {
     expect(acceptPing(at(1_000), at(1_100, 0.0001), false)).toBe(false); // ~11 m jitter
@@ -65,10 +69,11 @@ describe("shouldHandOff", () => {
 
 describe("shouldSendPing", () => {
   const p = { lat: -6.2, lng: 106.8, at: 0 };
-  it("sends after moving 30 m or after 5 s", () => {
+  it("sends after moving 30 m or after 10 s", () => {
     expect(shouldSendPing(null, p, haversineM)).toBe(true);
     expect(shouldSendPing(p, { lat: -6.2001, lng: 106.8, at: 1_000 }, haversineM)).toBe(false); // ~11 m
     expect(shouldSendPing(p, { lat: -6.2004, lng: 106.8, at: 1_000 }, haversineM)).toBe(true); // ~44 m
-    expect(shouldSendPing(p, { lat: -6.2, lng: 106.8, at: 5_000 }, haversineM)).toBe(true);
+    expect(shouldSendPing(p, { lat: -6.2, lng: 106.8, at: 5_000 }, haversineM)).toBe(false);
+    expect(shouldSendPing(p, { lat: -6.2, lng: 106.8, at: 10_000 }, haversineM)).toBe(true);
   });
 });

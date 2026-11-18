@@ -63,8 +63,10 @@
     "TRACK_MIN_GAP_M": "200",
     "TRACK_MAX_GAP_MS": "60000",
     "TRACK_TOLERANCE_M": "25",
-    // location throttle (server drops pings closer together than this) and zone hand-over hysteresis
-    "LOC_MIN_INTERVAL_MS": "2000",
+    // location throttle: the server drops a ping that came sooner than this after the last kept one AND
+    // moved < LOC_MIN_MOVE_M. Not on a ride it is the heartbeat of a driver standing still (below the
+    // client's 10 s idle ping, and well inside the matcher's 30 s staleness). Then zone hand-over hysteresis.
+    "LOC_MIN_INTERVAL_MS": "8000",
     "LOC_MIN_INTERVAL_ON_RIDE_MS": "1000",
     "LOC_MIN_MOVE_M": "30",
     "HANDOFF_MARGIN_M": "100",

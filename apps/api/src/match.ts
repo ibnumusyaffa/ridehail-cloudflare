@@ -45,6 +45,8 @@ export interface MatchApi {
 export class MatchDO extends ZoneActor implements MatchApi {
   /** drivers just handed to a ride's actor (memory only): driverId → rideId, until */
   private moved = new Map<string, { rideId: string; until: number }>();
+  /** free drivers only (OFFLINE / AVAILABLE / RESERVED): the idle ping interval */
+  protected readonly ridePings = false;
 
   protected initTables() {
     // drivers, timers and meta are shared (ZoneActor.initSchema)

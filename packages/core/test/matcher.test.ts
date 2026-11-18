@@ -19,7 +19,7 @@ describe("rankCandidates", () => {
         d("busy", 0.001, { status: "ON_RIDE" }),
         d("reserved", 0.001, { status: "RESERVED", reservedUntil: now + 5_000 }),
         d("offline", 0.001, { status: "OFFLINE" }),
-        d("stale", 0.001, { updatedAt: now - 31_000 }),
+        d("stale", 0.001, { updatedAt: now - 46_000 }),
         d("rejected", 0.001),
         d("toofar", 0.1), // ~11km
         d("ok", 0.002),
@@ -28,6 +28,11 @@ describe("rankCandidates", () => {
       { now, exclude: new Set(["rejected"]) },
     );
     expect(r.map((c) => c.driverId)).toEqual(["ok", "lapsed"]);
+  });
+  it("keeps a still driver whose heartbeats were lost twice (45 s staleness)", () => {
+    // idle heartbeat every ~10 s: two lost in a row leave a ~30 s gap, still matchable
+    const r = rankCandidates(pickup, [d("gap", 0.001, { updatedAt: now - 32_000 }), d("gone", 0.002, { updatedAt: now - 46_000 })], { now });
+    expect(r.map((c) => c.driverId)).toEqual(["gap"]);
   });
   it("pickup radius is 2 km by default", () => {
     // 0.001° latitude ≈ 111 m

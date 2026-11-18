@@ -24,7 +24,9 @@ export interface MatchConfig {
 }
 
 export const DEFAULT_MATCH_CONFIG: MatchConfig = {
-  staleMs: 30_000,
+  // ~4 idle heartbeats (client 10 s, server keeps one per >= 8 s): one or two lost pings on a bad
+  // network must not drop an online driver from matching
+  staleMs: 45_000,
   maxRadiusM: 2_000,
   k: 10,
   ringPrecisions: [6, 5],

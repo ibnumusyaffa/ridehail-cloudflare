@@ -2,7 +2,12 @@ import { distanceInsideCellM, haversineM } from "./geo";
 import type { LatLng } from "./types";
 
 export interface PresenceConfig {
-  /** Minimum gap between accepted location pings of an idle / available driver. */
+  /**
+   * Minimum gap between accepted location pings of a driver not on a ride (available / reserved /
+   * offline). A driver standing still is then processed only this often: a heartbeat well inside the
+   * matcher's `staleMs` (45 s). Keep it below the client's idle interval (`shouldSendPing`) so network jitter
+   * never drops a heartbeat.
+   */
   locMinIntervalMs: number;
   /** Same, for a driver on a ride (the customer watches the marker, so allow more). */
   locMinIntervalOnRideMs: number;
@@ -15,7 +20,7 @@ export interface PresenceConfig {
 }
 
 export const DEFAULT_PRESENCE_CONFIG: PresenceConfig = {
-  locMinIntervalMs: 2_000,
+  locMinIntervalMs: 8_000,
   locMinIntervalOnRideMs: 1_000,
   locMinMoveM: 30,
   handoffMarginM: 100,
@@ -48,13 +53,13 @@ export function shouldHandOff(p: LatLng, newZone: string, outsidePings: number, 
 
 /**
  * Client-side throttle: send a location ping only after moving far enough or waiting long enough.
- * Keeps idle drivers at one ping per `maxIntervalMs`.
+ * Keeps idle drivers at one ping per `maxIntervalMs` (above the server's `locMinIntervalMs`, so each is a heartbeat it keeps).
  */
 export function shouldSendPing(
   last: (LatLng & { at: number }) | null,
   now: LatLng & { at: number },
   movedM: (a: LatLng, b: LatLng) => number,
-  opts: { minMoveM: number; maxIntervalMs: number } = { minMoveM: 30, maxIntervalMs: 5_000 },
+  opts: { minMoveM: number; maxIntervalMs: number } = { minMoveM: 30, maxIntervalMs: 10_000 },
 ): boolean {
   if (!last) return true;
   return now.at - last.at >= opts.maxIntervalMs || movedM(last, now) >= opts.minMoveM;
