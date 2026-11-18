@@ -384,7 +384,8 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                     {searching && <div className="spinner" />}
                   </div>
                   {ride.driver && <DriverCard d={ride.driver} />}
-                  <div className="group">
+                  {/* once completed, the paid summary says what matters: keep the sheet short so the rating and "Pesan lagi" fit */}
+                  {ride.status !== "COMPLETED" && <div className="group">
                     <div className="cell inset">
                       <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin pick" /></span>
                       <span className="grow">{ride.pickup.label}</span>
@@ -398,7 +399,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                       <span className="grow">{ride.paymentMethod === "CASH" ? "Tunai" : "Wallet"}</span>
                       <strong className="tnum">{fmtRp(ride.fare)}</strong>
                     </div>
-                  </div>
+                  </div>}
                   {lost && ride.status === "ON_TRIP" && (
                     <div className="stack" data-testid="driver-lost">
                       <Section foot={`Dibatalkan otomatis pukul ${fmtTime(lost.autoCancelAt)} kalau tidak dijawab.`}>
@@ -413,7 +414,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                     </div>
                   )}
                   {["REQUESTED", "OFFERING", "ACCEPTED", "ARRIVED"].includes(ride.status) && (
-                    <button
+                    <div className="sheet-cta"><button
                       className="danger big"
                       data-testid="cancel-button"
                       onClick={async () => {
@@ -425,7 +426,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                       }}
                     >
                       Batalkan pesanan
-                    </button>
+                    </button></div>
                   )}
                   {ride.status === "COMPLETED" && (
                     <div className="group">
@@ -467,7 +468,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                     </div>
                   )}
                   {!active && (
-                    <button className="primary big" onClick={reset} data-testid="new-ride">Pesan lagi</button>
+                    <div className="sheet-cta"><button className="primary big" onClick={reset} data-testid="new-ride">Pesan lagi</button></div>
                   )}
                 </div>
               )}
