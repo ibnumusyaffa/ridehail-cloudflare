@@ -23,6 +23,15 @@ export class ApiError extends Error {
   }
 }
 
+/** Attempts of a request that carries an Idempotency-Key (first try + retries). */
+const IDEM_ATTEMPTS = 3;
+
+/**
+ * Worth retrying with the same Idempotency-Key: the reply was lost (network error) or the server could
+ * not finish (5xx). The key makes a retry return what the first attempt did, never a second write.
+ */
+const retryable = (e: unknown) => e instanceof TypeError || (e instanceof ApiError && e.status >= 500);
+
 /** Typed REST client for the ride-hailing API. */
 export class ApiClient {
   constructor(
@@ -47,6 +56,21 @@ export class ApiClient {
     return json as T;
   }
 
+  /**
+   * POST with an Idempotency-Key, retried with that same key (0.5 s, 1 s) when the reply is lost or the
+   * server fails. Callers keep the key for as long as they mean the same operation (see `createRide`).
+   */
+  private async reqIdem<T>(path: string, body: unknown, idem: string): Promise<T> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.req<T>(path, { body, idem });
+      } catch (e) {
+        if (attempt >= IDEM_ATTEMPTS || !retryable(e)) throw e;
+        await new Promise((r) => setTimeout(r, 500 * 2 ** (attempt - 1)));
+      }
+    }
+  }
+
   /** Dev only: wipe every user, ride, wallet and zone (API must run with DEV_RESET=1). */
   devReset() {
     return this.req<{ ok: true; zones: number }>("/dev/reset", { body: {} });
@@ -60,11 +84,12 @@ export class ApiClient {
   estimate(pickup: Place, dropoff: Place) {
     return this.req<{ distanceM: number; fare: number }>("/rides/estimate", { body: { pickup, dropoff } });
   }
-  createRide(pickup: Place, dropoff: Place, paymentMethod: PaymentMethod) {
-    return this.req<{ rideId: string; status: string; ride: RideView }>("/rides", {
-      body: { pickup, dropoff, paymentMethod },
-      idem: crypto.randomUUID(),
-    });
+  /**
+   * Order a ride. Pass the same `idem` for every try of one order (a button pressed again after a
+   * failure): if an earlier try did reach the server, its ride comes back instead of ACTIVE_RIDE_EXISTS.
+   */
+  createRide(pickup: Place, dropoff: Place, paymentMethod: PaymentMethod, idem: string = crypto.randomUUID()) {
+    return this.reqIdem<{ rideId: string; status: string; ride: RideView }>("/rides", { pickup, dropoff, paymentMethod }, idem);
   }
   activeRide() {
     return this.req<{ ride: RideView | null }>("/rides?active=1");
@@ -91,8 +116,9 @@ export class ApiClient {
   wallet() {
     return this.req<{ balance: number }>("/wallet");
   }
-  topup(amount: number) {
-    return this.req<{ balance: number }>("/wallet/topup", { body: { amount }, idem: crypto.randomUUID() });
+  /** Top up once per `idem` (keep it across tries of one top-up, as for `createRide`). */
+  topup(amount: number, idem: string = crypto.randomUUID()) {
+    return this.reqIdem<{ balance: number }>("/wallet/topup", { amount }, idem);
   }
   transactions() {
     return this.req<{ transactions: WalletTx[] }>("/wallet/transactions");

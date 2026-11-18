@@ -7,6 +7,7 @@ const E2E_DATABASE_URL = process.env.E2E_DATABASE_URL ?? "postgres://postgres:po
 const api = `http://localhost:${API_PORT}`;
 process.env.CUSTOMER_URL ??= "http://localhost:5273";
 process.env.DRIVER_URL ??= "http://localhost:5274";
+process.env.API_URL ??= api;
 
 export default defineConfig({
   testDir: "tests",

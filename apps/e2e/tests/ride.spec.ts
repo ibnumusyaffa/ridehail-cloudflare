@@ -1,6 +1,7 @@
 import { expect, test, type Browser, type Page } from "@playwright/test";
 import {
-  customerOrder, driverAcceptOffer, driverCompleteTrip, driverOnlineNear, driverReachTarget, login, phone, rideStatus, topup, URLS,
+  apiGet, customerOrder, driverAcceptOffer, driverCompleteTrip, driverOnlineNear, driverReachTarget, login, loseReplies, phone,
+  rideStatus, topup, URLS,
 } from "../src/steps";
 
 async function pair(browser: Browser, speed = 120): Promise<{ customer: Page; driver: Page }> {
@@ -97,4 +98,44 @@ test("reset button wipes everything and logs the other window out", async ({ bro
   await expect(customer.getByTestId("login-phone")).toBeVisible();
   await expect(driver.getByTestId("login-phone")).toBeVisible({ timeout: 15_000 });
   expect(await driver.evaluate(() => localStorage.getItem("session"))).toBeNull();
+});
+
+test.describe("lost replies (outage on the way back)", () => {
+  const myRides = async (p: Page) => (await apiGet<{ rides: unknown[] }>(p, "/rides?mine=1")).rides.length;
+
+  test("order reply lost once → retried with the same key, one ride", async ({ browser }) => {
+    const { customer } = await pair(browser);
+    const net = await loseReplies(customer, "/rides", 1);
+    await customerOrder(customer, "monas-hi", "CASH");
+    await expect(rideStatus(customer)).toHaveAttribute("data-status", /REQUESTED|OFFERING|NO_DRIVER/);
+    expect(net.posts()).toBe(2);
+    expect(await myRides(customer)).toBe(1);
+  });
+
+  test("every retry lost, then a new order → the ride that went through is shown", async ({ browser }) => {
+    const { customer } = await pair(browser);
+    await loseReplies(customer, "/rides", 3);
+    await customerOrder(customer, "monas-hi", "CASH");
+    await expect(customer.getByTestId("order-card")).toBeVisible();
+    await expect(customer.getByTestId("toast")).toBeVisible({ timeout: 10_000 });
+    expect(await myRides(customer)).toBe(1);
+
+    // a different trip gets a new key: the server refuses it (one active ride), the app shows the first one
+    await customerOrder(customer, "gbk-blokm", "CASH");
+    await expect(rideStatus(customer)).toHaveAttribute("data-status", /REQUESTED|OFFERING|NO_DRIVER/);
+    await expect(customer.getByTestId("toast")).toContainText("sudah masuk");
+    expect(await myRides(customer)).toBe(1);
+  });
+
+  test("top-up reply lost → pressed again, credited once", async ({ browser }) => {
+    const { customer } = await pair(browser);
+    await loseReplies(customer, "/wallet/topup", 3);
+    await customer.getByTestId("tab-wallet").click();
+    await customer.getByTestId("topup-50000").click();
+    await expect.poll(async () => (await apiGet<{ balance: number }>(customer, "/wallet")).balance).toBe(50_000);
+    await customer.getByTestId("topup-50000").click(); // same key: the server answers with the first top-up
+    await expect(customer.getByTestId("wallet-balance")).toContainText("50");
+    expect((await apiGet<{ balance: number }>(customer, "/wallet")).balance).toBe(50_000);
+    expect((await apiGet<{ transactions: unknown[] }>(customer, "/wallet/transactions")).transactions).toHaveLength(1);
+  });
 });

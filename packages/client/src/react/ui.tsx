@@ -206,6 +206,15 @@ export function WalletPanel({ api, refreshKey }: { api: ApiClient; refreshKey?: 
     setBalance(w.balance);
     setTxs(t.transactions);
   };
+  /** Idempotency-Key per amount, kept until that top-up succeeds: a press after a lost reply never tops up twice */
+  const topupKeys = useRef(new Map<number, string>());
+  const topup = async (amount: number) => {
+    const key = topupKeys.current.get(amount) ?? crypto.randomUUID();
+    topupKeys.current.set(amount, key);
+    await api.topup(amount, key);
+    topupKeys.current.delete(amount);
+    await load();
+  };
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -221,7 +230,7 @@ export function WalletPanel({ api, refreshKey }: { api: ApiClient; refreshKey?: 
         </div>
         <div className="row gap">
           {[50_000, 100_000].map((a) => (
-            <button key={a} data-testid={`topup-${a}`} onClick={async () => (await api.topup(a), load())}>
+            <button key={a} data-testid={`topup-${a}`} onClick={() => void topup(a)}>
               + {fmtRp(a)}
             </button>
           ))}

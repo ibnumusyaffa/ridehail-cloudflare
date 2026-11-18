@@ -83,7 +83,8 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
   - Catatan: saldo driver di bawah batas yang baru ketahuan dari pembayaran ulang (`settle:`) tidak lagi membuat driver `OFFLINE` saat itu juga; dicek saat ia online lagi.
 - [ ] **B3. Deploy pertama** — pastikan Hyperdrive terpakai dari kedua DO di produksi, bukan hanya Worker.
 - [ ] **B4. Payment gateway & penarikan saldo driver.**
-- [ ] **B5. Catatan kecil dari review (P3)** — driver yang socket-nya putus tetap `AVAILABLE` sampai 1 jam dan tidak dicek saldo ulang saat tersambung lagi; REST (`GET /rides/:id`, Postgres) dan WebSocket (RideDO) kini sama setelah A2, kecuali `OFFERING` (REST menampilkan `REQUESTED`); `purge` tidak menghapus driver `RESERVED` yang kedaluwarsa; `Idempotency-Key` dibuat baru tiap panggilan di `packages/client/src/api.ts`.
+- [ ] **B5. Catatan kecil dari review (P3)** — driver yang socket-nya putus tetap `AVAILABLE` sampai 1 jam dan tidak dicek saldo ulang saat tersambung lagi; REST (`GET /rides/:id`, Postgres) dan WebSocket (RideDO) kini sama setelah A2, kecuali `OFFERING` (REST menampilkan `REQUESTED`); `purge` tidak menghapus driver `RESERVED` yang kedaluwarsa.
+  - ~~`Idempotency-Key` dibuat baru tiap panggilan~~ → selesai: key disimpan per pesanan / per nominal top-up sampai sukses, `reqIdem` mengulang balasan hilang / 5xx dengan key yang sama, `ACTIVE_RIDE_EXISTS` → app menampilkan ride aktif. Dites: `apps/e2e/tests/ride.spec.ts` ("lost replies").
 
 ---
 

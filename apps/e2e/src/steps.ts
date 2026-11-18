@@ -4,7 +4,39 @@ import { expect, type Page } from "@playwright/test";
 export const URLS = {
   customer: process.env.CUSTOMER_URL ?? "http://localhost:5173",
   driver: process.env.DRIVER_URL ?? "http://localhost:5174",
+  api: process.env.API_URL ?? "http://localhost:8787",
 };
+
+/**
+ * The next `count` POSTs to `path` reach the API and are processed there, but the browser never gets the
+ * reply (as if the connection dropped on the way back). Returns how many POSTs were sent in total.
+ */
+export async function loseReplies(page: Page, path: string, count: number): Promise<{ posts: () => number }> {
+  let posts = 0;
+  await page.route(
+    (url) => url.pathname === path,
+    async (route) => {
+      if (route.request().method() !== "POST") return route.continue();
+      posts++;
+      if (posts > count) return route.continue();
+      await route.fetch(); // the server does the work...
+      await route.abort("connectionreset"); // ...the reply is lost
+    },
+  );
+  return { posts: () => posts };
+}
+
+/** GET an API path as the page's logged-in user. */
+export async function apiGet<T>(page: Page, path: string): Promise<T> {
+  return page.evaluate(
+    async ({ base, path }) => {
+      const { token } = JSON.parse(localStorage.getItem("session") ?? "{}");
+      const res = await fetch(base + path, { headers: { authorization: `Bearer ${token}` } });
+      return res.json();
+    },
+    { base: URLS.api, path },
+  );
+}
 
 let n = 0;
 export const phone = (prefix: string) => `${prefix}${String(Date.now()).slice(-6)}${++n}`;

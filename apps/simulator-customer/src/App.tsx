@@ -1,4 +1,4 @@
-import { ApiClient, type User } from "@gojek/client/api";
+import { ApiClient, ApiError, type User } from "@gojek/client/api";
 import { env } from "@gojek/client/env";
 import { reverseGeocode } from "@gojek/client/geocode";
 import { JAKARTA, PRESET_TRIPS } from "@gojek/client/presets";
@@ -87,6 +87,14 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
   const [toast, setToast] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  /**
+   * Idempotency-Key of the order being placed: kept across presses of "Pesan" until one succeeds, so a
+   * press after a lost reply gets that ride back instead of ordering again. A new trip gets a new key.
+   */
+  const orderKey = useRef<string | null>(null);
+  useEffect(() => {
+    orderKey.current = null;
+  }, [pickup, dropoff, pay]);
 
   const flash = (t: string) => {
     setToast(t);
@@ -215,15 +223,24 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
   const order = async () => {
     if (!pickup || !dropoff) return;
     setBusy(true);
-    try {
-      const res = await api.createRide(pickup, dropoff, pay);
+    const show = (r: RideView) => {
+      orderKey.current = null;
       setPaid(null);
       setRated(0);
       setDriverPos(null);
       setLegStart(null);
-      setRide(res.ride);
+      setRide(r);
+    };
+    try {
+      orderKey.current ??= crypto.randomUUID();
+      show((await api.createRide(pickup, dropoff, pay, orderKey.current)).ride);
     } catch (e) {
-      flash((e as Error).message);
+      // an earlier order of ours did go through (its reply was lost): show that ride instead of an error
+      const active = e instanceof ApiError && e.code === "ACTIVE_RIDE_EXISTS" ? await api.activeRide().catch(() => null) : null;
+      if (active?.ride) {
+        show(active.ride);
+        flash("Pesanan sebelumnya ternyata sudah masuk");
+      } else flash((e as Error).message);
     } finally {
       setBusy(false);
     }
