@@ -155,4 +155,21 @@ describe("driver search", () => {
     drv.ws.close();
     ws.close();
   });
+
+  it("actor restarts after its offer / search timers were consumed → the offer still times out, the search still ends", async () => {
+    const p = spot();
+    const drv = await onlineDriver(off(p, 0.001).lat, p.lng, "Diam");
+    const { rideId, ws } = await order(p);
+    expect((await drv.ws.next("offer")).rideId).toBe(rideId);
+    // a timer row is deleted before its handler runs: an actor that died mid-handler (deploy) lost both
+    await inZone(zoneOf(p), "ride", async (inst) => {
+      inst.sql.exec("DELETE FROM timers WHERE key IN (?, ?)", `offer:${rideId}`, `search:${rideId}`);
+      await inst.rearmTimers(); // what the constructor runs on restart
+    });
+
+    expect((await drv.ws.next("offer.cancelled", 5_000)).reason).toBe("TIMEOUT");
+    await ws.next(status("NO_DRIVER"), 8_000);
+    drv.ws.close();
+    ws.close();
+  });
 });

@@ -264,10 +264,11 @@ describe("A6: a driver never holds two rides", () => {
     const next = await onlineDriver(off(p, 0.004).lat, p.lng, "Eko");
     // the driver's other ride: active in Postgres, unknown to this zone (e.g. another zone's ride)
     const other = await customer();
+    const busyRide = `zzzzz_${crypto.randomUUID()}`;
     await withSql(env as unknown as Env, (sql) => sql`
       INSERT INTO rides (id, customer_id, driver_id, pickup_lat, pickup_lng, drop_lat, drop_lng, status,
         fare_estimate, distance_m, payment_method, requested_at, accepted_at)
-      VALUES (${`zzzzz_${crypto.randomUUID()}`}, ${other.id}, ${busy.id}, ${p.lat}, ${p.lng}, ${p.lat}, ${p.lng},
+      VALUES (${busyRide}, ${other.id}, ${busy.id}, ${p.lat}, ${p.lng}, ${p.lat}, ${p.lng},
         'ACCEPTED', 10000, 1000, 'CASH', ${Date.now()}, ${Date.now()})`);
 
     const c = await customer();
@@ -275,6 +276,8 @@ describe("A6: a driver never holds two rides", () => {
     expect((await busy.ws.next("offer")).rideId).toBe(rideId);
     busy.ws.send({ t: "offer.accept", rideId });
     expect((await busy.ws.next("error")).code).toBe("DRIVER_BUSY");
+    // not put back among the free drivers: pointed at the ride they are on
+    expect(await busy.ws.next("zone.moved")).toMatchObject({ zone: "zzzzz", rideId: busyRide });
 
     expect((await next.ws.next("offer")).rideId).toBe(rideId);
     next.ws.send({ t: "offer.accept", rideId });
@@ -283,6 +286,26 @@ describe("A6: a driver never holds two rides", () => {
     expect((await pgRide(rideId))?.driverId).toBe(next.id);
     busy.ws.close();
     next.ws.close();
+  });
+
+  it("a driver on a ride who reaches a match actor (second phone, stale client) and goes online → sent back to the ride, never AVAILABLE", async () => {
+    const p = spot();
+    const drv = await onlineDriver(off(p, 0.001).lat, p.lng, "Gilang");
+    const c = await customer();
+    const rideId: string = (await order(c.token, p)).json.rideId;
+    expect((await drv.ws.next("offer")).rideId).toBe(rideId);
+    drv.ws.send({ t: "offer.accept", rideId });
+    await drv.ws.next(status("ACCEPTED"));
+
+    // another socket of the same driver, told it has no active ride (`known=1`): lands in the match actor
+    const second = await Client.connect({ token: drv.token, lat: p.lat, lng: p.lng, known: 1 });
+    expect((await second.next("hello")).driverStatus).toBe("OFFLINE");
+    second.send({ t: "online" });
+    expect(await second.next("zone.moved")).toMatchObject({ rideId });
+    expect(await second.next("hello")).toMatchObject({ driverStatus: "ON_RIDE", rideId });
+    expect(second.inbox.some((m) => m.t === "driver.state" && m.status === "AVAILABLE")).toBe(false);
+    second.close();
+    drv.ws.close();
   });
 
   it("cross-zone accept: Postgres reply lost, nobody retries → it lands on recovery and the driver's zone hands the driver over", async () => {

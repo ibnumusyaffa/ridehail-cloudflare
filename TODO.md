@@ -45,7 +45,7 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
   - Tanda `searched` / `researched` dibuang. Aturan: selama belum lewat `searchDeadline`, cari ulang tiap `RESEARCH_DELAY_MS`; `NO_DRIVER` dari timer `search:`.
   - `findCandidates`: `Promise.allSettled`, zona gagal dilewati; kalau semua zona gagal, langkah gagal dan timer penjaga mengulang.
   - Dites: `test/dispatch.test.ts`. Test lama memakai `SEARCH_TIMEOUT_MS=3000`.
-  - Sisa: belum ada test untuk DO mati di tengah pencarian (`rearmTimers`).
+  - `rearmTimers` juga memasang ulang `offer:` (di `offer.expiresAt`) dan `search:` (di `searchDeadline`): baris timer dihapus sebelum handler jalan, jadi DO yang mati di tengah handler (deploy) dulu meninggalkan ride `OFFERING` tanpa timer — `dispatch:` melewati ride dengan tawaran berdiri, customer menunggu selamanya. Dites: `test/dispatch.test.ts` ("actor restarts after its offer / search timers were consumed").
 
 - [ ] **A5. Cek lokasi untuk Tiba dan Selesai** (§3.3)
   - `ARRIVE` hanya jika driver dekat titik jemput; `COMPLETE` hanya jika dekat tujuan. Jarak batas masuk config.
@@ -57,7 +57,23 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
   - Accept yang commit tapi zona driver tidak tahu (balasan Postgres hilang lalu commit lewat `sync:`, atau balasan RPC antar zona hilang): `adopt` ACCEPT dengan driver dari zona lain mencatat `ride.handover` dan memasang timer `handover:`. Timer memanggil RPC `handOverToRide` di zona driver (hapus driver dari zona itu, kirim `zone.moved` + `rideId`, tutup socket), diulang dengan backoff sampai berhasil. Kalau ride sudah lanjut (batal / requeue) sebelum sempat, timer hanya `release` reservasi driver.
   - RPC `acceptOffer` melempar error → diperlakukan `UNAVAILABLE`: reservasi driver dipertahankan dan diperpanjang `reserveTtlMs`, driver boleh mengulang. Kalau ternyata commit → `handover:`; kalau tidak → timer tawaran zona ride melepasnya.
   - Dites: `test/resilience.test.ts` (describe "A6").
-  - Sisa: driver bisa sempat ditawari ride lain di zona lama selama `handover:` belum sampai (mis. zona driver tidak terjangkau); accept kedua tetap ditolak Postgres (`DRIVER_BUSY`).
+  - Driver yang sedang punya ride aktif tidak bisa jadi `AVAILABLE` di MatchDO: `online` ikut mengecek `getActiveRide` (query Postgres yang sama dengan cek saldo) dan mengarahkan driver ke ride-nya (HP kedua, klien `known=1` yang salah, map `moved` hilang saat MatchDO restart). Accept yang ditolak `DRIVER_BUSY` tidak lagi mengembalikan driver jadi `AVAILABLE`: ia diarahkan ke ride aktifnya (atau `OFFLINE` kalau tidak ketemu). Dites: `test/resilience.test.ts` (describe "A6").
+  - Sisa: driver bisa sempat ditawari satu ride lain selama `handover:` belum sampai atau sebelum tawaran pertama memicu `DRIVER_BUSY`; accept kedua tetap ditolak Postgres.
+
+- [ ] **A9. Customer tidak datang (no-show)**
+  - Sekarang driver yang sudah `ARRIVED` hanya bisa melepas order (`REQUEUE`): ride dicarikan driver lain untuk customer yang tidak ada (sampai `MAX_REQUEUES` kali), driver yang menunggu tercatat di `dropoutDrivers` seperti driver yang membatalkan, dan tidak dapat kompensasi.
+  - Event baru, mis. `CANCEL` oleh `driver` dengan alasan `no_show`: hanya dari `ARRIVED`, dan hanya setelah driver menunggu `NO_SHOW_WAIT_MS` sejak `arrivedAt` (config). Ride selesai (tidak dicari ulang), tidak dihitung sebagai dropout.
+  - Putuskan: biaya no-show / biaya batal customer setelah `ARRIVED` (dipotong dari hold WALLET; CASH → utang customer atau dibebaskan?), dan berapa bagian untuk driver.
+  - Pakai cek lokasi A5: driver harus benar-benar dekat titik jemput untuk bisa klaim no-show.
+  - Selesai jika: driver di titik jemput, menunggu lewat batas → batal no-show, ride tidak dicari ulang, driver tidak tercatat dropout; sebelum batas → ditolak dengan error yang jelas.
+
+- [ ] **A10. Trip `ON_TRIP` tidak bisa dihentikan di tengah jalan**
+  - Sekarang `ON_TRIP` hanya berakhir lewat `COMPLETE` (tarif penuh) atau driver diam `DRIVER_LOST_ASK_MS` (1 jam, customer baru boleh melapor) / `DRIVER_LOST_CANCEL_MS` (3 jam). Ban bocor, kecelakaan, atau customer turun di tengah jalan tidak punya jalur; customer terkunci (satu ride aktif) sampai 1 jam.
+  - Opsi (perlu keputusan bisnis):
+    - Driver/customer bisa "akhiri trip di sini" → `COMPLETE` dengan tarif sebagian (dihitung dari rute `ride_track` / jarak lurus ke titik terakhir), `fareFinal` ≤ `fare`.
+    - Customer bisa lapor masalah lebih cepat dari 1 jam (turunkan `DRIVER_LOST_ASK_MS`, mis. 10–15 menit tanpa ping).
+    - Endpoint admin paksa selesai / paksa batal (butuh autentikasi admin; sudah disebut di sisa A3).
+  - Selesai jika: trip bisa diakhiri di tengah jalan dengan tarif yang adil, dan customer tidak terkunci lebih dari batas yang disepakati.
 
 ### P2 — Perbaikan kecil & pengalaman
 

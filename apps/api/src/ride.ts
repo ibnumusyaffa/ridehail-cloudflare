@@ -215,6 +215,18 @@ export class RideDO extends ZoneActor implements RideApi {
          AND json_extract(data, '$.pgPending') IS NOT 1`,
       now,
     );
+    // A timer row is deleted before its handler runs, so one that was running when this actor died is
+    // gone. A standing offer always has its timeout (dispatch skips a ride with a standing offer, so
+    // nothing else would ever move it on) and every search has its deadline.
+    this.sql.exec(
+      `INSERT OR IGNORE INTO timers (key, at) SELECT 'offer:' || id, json_extract(data, '$.offer.expiresAt') FROM rides
+       WHERE status = 'OFFERING' AND json_extract(data, '$.offer') IS NOT NULL
+         AND json_extract(data, '$.offer.reserving') IS NOT 1`,
+    );
+    this.sql.exec(
+      `INSERT OR IGNORE INTO timers (key, at) SELECT 'search:' || id, json_extract(data, '$.searchDeadline') FROM rides
+       WHERE status IN ('REQUESTED', 'OFFERING') AND json_extract(data, '$.pgPending') IS NOT 1`,
+    );
     // every accept the driver's match actor has not heard of yet
     this.sql.exec(
       "INSERT OR IGNORE INTO timers (key, at) SELECT 'handover:' || id, ? FROM rides WHERE json_extract(data, '$.handover') IS NOT NULL",

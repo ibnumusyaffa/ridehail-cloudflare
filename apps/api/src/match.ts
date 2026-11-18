@@ -108,6 +108,21 @@ export class MatchDO extends ZoneActor implements MatchApi {
     this.moveSockets(driverId, { t: "zone.moved", zone: rideHome, rideId }, false);
   }
 
+  /**
+   * The driver has an active ride (Postgres says so) yet is here: hand them to that ride's actor.
+   * False when the ride id names no ride actor (nothing done).
+   */
+  private toActiveRide(driverId: string, rideId: string): boolean {
+    const home = homeOfRide(rideId);
+    if (!home) return false;
+    const d = this.loadDriver(driverId);
+    // a reservation they still hold here can't be taken now: the ride's offer timer moves that search on
+    if (d?.status === "RESERVED" && d.rideId && d.rideId !== rideId)
+      this.send(driverId, { t: "offer.cancelled", rideId: d.rideId, reason: "CANCELLED" });
+    this.handToRide(driverId, rideId, home);
+    return true;
+  }
+
   // ============================================================ RPC: matching
 
   /** Drivers in `cells` from the in-memory grid (no table scan), then their status by primary key. */
@@ -246,10 +261,13 @@ export class MatchDO extends ZoneActor implements MatchApi {
       case "online": {
         if (d.status === "ON_RIDE" || d.status === "RESERVED") return this.sendDriverState(d);
         if (d.lat === null || d.lng === null) throw new DomainError("BAD_REQUEST", "send a loc first");
-        const { balance, vehicle } = await this.pg(async (sql) => ({
+        const { balance, vehicle, active } = await this.pg(async (sql) => ({
           balance: await db.getBalance(sql, d.id),
           vehicle: d.vehicle ?? (await db.getVehicle(sql, d.id)),
+          active: await db.getActiveRide(sql, d.id, "driver"),
         }));
+        // on a ride already (a second phone, a client that lost track): back to it, never AVAILABLE here
+        if (active && this.toActiveRide(d.id, active.id)) return;
         if (balance < this.cfg.driverMinBalance) throw new DomainError("DRIVER_BALANCE_TOO_LOW", `balance ${balance}`);
         const fresh = this.loadDriver(d.id) ?? d;
         if (fresh.status !== "OFFLINE" && fresh.status !== "AVAILABLE") return this.sendDriverState(fresh);
@@ -298,6 +316,24 @@ export class MatchDO extends ZoneActor implements MatchApi {
               this.setDriverFree(cur);
             }
             this.saveDriver(cur);
+          }
+          if (res.code === "DRIVER_BUSY") {
+            // Postgres says the driver is on another ride: they are not free, here or anywhere. Take them
+            // out of the search and point them at that ride (a stale AVAILABLE row heals at its first offer).
+            this.sendWs(ws, { t: "error", code: res.code, message: res.message });
+            const active = await this.pg((sql) => db.getActiveRide(sql, d.id, "driver")).catch((e) => {
+              console.error("accept: active ride lookup failed", d.id, e);
+              return null;
+            });
+            if (!active || !this.toActiveRide(d.id, active.id)) {
+              const now = this.loadDriver(d.id);
+              if (now && now.status === "AVAILABLE") {
+                now.status = "OFFLINE";
+                this.saveDriver(now);
+                this.sendDriverState(now);
+              }
+            }
+            return;
           }
           throw new DomainError(res.code, res.message);
         }
