@@ -10,7 +10,8 @@
     "./presets": "./src/presets.ts",
     "./react": "./src/react/index.ts",
     "./styles.css": "./src/react/styles.css",
-    "./route": "./src/route.ts"
+    "./route": "./src/route.ts",
+    "./geocode": "./src/geocode.ts"
   },
   "scripts": {
     "typecheck": "tsc -p ."

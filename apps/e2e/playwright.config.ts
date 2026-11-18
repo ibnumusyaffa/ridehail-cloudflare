@@ -33,14 +33,14 @@ export default defineConfig({
       command: "pnpm exec vite --port 5273 --strictPort",
       cwd: "../simulator-customer",
       url: process.env.CUSTOMER_URL,
-      env: { VITE_API_URL: api, VITE_OSRM_URL: "off" }, // deterministic: no external routing
+      env: { VITE_API_URL: api, VITE_OSRM_URL: "off", VITE_GEOCODER_URL: "off" }, // deterministic: no external routing
       reuseExistingServer: false,
     },
     {
       command: "pnpm exec vite --port 5274 --strictPort",
       cwd: "../simulator-driver",
       url: process.env.DRIVER_URL,
-      env: { VITE_API_URL: api, VITE_OSRM_URL: "off" }, // deterministic: no external routing
+      env: { VITE_API_URL: api, VITE_OSRM_URL: "off", VITE_GEOCODER_URL: "off" }, // deterministic: no external routing
       reuseExistingServer: false,
     },
   ],

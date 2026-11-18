@@ -2,7 +2,8 @@ import { ApiClient, type User } from "@gojek/client/api";
 import { nearPickup, PRESET_TRIPS } from "@gojek/client/presets";
 import type { OfferPayload, RideView, ServerMsg } from "@gojek/client/protocol";
 import {
-  ConnDot, fmtKm, fmtRp, fmtTime, LoginForm, MapView, type MapMarker, ResetButton, Toast, useRoute, useStored, WalletPanel, wipeLocalAndReload,
+  AccountPage, ConnDot, fmtKm, fmtRp, fmtTime, Icon, LoginForm, MapView, type MapMarker, Page, Phone, Sheet, ResetButton, Section, TabBar,
+  type TabSpec, Toast, useRoute, useStored, WalletPanel, wipeLocalAndReload,
 } from "@gojek/client/react";
 import { advanceAlong, getRoute, pathLength, trimFrom } from "@gojek/client/route";
 import { RideSocket, type SocketState } from "@gojek/client/socket";
@@ -17,25 +18,32 @@ export function App() {
   const [defaultPhone] = useState(() => `0899${Math.floor(1e6 + Math.random() * 9e6)}`);
   if (!session) {
     return (
-      <div className="app">
-        <header className="topbar driver">
-          <h1>RideSim · Driver</h1>
-          <ResetButton api={new ApiClient(API)} onDone={wipeLocalAndReload} />
-        </header>
-        <div className="page">
-          <LoginForm
-            role="driver"
-            defaultPhone={defaultPhone}
-            onLogin={async (phone, name) => setSession(await new ApiClient(API).login(phone, "driver", name || undefined))}
-          />
+      <Phone role="driver">
+        <div className="app no-tabs">
+          <div className="page">
+            <LoginForm
+              role="driver"
+              defaultPhone={defaultPhone}
+              onLogin={async (phone, name) => setSession(await new ApiClient(API).login(phone, "driver", name || undefined))}
+            />
+            <Section>
+              <ResetButton api={new ApiClient(API)} onDone={wipeLocalAndReload} />
+            </Section>
+          </div>
         </div>
-      </div>
+      </Phone>
     );
   }
   return <Driver session={session} onLogout={() => setSession(null)} />;
 }
 
-type Tab = "drive" | "earnings" | "wallet";
+type Tab = "drive" | "earnings" | "wallet" | "account";
+const TABS: TabSpec<Tab>[] = [
+  { id: "drive", label: "Kemudi", icon: "wheel" },
+  { id: "earnings", label: "Pendapatan", icon: "chart" },
+  { id: "wallet", label: "Wallet", icon: "wallet" },
+  { id: "account", label: "Akun", icon: "person" },
+];
 const ARRIVE_M = 25;
 
 const STATUS_TEXT: Record<DriverStatus, string> = {
@@ -243,158 +251,201 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
   const fitPoints = (offer || onRide) && route.length ? route : ride?.status === "ARRIVED" ? [pos, ride.pickup] : [pos];
 
 
+  const online = status !== "OFFLINE";
+
   return (
-    <div className="app">
-      <header className="topbar driver">
-        <h1>RideSim · Driver</h1>
-        <ConnDot state={sock} />
-        <nav className="tabs">
-          {(["drive", "earnings", "wallet"] as Tab[]).map((t) => (
-            <button key={t} aria-pressed={tab === t} onClick={() => setTab(t)} data-testid={`tab-${t}`}>
-              {t === "drive" ? "Kemudi" : t === "earnings" ? "Pendapatan" : "Wallet"}
-            </button>
-          ))}
-        </nav>
-        <ResetButton api={api} onDone={wipeLocalAndReload} />
-        <button onClick={onLogout} title={session.user.phone}>Keluar</button>
-      </header>
+    <Phone role="driver">
+      <div className="app">
+        {tab === "drive" && (
+          <div className="body">
+            <MapView
+              center={pos}
+              markers={markers}
+              route={route}
+              fitKey={fitKey}
+              fitPoints={fitPoints}
+              onClick={onRide && autopilot ? undefined : (p) => (setPos(p), sendLoc())}
+            />
+            <div className="float-top">
+              <span className="chip"><ConnDot state={sock} />{online ? "Online" : "Offline"}</span>
+            </div>
 
-      {tab === "drive" && (
-        <div className="body">
-          <MapView
-            center={pos}
-            markers={markers}
-            route={route}
-            fitKey={fitKey}
-            fitPoints={fitPoints}
-            onClick={onRide && autopilot ? undefined : (p) => (setPos(p), sendLoc())}
-          />
-
-          <div className="sheet">
-            {!onRide && (
-              <div className="card">
-                <div className="row between">
-                  <span className="status" data-testid="driver-status" data-status={status}>{STATUS_TEXT[status]}</span>
-                  <button className={wantOnline ? "" : "primary"} onClick={toggleOnline} data-testid="online-toggle" data-online={wantOnline}>
+            <Sheet expandKey={ride && onRide ? `${ride.id}:${ride.status}` : `idle:${status}`}>
+              {!onRide && (
+                <div className="card">
+                  <div className="row between" style={{ gap: 12 }}>
+                    <div>
+                      <span className="status" data-testid="driver-status" data-status={status}>{STATUS_TEXT[status]}</span>
+                      <p className="muted">{session.user.name}</p>
+                    </div>
+                    <span className={`dot ${online ? "dot-open" : ""}`} style={{ width: 12, height: 12, background: online ? undefined : "#8e8e93" }} />
+                  </div>
+                  <button className={`big ${wantOnline ? "danger" : "primary"}`} onClick={toggleOnline} data-testid="online-toggle" data-online={wantOnline}>
                     {wantOnline ? "Go offline" : "Go online"}
                   </button>
+                  <Section foot="Atau klik peta / geser 🛵 untuk pindah posisi.">
+                    <label className="cell inset">
+                      <span className="ic blue"><Icon name="pin" /></span>
+                      <span>Pindah ke dekat</span>
+                      <select
+                        data-testid="spawn"
+                        value=""
+                        onChange={(e) => {
+                          const t = PRESET_TRIPS.find((p) => p.id === e.target.value);
+                          if (t) (setPos(nearPickup(t)), sendLoc());
+                        }}
+                      >
+                        <option value="">Pilih…</option>
+                        {PRESET_TRIPS.map((t) => <option key={t.id} value={t.id}>{t.pickup.label}</option>)}
+                      </select>
+                      <span className="chev"><Icon name="chevron" size={14} /></span>
+                    </label>
+                    <div className="cell inset">
+                      <span className="ic gray"><Icon name="bolt" /></span>
+                      <span className="grow">Koordinat</span>
+                      <span className="value tnum small">{pos.lat.toFixed(5)}, {pos.lng.toFixed(5)}</span>
+                    </div>
+                  </Section>
+                  {lastPaid && ride?.status === "COMPLETED" && (
+                    <div className="group">
+                      <div className="cell" data-testid="last-paid">
+                        <span className="ic green">✓</span>
+                        <div className="grow">
+                          <div>Ride terakhir {fmtRp(lastPaid.fare)} ({lastPaid.paidVia === "WALLET" ? "wallet" : "tunai"})</div>
+                          <div className="sub">Saldo <b className={lastPaid.balance < 0 ? "neg" : ""}>{fmtRp(lastPaid.balance)}</b></div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
-                <label>
-                  Pindah ke
-                  <select
-                    data-testid="spawn"
-                    value=""
-                    onChange={(e) => {
-                      const t = PRESET_TRIPS.find((p) => p.id === e.target.value);
-                      if (t) (setPos(nearPickup(t)), sendLoc());
-                    }}
-                  >
-                    <option value="">Dekat… (atau klik / geser 🛵 di peta)</option>
-                    {PRESET_TRIPS.map((t) => <option key={t.id} value={t.id}>{t.pickup.label}</option>)}
-                  </select>
-                </label>
-                <p className="muted">{session.user.name} · {pos.lat.toFixed(5)}, {pos.lng.toFixed(5)}</p>
-                {lastPaid && ride?.status === "COMPLETED" && (
-                  <p data-testid="last-paid">
-                    Ride terakhir: {fmtRp(lastPaid.fare)} ({lastPaid.paidVia === "WALLET" ? "wallet" : "tunai"}) · saldo{" "}
-                    <b className={lastPaid.balance < 0 ? "neg" : ""}>{fmtRp(lastPaid.balance)}</b>
-                  </p>
-                )}
-              </div>
-            )}
+              )}
 
-            {onRide && ride && (
-              <div className="card" data-testid="ride-card">
-                <div className="row between">
-                  <span className="status" data-testid="driver-ride-status" data-status={ride.status}>
-                    {ride.status === "ACCEPTED" ? "Menuju jemput" : ride.status === "ARRIVED" ? "Menunggu customer" : "Antar ke tujuan"}
-                  </span>
-                  <span className="pill">{fmtRp(ride.fare)} · {ride.paymentMethod === "CASH" ? "Tunai" : "Wallet"}</span>
+              {onRide && ride && (
+                <div className="card" data-testid="ride-card">
+                  <div className="row between" style={{ gap: 12 }}>
+                    <div>
+                      <span className="status" data-testid="driver-ride-status" data-status={ride.status}>
+                        {ride.status === "ACCEPTED" ? "Menuju jemput" : ride.status === "ARRIVED" ? "Menunggu customer" : "Antar ke tujuan"}
+                      </span>
+                      {remaining !== null && (
+                        <p className="muted" data-testid="nav" data-remaining={Math.round(remaining)} data-at-target={atTarget}>
+                          {atTarget ? "✅ Sudah sampai" : `Sisa ${fmtKm(remaining)}${path.length > 1 ? " via jalan" : ""}`}
+                        </p>
+                      )}
+                    </div>
+                    <span className="pill tnum">{fmtRp(ride.fare)} · {ride.paymentMethod === "CASH" ? "Tunai" : "Wallet"}</span>
+                  </div>
+                  <div className="group">
+                    <div className="cell inset">
+                      <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin pick" /></span>
+                      <span className="grow">{ride.pickup.label}</span>
+                    </div>
+                    <div className="cell inset">
+                      <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin drop" /></span>
+                      <span className="grow">{ride.dropoff.label}</span>
+                    </div>
+                  </div>
+                  <div className="group">
+                    <label className="cell inset">
+                      <span className="ic indigo"><Icon name="car" /></span>
+                      <span className="grow" style={{ color: "var(--text)", fontSize: 17 }}>Autopilot</span>
+                      <input type="checkbox" className="switch" role="switch" checked={autopilot} onChange={(e) => setAutopilot(e.target.checked)} data-testid="autopilot" />
+                    </label>
+                    <div className="cell inset">
+                      <span className="ic orange"><Icon name="bolt" /></span>
+                      <input type="range" min={5} max={150} value={speed} onChange={(e) => setSpeed(Number(e.target.value))} data-testid="speed" aria-label="Kecepatan" />
+                      <span className="value tnum small" style={{ width: 56, textAlign: "right" }}>{speed} m/s</span>
+                    </div>
+                  </div>
+                  {ride.status === "ACCEPTED" && (
+                    <button className="primary big" onClick={() => rideAction("ride.arrived")} data-testid="ride-arrived">Sudah tiba</button>
+                  )}
+                  {ride.status === "ARRIVED" && (
+                    <button className="primary big" onClick={() => rideAction("ride.start")} data-testid="ride-start">Mulai perjalanan</button>
+                  )}
+                  {ride.status === "ON_TRIP" && (
+                    <button className="primary big" onClick={() => rideAction("ride.complete")} data-testid="ride-complete">Selesaikan</button>
+                  )}
+                  {(ride.status === "ACCEPTED" || ride.status === "ARRIVED") && (
+                    <button
+                      className="danger big"
+                      data-testid="ride-cancel"
+                      onClick={async () => {
+                        const reason = prompt("Alasan batal?", "Kendaraan bermasalah");
+                        if (!reason) return;
+                        try {
+                          // the ride is not ours anymore: it goes back to the search for another driver
+                          await api.cancel(ride.id, reason);
+                          setRide(null);
+                          flash("Ride dilepas, dicarikan driver lain");
+                        } catch (e) {
+                          flash((e as Error).message);
+                        }
+                      }}
+                    >
+                      Batalkan (dengan alasan)
+                    </button>
+                  )}
                 </div>
-                <p className="muted">{ride.pickup.label} → {ride.dropoff.label}</p>
-                {remaining !== null && (
-                  <p data-testid="nav" data-remaining={Math.round(remaining)} data-at-target={atTarget}>
-                    {atTarget ? "✅ Sudah sampai" : `Sisa ${fmtKm(remaining)}${path.length > 1 ? " via jalan" : ""}`}
-                  </p>
-                )}
-                <div className="row gap">
-                  <label className="row gap" style={{ color: "inherit" }}>
-                    <input type="checkbox" checked={autopilot} onChange={(e) => setAutopilot(e.target.checked)} data-testid="autopilot" />
-                    Autopilot
-                  </label>
-                  <input type="range" min={5} max={150} value={speed} onChange={(e) => setSpeed(Number(e.target.value))} data-testid="speed" />
-                  <span className="muted">{speed} m/s</span>
+              )}
+            </Sheet>
+
+            {offer && (
+              <div className="offer">
+                <div className="card" data-testid="offer" data-ride-id={offer.rideId}>
+                  <div className="row between">
+                    <h3 className="title2">Order baru</h3>
+                    <span className="pill tnum" data-testid="offer-countdown">{Math.max(0, Math.ceil((offer.expiresAt - now) / 1000))} dtk</span>
+                  </div>
+                  <div className="countdown">
+                    <div style={{ width: `${Math.max(0, Math.min(100, ((offer.expiresAt - now) / 15_000) * 100))}%` }} />
+                  </div>
+                  <div className="group">
+                    <div className="cell inset">
+                      <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin pick" /></span>
+                      <div className="grow">
+                        <div>{offer.pickup.label}</div>
+                        <div className="sub">{fmtKm(haversineM(pos, offer.pickup))} dari kamu</div>
+                      </div>
+                    </div>
+                    <div className="cell inset">
+                      <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin drop" /></span>
+                      <div className="grow">
+                        <div>{offer.dropoff.label}</div>
+                        <div className="sub">Perjalanan {fmtKm(offer.distanceM)}</div>
+                      </div>
+                    </div>
+                    <div className="cell inset">
+                      <span className="ic green"><Icon name="wallet" /></span>
+                      <span className="grow">{offer.paymentMethod === "CASH" ? "Tunai" : "Wallet"}</span>
+                      <strong className="title3 tnum">{fmtRp(offer.fare)}</strong>
+                    </div>
+                  </div>
+                  <div className="grid2">
+                    <button className="big" data-testid="offer-reject" onClick={() => (sockRef.current?.send({ t: "offer.reject", rideId: offer.rideId }), setOffer(null))}>
+                      Tolak
+                    </button>
+                    <button className="primary big" data-testid="offer-accept" onClick={() => sockRef.current?.send({ t: "offer.accept", rideId: offer.rideId })}>
+                      Terima
+                    </button>
+                  </div>
                 </div>
-                {ride.status === "ACCEPTED" && (
-                  <button className="primary big" onClick={() => rideAction("ride.arrived")} data-testid="ride-arrived">Sudah tiba</button>
-                )}
-                {ride.status === "ARRIVED" && (
-                  <button className="primary big" onClick={() => rideAction("ride.start")} data-testid="ride-start">Mulai perjalanan</button>
-                )}
-                {ride.status === "ON_TRIP" && (
-                  <button className="primary big" onClick={() => rideAction("ride.complete")} data-testid="ride-complete">Selesaikan</button>
-                )}
-                {(ride.status === "ACCEPTED" || ride.status === "ARRIVED") && (
-                  <button
-                    className="danger"
-                    data-testid="ride-cancel"
-                    onClick={async () => {
-                      const reason = prompt("Alasan batal?", "Kendaraan bermasalah");
-                      if (!reason) return;
-                      try {
-                        // the ride is not ours anymore: it goes back to the search for another driver
-                        await api.cancel(ride.id, reason);
-                        setRide(null);
-                        flash("Ride dilepas, dicarikan driver lain");
-                      } catch (e) {
-                        flash((e as Error).message);
-                      }
-                    }}
-                  >
-                    Batalkan (dengan alasan)
-                  </button>
-                )}
               </div>
             )}
           </div>
+        )}
 
-          {offer && (
-            <div className="offer">
-              <div className="card" data-testid="offer" data-ride-id={offer.rideId}>
-                <h3>Order baru!</h3>
-                <div className="countdown">
-                  <div style={{ width: `${Math.max(0, Math.min(100, ((offer.expiresAt - now) / 15_000) * 100))}%` }} />
-                </div>
-                <p className="muted" data-testid="offer-countdown">{Math.max(0, Math.ceil((offer.expiresAt - now) / 1000))} detik</p>
-                <div className="row between">
-                  <span>📍 {offer.pickup.label}</span>
-                  <span className="muted">{fmtKm(haversineM(pos, offer.pickup))} dari kamu</span>
-                </div>
-                <div>🏁 {offer.dropoff.label} <span className="muted">({fmtKm(offer.distanceM)})</span></div>
-                <div className="row between">
-                  <strong>{fmtRp(offer.fare)}</strong>
-                  <span className="pill">{offer.paymentMethod === "CASH" ? "Tunai" : "Wallet"}</span>
-                </div>
-                <div className="grid2">
-                  <button data-testid="offer-reject" onClick={() => (sockRef.current?.send({ t: "offer.reject", rideId: offer.rideId }), setOffer(null))}>
-                    Tolak
-                  </button>
-                  <button className="primary" data-testid="offer-accept" onClick={() => sockRef.current?.send({ t: "offer.accept", rideId: offer.rideId })}>
-                    Terima
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {tab === "earnings" && <Earnings api={api} refreshKey={lastPaid} />}
-      {tab === "wallet" && <div className="page"><WalletPanel api={api} refreshKey={lastPaid} /></div>}
+        {tab === "earnings" && <Earnings api={api} refreshKey={lastPaid} />}
+        {tab === "wallet" && <Page title="Wallet"><WalletPanel api={api} refreshKey={lastPaid} /></Page>}
+        {tab === "account" && <AccountPage user={session.user} role="driver" api={api} onLogout={onLogout} />}
+        <TabBar tabs={TABS} value={tab} onChange={setTab} />
+      </div>
       <Toast text={toast} />
-    </div>
+    </Phone>
   );
 }
+
+const HIST_STATUS: Record<string, string> = { COMPLETED: "Selesai", CANCELLED: "Dibatalkan", NO_DRIVER: "Tidak ada driver" };
 
 function Earnings({ api, refreshKey }: { api: ApiClient; refreshKey: unknown }) {
   const [data, setData] = useState<Awaited<ReturnType<ApiClient["rides"]>> | null>(null);
@@ -402,30 +453,29 @@ function Earnings({ api, refreshKey }: { api: ApiClient; refreshKey: unknown }) 
     api.rides().then(setData).catch(() => {});
   }, [api, refreshKey]);
   return (
-    <div className="page">
-      <div className="card">
-        <h3>Hari ini</h3>
+    <Page title="Pendapatan">
+      <section className="section">
+        <div className="section-head">Hari ini</div>
         <div className="grid2">
-          <div><div className="muted">Ride</div><b data-testid="today-count">{data?.today?.count ?? 0}</b></div>
-          <div><div className="muted">Pendapatan bersih</div><b>{fmtRp(data?.today?.net ?? 0)}</b></div>
+          <div className="stat"><span className="muted small">Ride</span><b className="tnum" data-testid="today-count">{data?.today?.count ?? 0}</b></div>
+          <div className="stat"><span className="muted small">Bersih</span><b className="tnum">{fmtRp(data?.today?.net ?? 0)}</b></div>
         </div>
-      </div>
-      <div className="card">
-        <h3>Riwayat</h3>
+      </section>
+      <Section head="Riwayat">
         <ul className="list">
-          {data?.rides.length === 0 && <li className="muted">Belum ada ride</li>}
+          {data?.rides.length === 0 && <li className="cell muted">Belum ada ride</li>}
           {data?.rides.map((r) => (
-            <li key={r.id} className="row between">
-              <span>
-                {r.pickup.label} → {r.dropoff.label}
-                <br />
-                <small className="muted">{fmtTime(r.requestedAt)} · {r.status}{r.rating ? ` · ${"★".repeat(r.rating)}` : ""}</small>
-              </span>
-              <span>{fmtRp(r.fareFinal ?? r.fare)}</span>
+            <li key={r.id} className="cell inset">
+              <span className={`ic ${r.status === "COMPLETED" ? "orange" : "gray"}`}><Icon name="wheel" /></span>
+              <div className="grow">
+                <div>{r.pickup.label} → {r.dropoff.label}</div>
+                <div className="sub">{fmtTime(r.requestedAt)} · {HIST_STATUS[r.status] ?? r.status}{r.rating ? ` · ${"★".repeat(r.rating)}` : ""}</div>
+              </div>
+              <span className="tnum">{fmtRp(r.fareFinal ?? r.fare)}</span>
             </li>
           ))}
         </ul>
-      </div>
-    </div>
+      </Section>
+    </Page>
   );
 }

@@ -58,7 +58,7 @@ export function MapView({ center, zoom = 14, markers, route, onClick, fitKey, fi
         type: "line",
         source: "route",
         layout: { "line-join": "round", "line-cap": "round" },
-        paint: { "line-color": "#0f766e", "line-width": 4 },
+        paint: { "line-color": "#007aff", "line-width": 5 },
       });
     });
     map.current = m;

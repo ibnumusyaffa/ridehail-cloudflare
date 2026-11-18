@@ -90,6 +90,7 @@ test("wallet order refused when balance is too low", async ({ browser }) => {
 test("reset button wipes everything and logs the other window out", async ({ browser }) => {
   const { customer, driver } = await pair(browser);
   await driverOnlineNear(driver, "monas-hi");
+  await customer.getByTestId("tab-account").click();
   customer.once("dialog", (d) => d.accept());
   await customer.getByTestId("reset-sim").click();
   // both apps land on the login screen with clean local state
