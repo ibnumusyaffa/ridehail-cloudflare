@@ -118,7 +118,8 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
           case "hello":
             s.send({ t: "loc", lat: posRef.current.lat, lng: posRef.current.lng });
             if (m.driverStatus === "ON_RIDE" || m.driverStatus === "RESERVED") s.send({ t: "resume", rideId: m.rideId ?? undefined });
-            else if (wantRef.current) s.send({ t: "online" });
+            // a zone hand-over brings the driver over AVAILABLE: only an OFFLINE driver has to go online again
+            else if (wantRef.current && m.driverStatus !== "AVAILABLE") s.send({ t: "online" });
             if (m.driverStatus) setStatus(m.driverStatus);
             break;
           case "driver.state":

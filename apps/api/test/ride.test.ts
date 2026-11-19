@@ -277,6 +277,29 @@ describe("ride flow", () => {
     d.ws.close();
   });
 
+  it("a driver crossing into another zone arrives there AVAILABLE, without going online again", async () => {
+    const base = spot();
+    const b = geohashBounds(geohashEncode(base.lat, base.lng, 5));
+    const lng = (b.lngMin + b.lngMax) / 2;
+    const inside = { lat: b.latMax - 0.002, lng };
+    const across = { lat: b.latMax + 0.0002, lng };
+    const newZone = geohashEncode(across.lat, across.lng, 5);
+    const d = await onlineDriver(inside.lat, inside.lng);
+    for (let i = 0; i < 3; i++) d.ws.send({ t: "loc", ...across });
+    expect((await d.ws.next("reconnect")).route).toBe(matchRoute(newZone));
+    // the client follows; no `online` is sent in the new zone
+    expect(await d.ws.next("hello")).toMatchObject({ route: matchRoute(newZone), driverStatus: "AVAILABLE" });
+    // like the app: a position on every hello (this client reconnects with its first lat/lng in the URL)
+    d.ws.send({ t: "loc", ...across });
+
+    // and is offered a ride there straight away
+    const c = await customer();
+    const { json } = await requestRide(c.token, off(across, 0.001));
+    expect((await d.ws.next("offer")).rideId).toBe(json.rideId);
+    expect(d.ws.inbox.some((m) => m.t === "driver.state" && m.status === "OFFLINE")).toBe(false);
+    d.ws.close();
+  });
+
   it("a route skips the active-ride lookup; one the server can't read falls back to it", async () => {
     const c = await customer();
     const p = spot();

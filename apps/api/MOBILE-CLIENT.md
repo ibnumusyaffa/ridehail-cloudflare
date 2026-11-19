@@ -464,9 +464,11 @@ Login ─► GET /me ─► buka WS (?lat&lng) ─► hello ─► loc ─► on
    - Kirim `loc` posisi sekarang dulu.
    - `driverStatus` `ON_RIDE` atau `RESERVED` → kirim `{"t":"resume","rideId": hello.rideId}`
      (server membalas `driver.state`, `offer` yang masih berlaku, atau `ride.status`).
-   - Selain itu, kalau driver memang ingin online → kirim `online`.
-   - Server **lupa** status online kalau driver lama tidak terhubung; simpan niat online di client dan kirim
-     ulang `online` setiap `hello`.
+   - `driverStatus` `OFFLINE` dan driver memang ingin online → kirim `online`.
+   - `driverStatus` `AVAILABLE` → tidak perlu kirim apa-apa (mis. setelah server memindahkan driver ke zona
+     lain, status online ikut pindah).
+   - Server bisa **lupa** status online kalau driver lama tidak terhubung (hello datang `OFFLINE`); karena itu
+     simpan niat online di client.
 3. **Online**: kirim `online` (harus sudah pernah `loc`, kalau tidak `BAD_REQUEST "send a loc first"`).
    Balasan `driver.state` `AVAILABLE`. Saldo di bawah minimum → `error DRIVER_BALANCE_TOO_LOW` → arahkan top-up.
 4. **Kirim lokasi** (`loc`) terus selama socket terbuka, termasuk saat offline:
@@ -560,7 +562,7 @@ CONNECT /ws?token=…&rideId=qqguw_9c1…
 - [ ] Tombol aksi driver: disable setelah ditekan, aktif lagi setelah `ride.status` atau `error`.
 - [ ] Driver: kirim `loc` di background (foreground service Android / background location iOS);
       kalau berhenti > 45 s driver tidak dapat order, kalau > 60 menit saat trip customer diberi dialog driver hilang.
-- [ ] Driver: simpan niat "online" lokal, kirim `online` lagi setiap `hello`.
+- [ ] Driver: simpan niat "online" lokal; kirim `online` setelah `hello` yang `driverStatus`-nya `OFFLINE`.
 - [ ] Countdown tawaran pakai `expiresAt` dikurangi selisih jam server (jam HP bisa meleset; selisih dapat
       dihitung dari `ride.status.at` vs `Date.now()`).
 - [ ] Customer: buka socket hanya saat ada ride aktif; tutup setelah status final + `ride.paid`.

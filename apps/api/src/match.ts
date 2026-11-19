@@ -9,7 +9,7 @@ import {
   shouldHandOff,
 } from "@gojek/core";
 import { type DriverRow, type PingDriver, PURGE_EVERY_MS, type SocketMeta, ZoneActor } from "./actor";
-import { homeOfRide, matchRoute, rideRoute, rideStub } from "./config";
+import { homeOfRide, matchRoute, matchStub, rideRoute, rideStub } from "./config";
 import * as db from "./db";
 import { type ClientMsg, type DriverInfo, fail, type OfferPayload, type Result, type RideView } from "./protocol";
 import type { RideApi } from "./ride";
@@ -46,6 +46,8 @@ export interface MatchApi {
 export class MatchDO extends ZoneActor implements MatchApi {
   /** drivers just handed to a ride's actor (memory only): driverId → rideId, until */
   private moved = new Map<string, { rideId: string; until: number }>();
+  /** drivers being handed to another zone right now (their `reconnect` is about to go out) */
+  private handingOff = new Set<string>();
   /** free drivers only (OFFLINE / AVAILABLE / RESERVED): the idle ping interval */
   protected readonly ridePings = false;
 
@@ -60,6 +62,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
   override async reset(): Promise<void> {
     await super.reset();
     this.moved.clear();
+    this.handingOff.clear();
   }
 
   /** The ride actor of `home` (see `rideHome`: a zone, or one of its shards). */
@@ -84,8 +87,10 @@ export class MatchDO extends ZoneActor implements MatchApi {
   /**
    * An AVAILABLE driver outside this zone is handed to the zone it is in now — once clearly inside
    * it, or after several pings outside (hysteresis: GPS jitter on a border must not loop reconnects).
+   * The new zone gets the driver AVAILABLE before the client is told to move, so they arrive online
+   * (no `online` to resend, no balance check again); if that call fails they arrive OFFLINE there.
    */
-  private maybeHandOff(d: PingDriver): boolean {
+  private async maybeHandOff(d: PingDriver): Promise<boolean> {
     if (d.status !== "AVAILABLE" || d.lat === null || d.lng === null || !this.zone) return false;
     const z = this.zoneOf(d.lat, d.lng);
     const p = this.pos.get(d.id);
@@ -96,7 +101,21 @@ export class MatchDO extends ZoneActor implements MatchApi {
     const outside = (p?.outside ?? 0) + 1;
     if (p) p.outside = outside;
     if (!shouldHandOff({ lat: d.lat, lng: d.lng }, z, outside, this.cfg.presence)) return false;
+    const full = this.loadDriver(d.id);
+    // removed first: from here on this zone can't reserve them (the new one can't either until they connect)
     this.removeDriver(d.id);
+    this.handingOff.add(d.id);
+    try {
+      if (full)
+        await (matchStub(this.env, z) as unknown as MatchApi).returnDriver(
+          { id: full.id, name: full.name, vehicle: full.vehicle, lat: full.lat, lng: full.lng, heading: full.heading },
+          "AVAILABLE",
+        );
+    } catch (e) {
+      console.error("zone hand-over: new zone unreachable, driver arrives OFFLINE", d.id, z, e);
+    } finally {
+      this.handingOff.delete(d.id);
+    }
     this.moveSockets(d.id, matchRoute(z), true);
     return true;
   }
@@ -183,7 +202,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
     this.setDriverFree(d);
     this.saveDriver(d);
     this.send(driverId, { t: "offer.cancelled", rideId, reason });
-    this.maybeHandOff(d);
+    await this.maybeHandOff(d);
   }
 
   /**
@@ -248,7 +267,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
       const p = this.loadDriverPing(meta.userId);
       if (!p) return this.handleMoved(ws, meta, msg);
       const moved = this.takePing(p, msg);
-      if (moved) this.maybeHandOff(moved);
+      if (moved) await this.maybeHandOff(moved);
       return;
     }
 
@@ -277,7 +296,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
         fresh.updatedAt = Date.now();
         this.saveDriver(fresh);
         this.sendDriverState(fresh);
-        this.maybeHandOff(fresh);
+        await this.maybeHandOff(fresh);
         return;
       }
       case "offline": {
@@ -350,7 +369,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
         this.saveDriver(d);
         this.sendDriverState(d);
         await this.stub(homeOfRide(msg.rideId)!).offerRejected(msg.rideId, d.id);
-        this.maybeHandOff(this.loadDriver(d.id) ?? d);
+        await this.maybeHandOff(this.loadDriver(d.id) ?? d);
         return;
       }
       default:
@@ -364,6 +383,8 @@ export class MatchDO extends ZoneActor implements MatchApi {
    * zone): ask it to reconnect without a route (the gateway places it by its active ride or location).
    */
   private async handleMoved(ws: WebSocket, meta: SocketMeta, msg: ClientMsg) {
+    // mid hand-over to another zone: its `reconnect` is on the way; a ping now would only race it
+    if (msg.t === "loc" && this.handingOff.has(meta.userId)) return;
     const m = this.moved.get(meta.userId);
     const rideHome = m && m.until > Date.now() ? homeOfRide(m.rideId) : null;
     if (!m || !rideHome) {
