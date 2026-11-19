@@ -26,6 +26,8 @@ export interface Config {
   driverLostCancelMs: number;
   /** ON_TRIP route points buffered in the zone actor are sent to Postgres this often */
   trackFlushMs: number;
+  /** how close (m) a driver must be to the pickup to arrive / to the dropoff to complete; 0 = no check */
+  atPlace: { arriveM: number; completeM: number };
   /** which ON_TRIP pings are kept as the trip's route (see `sampleTrack`) */
   track: TrackConfig;
   /** ride actors per zone (see `rideHome`) */
@@ -53,6 +55,7 @@ export function loadConfig(env: Env): Config {
     driverLostAskMs: e.DRIVER_LOST_ASK_MS,
     driverLostCancelMs: e.DRIVER_LOST_CANCEL_MS,
     trackFlushMs: e.TRACK_FLUSH_MS,
+    atPlace: { arriveM: e.ARRIVE_MAX_DISTANCE_M, completeM: e.COMPLETE_MAX_DISTANCE_M },
     track: { minGapM: e.TRACK_MIN_GAP_M, maxGapMs: e.TRACK_MAX_GAP_MS, toleranceM: e.TRACK_TOLERANCE_M },
     rideShards: parseRideShards(e.RIDE_SHARDS),
     fare: DEFAULT_FARE_CONFIG,

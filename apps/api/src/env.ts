@@ -46,6 +46,10 @@ function parse(runtimeEnv: Env) {
       LOC_MIN_INTERVAL_ON_RIDE_MS: nonNeg(DEFAULT_PRESENCE_CONFIG.locMinIntervalOnRideMs),
       LOC_MIN_MOVE_M: nonNeg(DEFAULT_PRESENCE_CONFIG.locMinMoveM),
       HANDOFF_MARGIN_M: nonNeg(DEFAULT_PRESENCE_CONFIG.handoffMarginM),
+      /** a driver can mark "arrived" only this close to the pickup (metres, straight line); 0 = no check */
+      ARRIVE_MAX_DISTANCE_M: nonNeg(200),
+      /** a driver can complete a trip only this close to the dropoff (metres, straight line); 0 = no check */
+      COMPLETE_MAX_DISTANCE_M: nonNeg(300),
       HANDOFF_PINGS: z.coerce.number().int().min(1).default(DEFAULT_PRESENCE_CONFIG.handoffPings),
     },
     runtimeEnv: runtimeEnv as unknown as Record<string, string | undefined>,

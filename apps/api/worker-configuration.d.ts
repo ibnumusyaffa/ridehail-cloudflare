@@ -28,6 +28,8 @@ interface __BaseEnv_Env {
 	LOC_MIN_MOVE_M: "30";
 	HANDOFF_MARGIN_M: "100";
 	HANDOFF_PINGS: "3";
+	ARRIVE_MAX_DISTANCE_M: "200";
+	COMPLETE_MAX_DISTANCE_M: "300";
 	JWT_SECRET: string;
 	DEV_RESET: string;
 	MATCH: DurableObjectNamespace<import("./src/index").MatchDO>;
@@ -45,7 +47,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "CORS_ORIGINS" | "DO_LOCATION_HINT" | "ZONE_PRECISION" | "RIDE_SHARDS" | "COMMISSION_RATE" | "DRIVER_MIN_BALANCE" | "OFFER_TIMEOUT_MS" | "RESERVE_TTL_MS" | "SEARCH_TIMEOUT_MS" | "RESEARCH_DELAY_MS" | "TOPUP_MAX" | "MAX_REQUEUES" | "DRIVER_LOST_ASK_MS" | "DRIVER_LOST_CANCEL_MS" | "TRACK_FLUSH_MS" | "TRACK_MIN_GAP_M" | "TRACK_MAX_GAP_MS" | "TRACK_TOLERANCE_M" | "LOC_MIN_INTERVAL_MS" | "LOC_MIN_INTERVAL_ON_RIDE_MS" | "LOC_MIN_MOVE_M" | "HANDOFF_MARGIN_M" | "HANDOFF_PINGS" | "JWT_SECRET" | "DEV_RESET">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "CORS_ORIGINS" | "DO_LOCATION_HINT" | "ZONE_PRECISION" | "RIDE_SHARDS" | "COMMISSION_RATE" | "DRIVER_MIN_BALANCE" | "OFFER_TIMEOUT_MS" | "RESERVE_TTL_MS" | "SEARCH_TIMEOUT_MS" | "RESEARCH_DELAY_MS" | "TOPUP_MAX" | "MAX_REQUEUES" | "DRIVER_LOST_ASK_MS" | "DRIVER_LOST_CANCEL_MS" | "TRACK_FLUSH_MS" | "TRACK_MIN_GAP_M" | "TRACK_MAX_GAP_MS" | "TRACK_TOLERANCE_M" | "LOC_MIN_INTERVAL_MS" | "LOC_MIN_INTERVAL_ON_RIDE_MS" | "LOC_MIN_MOVE_M" | "HANDOFF_MARGIN_M" | "HANDOFF_PINGS" | "ARRIVE_MAX_DISTANCE_M" | "COMPLETE_MAX_DISTANCE_M" | "JWT_SECRET" | "DEV_RESET">> {}
 }
 declare module "*.txt" {
 	const value: string;

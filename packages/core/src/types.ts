@@ -35,6 +35,7 @@ export type ErrorCode =
   | "INSUFFICIENT_BALANCE"
   | "DRIVER_BALANCE_TOO_LOW"
   | "BAD_REQUEST"
+  | "TOO_FAR"
   | "ACTIVE_RIDE_EXISTS"
   | "RATE_LIMITED"
   | "UNAVAILABLE";

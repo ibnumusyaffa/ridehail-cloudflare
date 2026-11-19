@@ -5,6 +5,7 @@ import {
   type DriverStatus,
   endTrack,
   estimate,
+  haversineM,
   type PaymentMethod,
   type Place,
   type RideEvent,
@@ -1055,6 +1056,9 @@ export class RideDO extends ZoneActor implements RideApi {
     const r = await this.ready(rideId);
     if (!r.ok) throw new DomainError(r.code, r.message);
     if (r.ride.driverId !== driverId) throw new DomainError("FORBIDDEN");
+    // only the step that changes the status: a repeated "complete" stays an idempotent no-op wherever the driver is
+    if (type === "ARRIVE" && r.ride.status === "ACCEPTED") this.requireAt(driverId, r.ride.pickup, this.cfg.atPlace.arriveM, "pickup");
+    if (type === "COMPLETE" && r.ride.status === "ON_TRIP") this.requireAt(driverId, r.ride.dropoff, this.cfg.atPlace.completeM, "dropoff");
     const res = await this.commit(rideId, { type }, (n) => {
       const now = Date.now();
       if (type === "ARRIVE") n.arrivedAt = now;
@@ -1067,6 +1071,19 @@ export class RideDO extends ZoneActor implements RideApi {
     if (!res.ok) throw new DomainError(res.code, res.message);
     // duplicate "complete": idempotent no-op — except it re-drives an unfinished settlement
     if (!res.changed && type === "COMPLETE" && res.ride.paidAt === null) await this.settleFromTimer(rideId);
+  }
+
+  /**
+   * The driver's last known position (live ping, else the ≤ 30 s old snapshot) must be within `maxM` of
+   * `place`: no "arrived" from across town, no paid trip from a driver who never moved. 0 = no check.
+   */
+  private requireAt(driverId: string, place: Place, maxM: number, what: "pickup" | "dropoff") {
+    if (maxM <= 0) return;
+    const d = this.loadDriver(driverId);
+    if (!d || d.lat === null || d.lng === null)
+      throw new DomainError("TOO_FAR", `no recent location: send a loc, then try again at the ${what}`);
+    const m = Math.round(haversineM({ lat: d.lat, lng: d.lng }, place));
+    if (m > maxM) throw new DomainError("TOO_FAR", `${m} m from the ${what} (must be within ${maxM} m)`);
   }
 
   /**

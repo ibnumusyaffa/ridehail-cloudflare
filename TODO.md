@@ -46,10 +46,11 @@ Kerjakan berurutan; nomor kecil sering jadi prasyarat nomor besar.
   - Dites: `test/dispatch.test.ts`. Test lama memakai `SEARCH_TIMEOUT_MS=3000`.
   - `rearmTimers` juga memasang ulang `offer:` (di `offer.expiresAt`) dan `search:` (di `searchDeadline`): baris timer dihapus sebelum handler jalan, jadi DO yang mati di tengah handler (deploy) dulu meninggalkan ride `OFFERING` tanpa timer — `dispatch:` melewati ride dengan tawaran berdiri, customer menunggu selamanya. Dites: `test/dispatch.test.ts` ("actor restarts after its offer / search timers were consumed").
 
-- [ ] **A5. Cek lokasi untuk Tiba dan Selesai**
-  - `ARRIVE` hanya jika driver dekat titik jemput; `COMPLETE` hanya jika dekat tujuan. Jarak batas masuk config.
-  - Pakai posisi terakhir di memori (`pos`). `pos` bisa kosong setelah DO restart atau pindah zona: jatuh ke `lat/lng` di `DriverRow` (snapshot ≤30 detik), dan kalau tetap tidak ada, tolak dengan error yang jelas.
-  - Selesai jika: Tiba dari 2 km ditolak dengan error yang jelas.
+- [x] **A5. Cek lokasi untuk Tiba dan Selesai**
+  - `ARRIVE` hanya dalam `ARRIVE_MAX_DISTANCE_M` (200 m) dari titik jemput; `COMPLETE` hanya dalam `COMPLETE_MAX_DISTANCE_M` (300 m) dari tujuan. Jarak lurus; 0 = cek mati. Selain itu → error `TOO_FAR` dengan jaraknya ("330 m from the pickup (must be within 200 m)").
+  - Posisi: `loadDriver` (ping terakhir di memori, jatuh ke snapshot `DriverRow`). Tidak ada posisi sama sekali → `TOO_FAR` "no recent location".
+  - Cek hanya pada langkah yang mengubah status (`ACCEPTED → ARRIVED`, `ON_TRIP → COMPLETED`): `complete` yang diulang tetap no-op idempotent dari mana pun.
+  - Dites: `test/at-place.test.ts`. Test lain mematikan cek di `vitest.config.ts`; e2e jalan dengan batas produksi.
 
 - [x] **A6. Driver tidak boleh punya dua ride**
   - Dua zona, Postgres menolak accept karena `one_active_ride_driver` → `DRIVER_BUSY` → `dropOffer` + `dispatch` (bersama A2).

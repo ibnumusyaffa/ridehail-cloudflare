@@ -102,6 +102,9 @@ Driver status: `OFFLINE`, `AVAILABLE`, `RESERVED` (has an open offer), `ON_RIDE`
 - Location pings: the client sends one after moving ≥ 30 m or every 10 s. The server drops pings that arrive
   < 8 s apart (on a ride: < 1 s) **and** moved < 30 m, so an idle driver costs one ping every ~10 s. MatchDO
   drops them in memory before reading SQLite. Drivers silent for > 45 s are left out of searches.
+- **At the right place**: a driver can mark Arrived only within `ARRIVE_MAX_DISTANCE_M` (200 m) of the pickup,
+  and Complete only within `COMPLETE_MAX_DISTANCE_M` (300 m) of the dropoff, using their last known position.
+  Otherwise the action fails with `TOO_FAR` and the distance. A repeated Complete stays an idempotent no-op.
 - **Trip route**: `ON_TRIP` pings are thinned first (`sampleTrack`, `packages/core/src/track.ts`): one point
   every `TRACK_MIN_GAP_M` (200 m) or `TRACK_MAX_GAP_MS` (1 min), plus any point where the stored line would drift
   more than `TRACK_TOLERANCE_M` (25 m) from the driver (turns), plus the final position. Points are kept in
@@ -182,7 +185,7 @@ Full definitions: `packages/client/src/protocol.ts`. Guide for native mobile cli
 `ZONE_PRECISION` (≤ 5), `RIDE_SHARDS`, `COMMISSION_RATE`, `DRIVER_MIN_BALANCE`, `OFFER_TIMEOUT_MS`,
 `RESERVE_TTL_MS`, `SEARCH_TIMEOUT_MS`, `RESEARCH_DELAY_MS`, `TOPUP_MAX`, `DRIVER_LOST_ASK_MS`,
 `DRIVER_LOST_CANCEL_MS`, `TRACK_FLUSH_MS`, `LOC_MIN_INTERVAL_MS`, `LOC_MIN_INTERVAL_ON_RIDE_MS`, `LOC_MIN_MOVE_M`,
-`HANDOFF_MARGIN_M`, `HANDOFF_PINGS`, `TRACK_MIN_GAP_M`, `TRACK_MAX_GAP_MS`, `TRACK_TOLERANCE_M`.
+`HANDOFF_MARGIN_M`, `HANDOFF_PINGS`, `ARRIVE_MAX_DISTANCE_M`, `COMPLETE_MAX_DISTANCE_M`, `TRACK_MIN_GAP_M`, `TRACK_MAX_GAP_MS`, `TRACK_TOLERANCE_M`.
 Secret: `JWT_SECRET`. Fare constants: `packages/core/src/fare.ts`.
 
 ## Tests

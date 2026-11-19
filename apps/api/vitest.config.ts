@@ -27,6 +27,9 @@ export default defineConfig({
           // tests send pings back to back; the throttle itself is unit-tested in @gojek/core
           LOC_MIN_INTERVAL_MS: "0",
           LOC_MIN_INTERVAL_ON_RIDE_MS: "0",
+          // most tests arrive / complete wherever the driver is; at-place.test.ts turns the check on for its own zone
+          ARRIVE_MAX_DISTANCE_M: "0",
+          COMPLETE_MAX_DISTANCE_M: "0",
           // every ON_TRIP ping is stored (track.test.ts turns thinning on for its own zone; it is unit-tested in @gojek/core)
           TRACK_MIN_GAP_M: "0",
           // only shard.test.ts's zone (Surabaya) is sharded: every other test runs on shard 0 (plain `<zone>_` ids)

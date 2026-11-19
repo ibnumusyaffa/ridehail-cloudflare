@@ -70,7 +70,11 @@
     "LOC_MIN_INTERVAL_ON_RIDE_MS": "1000",
     "LOC_MIN_MOVE_M": "30",
     "HANDOFF_MARGIN_M": "100",
-    "HANDOFF_PINGS": "3"
+    "HANDOFF_PINGS": "3",
+    // a driver must be this close (m, straight line) to the pickup to arrive and to the dropoff to complete:
+    // no paid trip from a driver who never moved. Generous enough for GPS drift and a pin across the street.
+    "ARRIVE_MAX_DISTANCE_M": "200",
+    "COMPLETE_MAX_DISTANCE_M": "300"
   }
   // JWT_SECRET: `wrangler secret put JWT_SECRET` (local: .dev.vars)
 }
