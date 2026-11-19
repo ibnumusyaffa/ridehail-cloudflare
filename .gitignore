@@ -8,3 +8,6 @@ videos
 test-results
 playwright-report
 .env*.local
+
+# personal notes (job application), not part of the project
+docs/private/
