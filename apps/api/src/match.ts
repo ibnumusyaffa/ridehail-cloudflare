@@ -13,6 +13,7 @@ import { homeOfRide, rideStub } from "./config";
 import * as db from "./db";
 import { type ClientMsg, type DriverInfo, fail, type OfferPayload, type Result, type RideView } from "./protocol";
 import type { RideApi } from "./ride";
+import { MATCH_MIGRATIONS } from "./schema";
 
 const KEEP_IDLE_DRIVER_MS = 60 * 60_000;
 /** how long a driver handed to a ride's actor is remembered here (to forward messages still in flight) */
@@ -48,8 +49,8 @@ export class MatchDO extends ZoneActor implements MatchApi {
   /** free drivers only (OFFLINE / AVAILABLE / RESERVED): the idle ping interval */
   protected readonly ridePings = false;
 
-  protected initTables() {
-    // drivers, timers and meta are shared (ZoneActor.initSchema)
+  protected migrations() {
+    return MATCH_MIGRATIONS;
   }
 
   protected async onTimer(kind: string) {

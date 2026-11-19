@@ -20,6 +20,7 @@ import { homeOfRide, matchStub, zoneOfKey } from "./config";
 import * as db from "./db";
 import type { MatchApi } from "./match";
 import { type ClientMsg, type DriverInfo, fail, type OfferPayload, type Result, type RideView, type ServerMsg } from "./protocol";
+import { RIDE_MIGRATIONS } from "./schema";
 
 /** Hot ride state: the client view plus dispatch internals. */
 interface HotRide extends RideView {
@@ -167,22 +168,8 @@ export class RideDO extends ZoneActor implements RideApi {
    */
   private heads = new Map<string, RideHead>();
 
-  protected initTables() {
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS rides (
-        id TEXT PRIMARY KEY, status TEXT NOT NULL, customer_id TEXT NOT NULL, driver_id TEXT,
-        data TEXT NOT NULL, updated_at INTEGER NOT NULL
-      );
-      -- a socket connecting: the driver's active ride / the customer's latest ride, without a table scan
-      CREATE INDEX IF NOT EXISTS rides_driver ON rides (driver_id, status);
-      CREATE INDEX IF NOT EXISTS rides_customer ON rides (customer_id, updated_at);
-      CREATE TABLE IF NOT EXISTS ride_idem (customer_id TEXT NOT NULL, key TEXT NOT NULL, ride_id TEXT NOT NULL,
-        PRIMARY KEY (customer_id, key));
-      -- ON_TRIP route points not yet in Postgres; seq (AUTOINCREMENT: never reused) is their key there
-      CREATE TABLE IF NOT EXISTS track (seq INTEGER PRIMARY KEY AUTOINCREMENT, ride_id TEXT NOT NULL,
-        lat REAL NOT NULL, lng REAL NOT NULL, at INTEGER NOT NULL);
-      CREATE INDEX IF NOT EXISTS track_ride ON track (ride_id, seq);
-    `);
+  protected migrations() {
+    return RIDE_MIGRATIONS;
   }
 
   /** Work that waits on Postgres or another actor must always have its timer (see ZoneActor.rearmTimers). */

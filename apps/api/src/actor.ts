@@ -4,6 +4,7 @@ import { type Config, keyOfActor, loadConfig, zoneOfKey } from "./config";
 import * as db from "./db";
 import { type Sql, withDb } from "./pg";
 import type { ClientMsg, OfferPayload, ServerMsg, Vehicle } from "./protocol";
+import { migrate } from "./schema";
 
 export interface DriverRow {
   id: string;
@@ -101,26 +102,17 @@ export abstract class ZoneActor extends DurableObject<Env> {
     void ctx.blockConcurrencyWhile(() => this.rearmTimers());
   }
 
-  /** Tables of this kind of actor (the shared ones are created by `initSchema`). */
-  protected abstract initTables(): void;
+  /** This kind of actor's SQLite migrations (see schema.ts). A method: the constructor needs it before subclass fields exist. */
+  protected abstract migrations(): readonly string[];
   /** A due timer `<kind>:<id>`. */
   protected abstract onTimer(kind: string, id: string): Promise<void>;
   /** A message from a client socket (pings are answered without waking the actor). */
   protected abstract handle(ws: WebSocket, meta: SocketMeta, msg: ClientMsg): Promise<void>;
 
+  /** Bring this actor's database up to date (runs only the steps it has not run yet). */
   protected initSchema() {
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS drivers (
-        id TEXT PRIMARY KEY, name TEXT NOT NULL, vehicle TEXT,
-        lat REAL, lng REAL, heading REAL, cell TEXT,
-        status TEXT NOT NULL, ride_id TEXT, reserved_until INTEGER, offer TEXT,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS drivers_cell ON drivers (cell);
-      CREATE TABLE IF NOT EXISTS timers (key TEXT PRIMARY KEY, at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
-    `);
-    this.initTables();
+    const { from, to } = migrate(this.ctx.storage, this.migrations());
+    if (from > 0 && to > from) console.log("actor schema migrated", this.ctx.id.name, `v${from} → v${to}`);
   }
 
   protected meta(k: string): string | null {

@@ -59,6 +59,7 @@ Tarif di backend tetap memakai jarak lurus × 1,3.
 | MatchDO | `apps/api/src/match.ts` | Petugas pencarian satu zona (`match:<zona>`, geohash 5, ±5 km). Memegang driver bebas (`OFFLINE`/`AVAILABLE`/`RESERVED`) dan posisinya, menjawab pencarian, mereservasi driver. |
 | RideDO | `apps/api/src/ride.ts` | Petugas ride satu zona (`ride:<zona>`), atau beberapa petugas untuk zona ramai (shard, `ride:<zona>.<k>`). Memegang ride yang titik jemputnya di zona itu: dispatch, status, timer, rute, pembayaran; plus socket customer dan driver yang sedang `ON_RIDE`. |
 | (bersama) | `apps/api/src/actor.ts` | Dasar kedua DO: timer di satu alarm, socket, posisi driver, jalur Postgres. |
+| (bersama) | `apps/api/src/schema.ts` | Migrasi SQLite tiap DO (bernomor, hanya ditambah). Tiap DO menjalankan langkah yang belum ia jalankan saat menyala, dalam satu transaksi. |
 | Postgres | `apps/api/src/db.ts`, `apps/api/migrations` | User, kendaraan, riwayat ride, saldo, transaksi, saldo tertahan. |
 
 Alur satu ride:
