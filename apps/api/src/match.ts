@@ -9,7 +9,7 @@ import {
   shouldHandOff,
 } from "@gojek/core";
 import { type DriverRow, type PingDriver, PURGE_EVERY_MS, type SocketMeta, ZoneActor } from "./actor";
-import { homeOfRide, rideStub } from "./config";
+import { homeOfRide, matchRoute, rideRoute, rideStub } from "./config";
 import * as db from "./db";
 import { type ClientMsg, type DriverInfo, fail, type OfferPayload, type Result, type RideView } from "./protocol";
 import type { RideApi } from "./ride";
@@ -97,7 +97,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
     if (p) p.outside = outside;
     if (!shouldHandOff({ lat: d.lat, lng: d.lng }, z, outside, this.cfg.presence)) return false;
     this.removeDriver(d.id);
-    this.moveSockets(d.id, { t: "zone.moved", zone: z }, true);
+    this.moveSockets(d.id, matchRoute(z), true);
     return true;
   }
 
@@ -106,7 +106,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
     this.removeDriver(driverId);
     this.moved.set(driverId, { rideId, until: Date.now() + MOVED_MEMORY_MS });
     // not closed here: the client closes and reconnects; a message it sends meanwhile is forwarded
-    this.moveSockets(driverId, { t: "zone.moved", zone: rideHome, rideId }, false);
+    this.moveSockets(driverId, rideRoute(rideHome), false);
   }
 
   /**
@@ -235,7 +235,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
     }
     this.saveDriver(d);
     await this.scheduleOnce("purge:all", Date.now() + PURGE_EVERY_MS);
-    this.sendWs(server, { t: "hello", zone: m.zone, role: m.role, driverStatus: d.status, rideId: d.rideId });
+    this.sendWs(server, { t: "hello", route: matchRoute(m.zone), role: m.role, driverStatus: d.status, rideId: d.rideId });
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -361,13 +361,13 @@ export class MatchDO extends ZoneActor implements MatchApi {
   /**
    * A message from a socket whose driver is not here any more. Just handed to a ride's actor: the
    * client is reconnecting there, so what it sent meanwhile is passed on. Otherwise (handed to another
-   * zone): ask it to reconnect by location.
+   * zone): ask it to reconnect without a route (the gateway places it by its active ride or location).
    */
   private async handleMoved(ws: WebSocket, meta: SocketMeta, msg: ClientMsg) {
     const m = this.moved.get(meta.userId);
     const rideHome = m && m.until > Date.now() ? homeOfRide(m.rideId) : null;
     if (!m || !rideHome) {
-      this.sendWs(ws, { t: "zone.moved", zone: this.zone ?? "" });
+      this.sendWs(ws, { t: "reconnect", route: null });
       return ws.close(4001, "zone moved");
     }
     if (isRideEvent(msg)) return this.forwardRideEvent(ws, meta.userId, msg);
@@ -380,7 +380,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
       if (ride) this.sendWs(ws, { t: "ride.status", rideId: ride.id, status: ride.status, driver: ride.driver, at: Date.now(), ride });
       return;
     }
-    this.sendWs(ws, { t: "zone.moved", zone: rideHome, rideId: m.rideId });
+    this.sendWs(ws, { t: "reconnect", route: rideRoute(rideHome) });
   }
 
   private async forwardRideEvent(ws: WebSocket, driverId: string, msg: RideEventMsg) {
@@ -389,7 +389,7 @@ export class MatchDO extends ZoneActor implements MatchApi {
     const type = msg.t === "ride.arrived" ? "ARRIVE" : msg.t === "ride.start" ? "START" : "COMPLETE";
     const res = await this.stub(rz).driverRideEvent(driverId, msg.rideId, type);
     if (!res.ok) throw new DomainError(res.code, res.message);
-    if (!this.moved.has(driverId)) this.sendWs(ws, { t: "zone.moved", zone: rz, rideId: msg.rideId });
+    if (!this.moved.has(driverId)) this.sendWs(ws, { t: "reconnect", route: rideRoute(rz) });
   }
 
   private resume(ws: WebSocket, meta: SocketMeta, rideId?: string) {
@@ -400,6 +400,6 @@ export class MatchDO extends ZoneActor implements MatchApi {
     }
     // a ride lives in its ride actor
     const rz = rideId ? homeOfRide(rideId) : null;
-    if (rideId && rz && !(d?.status === "RESERVED" && d.rideId === rideId)) this.sendWs(ws, { t: "zone.moved", zone: rz, rideId });
+    if (rideId && rz && !(d?.status === "RESERVED" && d.rideId === rideId)) this.sendWs(ws, { t: "reconnect", route: rideRoute(rz) });
   }
 }

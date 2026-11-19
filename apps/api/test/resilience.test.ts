@@ -1,6 +1,7 @@
 import { env } from "cloudflare:test";
 import { geohashBounds, geohashEncode } from "@gojek/core";
 import { describe, expect, it } from "vitest";
+import { homeOfRide, matchRoute, rideRoute } from "../src/config";
 import * as db from "../src/db";
 import { api, Client, inZone, login, onlineDriver, postgresOutage, sleep, status, withSql } from "./helpers";
 
@@ -277,7 +278,7 @@ describe("A6: a driver never holds two rides", () => {
     busy.ws.send({ t: "offer.accept", rideId });
     expect((await busy.ws.next("error")).code).toBe("DRIVER_BUSY");
     // not put back among the free drivers: pointed at the ride they are on
-    expect(await busy.ws.next("zone.moved")).toMatchObject({ zone: "zzzzz", rideId: busyRide });
+    expect(await busy.ws.next("reconnect")).toMatchObject({ route: rideRoute("zzzzz") });
 
     expect((await next.ws.next("offer")).rideId).toBe(rideId);
     next.ws.send({ t: "offer.accept", rideId });
@@ -297,11 +298,11 @@ describe("A6: a driver never holds two rides", () => {
     drv.ws.send({ t: "offer.accept", rideId });
     await drv.ws.next(status("ACCEPTED"));
 
-    // another socket of the same driver, told it has no active ride (`known=1`): lands in the match actor
-    const second = await Client.connect({ token: drv.token, lat: p.lat, lng: p.lng, known: 1 });
+    // another socket of the same driver, with a stale route to the match actor: lands there
+    const second = await Client.connect({ token: drv.token, lat: p.lat, lng: p.lng, route: matchRoute(geohashEncode(p.lat, p.lng, 5)) });
     expect((await second.next("hello")).driverStatus).toBe("OFFLINE");
     second.send({ t: "online" });
-    expect(await second.next("zone.moved")).toMatchObject({ rideId });
+    expect(await second.next("reconnect")).toMatchObject({ route: rideRoute(homeOfRide(rideId)!) });
     expect(await second.next("hello")).toMatchObject({ driverStatus: "ON_RIDE", rideId });
     expect(second.inbox.some((m) => m.t === "driver.state" && m.status === "AVAILABLE")).toBe(false);
     second.close();
@@ -322,10 +323,10 @@ describe("A6: a driver never holds two rides", () => {
     expect((await pgRide(rideId))?.driverId).toBe(drv.id); // it did land
 
     // the ride's zone learns it on its own (`sync:`), then tells the driver's zone (`handover:`)
-    const moved = await drv.ws.next("zone.moved", 15_000);
-    expect(moved).toMatchObject({ zone: rideZone, rideId });
-    // the client follows zone.moved into the ride's actor
-    expect(await drv.ws.next("hello")).toMatchObject({ zone: rideZone, driverStatus: "ON_RIDE", rideId });
+    const moved = await drv.ws.next("reconnect", 15_000);
+    expect(moved).toMatchObject({ route: rideRoute(rideZone) });
+    // the client follows `reconnect` into the ride's actor
+    expect(await drv.ws.next("hello")).toMatchObject({ route: rideRoute(rideZone), driverStatus: "ON_RIDE", rideId });
     drv.ws.close();
   });
 
@@ -341,8 +342,8 @@ describe("A6: a driver never holds two rides", () => {
     expect((await drv.ws.next("error")).code).toBe("UNAVAILABLE");
     await lostAcceptReply(driverZone, false);
 
-    const moved = await drv.ws.next("zone.moved", 10_000);
-    expect(moved).toMatchObject({ zone: rideZone, rideId });
+    const moved = await drv.ws.next("reconnect", 10_000);
+    expect(moved).toMatchObject({ route: rideRoute(rideZone) });
     expect((await pgRide(rideId))?.status).toBe("ACCEPTED");
     // gone from its old zone: it is never offered there again
     expect(await drv.ws.next("hello")).toMatchObject({ driverStatus: "ON_RIDE", rideId });

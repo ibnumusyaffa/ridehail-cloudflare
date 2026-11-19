@@ -61,7 +61,8 @@ export type ClientMsg =
   | { t: "ping" };
 
 export type ServerMsg =
-  | { t: "hello"; zone: string; role: string; driverStatus?: DriverStatus; rideId?: string | null }
+  /** `route`: opaque; send it back as `/ws?route=` on every reconnect */
+  | { t: "hello"; route: string; role: string; driverStatus?: DriverStatus; rideId?: string | null }
   | { t: "driver.state"; status: DriverStatus; rideId: string | null }
   | ({ t: "offer" } & OfferPayload)
   | { t: "offer.cancelled"; rideId: string; reason: string }
@@ -73,7 +74,11 @@ export type ServerMsg =
   | { t: "ride.driver_back"; rideId: string }
   /** the driver dropped the ride before the trip: it is searched again (a `ride.status` REQUESTED follows) */
   | { t: "ride.requeued"; rideId: string; reason: "DRIVER_CANCELLED" }
-  | { t: "zone.moved"; zone: string; rideId?: string }
+  /**
+   * Close this socket and connect again with `route` (opaque; null = connect without one). The
+   * server moves a client between its actors this way; the client never needs to know why.
+   */
+  | { t: "reconnect"; route: string | null }
   | { t: "pong" }
   | { t: "error"; code: ErrorCode; message: string };
 

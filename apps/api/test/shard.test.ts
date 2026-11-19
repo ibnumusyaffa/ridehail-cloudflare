@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { geohashBounds } from "@gojek/core";
 import { describe, expect, it } from "vitest";
-import { homeOfRide, parseRideHome, parseRideShards, rideHome, shardFor } from "../src/config";
+import { homeOfRide, matchRoute, parseRideHome, parseRideShards, rideHome, rideRoute, shardFor } from "../src/config";
 import { api, Client, inZone, login, onlineDriver, sleep, status, withSql } from "./helpers";
 
 // vitest.config.ts shards this zone only: RIDE_SHARDS = "qw8nv=4,*=1"
@@ -76,9 +76,9 @@ describe("sharded zone", () => {
     expect(offer.rideId).toBe(rideId);
     d.ws.send({ t: "offer.accept", rideId });
     await cws.next(status("ACCEPTED"));
-    // the driver followed `zone.moved` to the shard's actor
+    // the driver followed `reconnect` to the shard's actor
     const moved = await d.ws.next("hello");
-    expect(moved.zone).toBe(`${ZONE}.2`);
+    expect(moved.route).toBe(rideRoute(`${ZONE}.2`));
 
     d.ws.send({ t: "loc", lat: centre.lat + 0.001, lng: centre.lng });
     await cws.next("driver.loc");
@@ -92,7 +92,7 @@ describe("sharded zone", () => {
 
     // the driver went back to the zone's match actor, free
     await d.ws.next((m) => m.t === "driver.state" && m.status === "AVAILABLE");
-    await d.ws.next((m) => m.t === "hello" && m.zone === ZONE);
+    await d.ws.next((m) => m.t === "hello" && m.route === matchRoute(ZONE));
 
     // the ride lives in shard 2 only; shard 0 never saw it
     let inShard = false;

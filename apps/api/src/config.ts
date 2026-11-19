@@ -149,6 +149,30 @@ export function keyOfActor(name: string | undefined): string | null {
 /** The geohash zone of an actor key (a ride home loses its shard). */
 export const zoneOfKey = (key: string) => parseRideHome(key)?.zone ?? key;
 
+// ------------------------------------------------------------- client routes
+//
+// A client's socket lives in one actor at a time. Which one is the server's business: the client is
+// handed an opaque `route` (in `hello`, and in `reconnect` when it must move) and sends it back on
+// every connect (`/ws?route=`). The format is versioned so it can change without touching clients;
+// a route the server can't read is ignored (the gateway looks the user up instead).
+
+const ROUTE_RE = /^v1\.([mr])\.(.+)$/;
+
+/** The route to the match actor of `zone`. */
+export const matchRoute = (zone: string) => `v1.m.${zone}`;
+
+/** The route to the ride actor of `home` (a zone, or `<zone>.<k>`). */
+export const rideRoute = (home: string) => `v1.r.${home}`;
+
+/** The actor a route names; null when it is not a route this server issues. */
+export function parseRoute(route: string | null | undefined): { kind: ActorKind; key: string } | null {
+  const m = route ? ROUTE_RE.exec(route) : null;
+  if (!m) return null;
+  const key = m[2]!;
+  if (m[1] === "m") return isGeohash(key) ? { kind: "match", key } : null;
+  return parseRideHome(key) ? { kind: "ride", key } : null;
+}
+
 /**
  * An actor's stub. `DO_LOCATION_HINT` places new actors near the Postgres region (every ride
  * transition waits on Postgres); it only applies when an actor is first created, never moves one.

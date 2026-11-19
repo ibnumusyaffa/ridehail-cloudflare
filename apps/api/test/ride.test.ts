@@ -1,5 +1,6 @@
 import { geohashBounds, geohashEncode } from "@gojek/core";
 import { describe, expect, it } from "vitest";
+import { matchRoute, rideRoute } from "../src/config";
 import { api, Client, login, onlineDriver, sleep, status } from "./helpers";
 
 // Each test uses its own area so drivers from other tests don't interfere.
@@ -221,13 +222,13 @@ describe("ride flow", () => {
     const o = await d.ws.next("offer");
     d.ws.send({ t: "offer.accept", rideId: o.rideId });
     await d.ws.next(status("ACCEPTED"));
-    const moved = await d.ws.next("zone.moved");
-    expect(moved.zone).toBe(zone);
+    const moved = await d.ws.next("reconnect");
+    expect(moved.route).toBe(rideRoute(zone));
 
-    // the client follows zone.moved into the ride's actor; the trip is finished there
+    // the client follows `reconnect` into the ride's actor; the trip is finished there
     const d2 = d.ws;
     const hello = await d2.next("hello");
-    expect(hello).toMatchObject({ zone, driverStatus: "ON_RIDE", rideId: o.rideId });
+    expect(hello).toMatchObject({ route: rideRoute(zone), driverStatus: "ON_RIDE", rideId: o.rideId });
     const cws = await Client.connect({ token: c.token, rideId: o.rideId });
     await cws.next("hello");
     d2.send({ t: "loc", lat: pickup.lat, lng: pickup.lng });
@@ -270,19 +271,31 @@ describe("ride flow", () => {
     d.ws.send({ t: "loc", ...justAcross });
     d.ws.send({ t: "loc", ...justAcross });
     await sleep(300);
-    expect(d.ws.inbox.some((m) => m.t === "zone.moved")).toBe(false);
+    expect(d.ws.inbox.some((m) => m.t === "reconnect")).toBe(false);
     d.ws.send({ t: "loc", ...justAcross }); // 3rd consecutive ping outside
-    expect((await d.ws.next("zone.moved")).zone).toBe(geohashEncode(justAcross.lat, justAcross.lng, 5));
+    expect((await d.ws.next("reconnect")).route).toBe(matchRoute(geohashEncode(justAcross.lat, justAcross.lng, 5)));
     d.ws.close();
   });
 
-  it("known=1 reconnects skip the active-ride lookup", async () => {
+  it("a route skips the active-ride lookup; one the server can't read falls back to it", async () => {
     const c = await customer();
-    const { json } = await requestRide(c.token, spot());
+    const p = spot();
+    const { json } = await requestRide(c.token, p);
     const ws = await Client.connect({ token: c.token }); // cold start: database finds the ride
-    expect((await ws.next("hello")).rideId).toBe(json.rideId);
+    const hello = await ws.next("hello");
+    expect(hello).toMatchObject({ rideId: json.rideId, route: rideRoute(geohashEncode(p.lat, p.lng, 5)) });
     ws.close();
-    await expect(Client.connect({ token: c.token, known: 1 })).rejects.toThrow(/400/);
+    // the route is trusted as given: another ride actor (no lookup), where this customer has no ride
+    const other = spot();
+    const elsewhere = await Client.connect({ token: c.token, route: rideRoute(geohashEncode(other.lat, other.lng, 5)) });
+    expect((await elsewhere.next("hello")).rideId).toBeNull();
+    elsewhere.close();
+    for (const route of ["garbage", "v9.r.qqguw", "v1.m.qqguw"]) {
+      // unreadable, or a match actor's route for a customer: ignored, the database finds the ride
+      const again = await Client.connect({ token: c.token, route });
+      expect((await again.next("hello")).rideId).toBe(json.rideId);
+      again.close();
+    }
   });
 
   it("rejects bad auth and bad input", async () => {

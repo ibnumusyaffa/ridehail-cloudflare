@@ -83,7 +83,7 @@ Status driver: `OFFLINE`, `AVAILABLE`, `RESERVED` (sedang ditawari), `ON_RIDE`.
 - Pencarian: sel geohash 6 + 8 tetangga dulu; kalau kosong, geohash 5 + 8 tetangga. Maksimal 2 km dari titik jemput (`maxRadiusM` di `packages/core/src/matcher.ts`, jarak lurus), 10 kandidat terdekat. Zona tetangga ditanya paralel.
 - Tawaran berurutan. `reserveAndOffer` hanya berhasil untuk driver `AVAILABLE` yang tersambung; kalau gagal lanjut kandidat berikutnya. Tawaran 15 detik, reservasi 20 detik.
 - Pencarian berhenti (`NO_DRIVER`) setelah dua kali hasil kosong (jeda 5 detik) atau lewat 2 menit. Lihat catatan di [ARCHITECTURE-REVIEW.md](ARCHITECTURE-REVIEW.md) §3.2.
-- Setelah menerima, driver **pindah ke RideDO** zona ride selama perjalanan (`zone.moved` dengan `rideId` → client reconnect), jadi customer, driver, dan ride ada di satu RideDO. Selesai / batal / driver mundur → RideDO mengembalikan driver ke MatchDO zona tempat ia berada (`returnDriver`), lalu `zone.moved` tanpa `rideId`.
+- Setelah menerima, driver **pindah ke RideDO** zona ride selama perjalanan (server mengirim `reconnect` dengan `route` ke RideDO → client reconnect), jadi customer, driver, dan ride ada di satu RideDO. Selesai / batal / driver mundur → RideDO mengembalikan driver ke MatchDO zona tempat ia berada (`returnDriver`), lalu `reconnect` dengan `route` ke MatchDO itu.
 - Saat pindah, server tidak menutup socket lama; client yang menutup. Pesan yang terkirim di sela itu (`loc`, `ride.*`) diteruskan MatchDO ke RideDO, tidak hilang.
 - Driver `AVAILABLE` yang keluar zona dipindah setelah ≥ 100 m di dalam zona baru atau 3 ping berturut-turut di luar.
 - Ping lokasi: client mengirim saat bergerak ≥ 30 m atau tiap 10 detik. Server membuang ping yang datang < 8 detik (saat ride: < 1 detik) **dan** bergerak < 30 m, jadi driver yang diam hanya diproses tiap ±10 detik. MatchDO membuang ping itu dari memori sebelum membaca SQLite (karena itu MatchDO menolak menyimpan driver `ON_RIDE`). Driver tanpa ping > 45 detik tidak ikut pencarian.
@@ -132,12 +132,13 @@ Format error: `{ "error": { "code": "INSUFFICIENT_BALANCE", "message": "..." } }
 
 WebSocket `GET /ws?token=…`
 
-- Customer: `&rideId=` (atau kosong → ride aktif).
-- Driver: `&lat=&lng=` (zona dari lokasi), `&zone=` setelah `zone.moved`, atau `&rideId=` saat sedang ride.
-- `&known=1`: dikirim client di tiap reconnect setelah `hello` pertama, supaya gerbang tidak perlu query database.
+- `&route=`: string opaque dari `hello` / `reconnect` terakhir (`v1.m.<zona>` atau `v1.r.<home>`, lihat `parseRoute` di `config.ts`). Client hanya menyimpan dan mengirimnya balik; dengan route gerbang tidak perlu query database. Route yang tidak terbaca diabaikan.
+- `&rideId=`: ride yang sedang ditonton customer (didahulukan dari route).
+- Tanpa keduanya: gerbang mencari ride aktif di Postgres; driver tanpa ride ditempatkan dari `&lat=&lng=`.
+- Route yang menunjuk petugas yang salah (basi) dikoreksi petugas itu dengan `reconnect`.
 
 Pesan dari client: `online`, `offline`, `loc`, `offer.accept`, `offer.reject`, `ride.arrived`, `ride.start`, `ride.complete`, `resume`, `ping`.
-Pesan dari server: `hello`, `driver.state`, `offer`, `offer.cancelled`, `ride.status`, `ride.paid`, `driver.loc`, `zone.moved`, `pong`, `error`.
+Pesan dari server: `hello`, `driver.state`, `offer`, `offer.cancelled`, `ride.status`, `ride.paid`, `driver.loc`, `reconnect`, `pong`, `error`.
 Definisi lengkap: `packages/client/src/protocol.ts`.
 
 ## Config (`apps/api/wrangler.jsonc`)

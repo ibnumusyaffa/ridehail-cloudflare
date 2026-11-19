@@ -31,14 +31,14 @@ export async function login(role: "customer" | "driver", name?: string) {
 type Msg = ServerMsg & Record<string, any>;
 
 /**
- * WebSocket client with an awaitable message inbox. Like the app's client it follows `zone.moved`:
- * closes the socket and reconnects to the actor named (the inbox carries over; a `hello` follows).
+ * WebSocket client with an awaitable message inbox. Like the app's client it follows `reconnect`:
+ * closes the socket and connects again with the route given (the inbox carries over; a `hello` follows).
  */
 export class Client {
   inbox: Msg[] = [];
   private waiters: { pred: (m: Msg) => boolean; resolve: (m: Msg) => void }[] = [];
   closed = false;
-  /** messages sent while reconnecting after `zone.moved` */
+  /** messages sent while reconnecting after `reconnect` */
   private queued: string[] | null = null;
 
   private constructor(public ws: WebSocket, private query: Record<string, string | number>) {
@@ -48,7 +48,7 @@ export class Client {
   private attach(ws: WebSocket) {
     ws.addEventListener("message", (e) => {
       const m = JSON.parse(e.data as string) as Msg;
-      if (m.t === "zone.moved" && ws === this.ws) void this.follow(m);
+      if (m.t === "reconnect" && ws === this.ws) void this.follow(m);
       const i = this.waiters.findIndex((w) => w.pred(m));
       if (i >= 0) this.waiters.splice(i, 1)[0]!.resolve(m);
       else this.inbox.push(m);
@@ -71,8 +71,8 @@ export class Client {
   }
 
   private async follow(m: Msg) {
-    const { zone: _z, rideId: _r, ...rest } = this.query;
-    this.query = m.rideId ? { ...rest, rideId: m.rideId } : m.zone ? { ...rest, zone: m.zone } : rest;
+    const { route: _r, ...rest } = this.query;
+    this.query = m.route ? { ...rest, route: m.route } : rest;
     this.queued = [];
     const old = this.ws;
     try {

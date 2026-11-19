@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { issueToken, type Principal, readToken } from "./auth";
-import { homeOfRide, loadConfig, matchStub, parseRideHome, rideHome, rideStub, shardCount, shardFor } from "./config";
+import { homeOfRide, loadConfig, matchStub, parseRideHome, parseRoute, rideHome, rideStub, shardCount, shardFor } from "./config";
 import * as db from "./db";
 import { serverEnv } from "./env";
 import { connect, type Sql } from "./pg";
@@ -37,8 +37,13 @@ const matchApi = (env: Env, zone: string) => matchStub(env, zone) as unknown as 
 
 /** The ride actor a ride id names, only when its zone is a real zone of this deployment (no made-up actors). */
 function rideHomeOf(env: Env, rideId: string): string | null {
-  const home = homeOfRide(rideId);
-  return home && parseRideHome(home)!.zone.length === loadConfig(env).zonePrecision ? home : null;
+  return validHome(env, homeOfRide(rideId));
+}
+
+/** `home` when it names a ride actor of a real zone of this deployment. */
+function validHome(env: Env, home: string | null): string | null {
+  const parsed = home ? parseRideHome(home) : null;
+  return parsed && parsed.zone.length === loadConfig(env).zonePrecision ? home : null;
 }
 
 async function body<T = Record<string, unknown>>(req: Request): Promise<T> {
@@ -101,11 +106,12 @@ app.post("/auth/login", async (c) => {
 });
 
 // ------------------------------------------------------------- WebSocket gateway
-// /ws?token=...  customer: &rideId=  (or active ride lookup)                         → ride:<home>
-//                driver:   &rideId= (on a ride)                                       → ride:<home>
-//                          &zone= (after zone.moved) | &lat=&lng= (zone by location)  → match:<zone>
-//                &known=1: the client already knows whether it has an active ride (every reconnect after
-//                the first hello), so the database is not consulted — a deploy's reconnect storm costs 0 queries.
+// /ws?token=...  &rideId=   the ride the client is watching (customer after ordering)  → ride:<home>
+//                &route=    opaque, from the last `hello` / `reconnect` (see `parseRoute`) → that actor
+//                (neither)  active ride lookup in Postgres → ride:<home>; else a driver by location → match:<zone>
+//                &lat=&lng= driver's position (a driver without a ride or route is placed by it)
+// Every reconnect after the first hello carries a route, so the database is not consulted — a deploy's
+// reconnect storm costs 0 queries. A route naming the wrong actor is corrected there (`reconnect`).
 app.get("/ws", async (c) => {
   if (c.req.header("Upgrade") !== "websocket") return c.text("expected websocket", 426);
   const user = await readToken(c.env, c.req.query("token"));
@@ -121,14 +127,19 @@ app.get("/ws", async (c) => {
 
   // a ride's participants connect to its ride actor; a driver without one to the match actor of where they are
   const validZone = (z: string | null | undefined) => (z && isGeohash(z) && z.length === cfg.zonePrecision ? z : null);
+  const route = parseRoute(q.route);
   let rideHomeKey: string | null = q.rideId ? rideHomeOf(c.env, q.rideId) : null;
-  if (!rideHomeKey && q.known !== "1") {
+  let matchZone: string | null = null;
+  if (!rideHomeKey && route) {
+    if (route.kind === "ride") rideHomeKey = validHome(c.env, route.key);
+    else if (user.role === "driver") matchZone = validZone(route.key);
+  }
+  if (!rideHomeKey && !matchZone) {
     const active = await db.getActiveRide(c.var.db(), user.sub, user.role);
     // Postgres keeps a searching ride REQUESTED; its driver is only offered it, still in a match actor
     if (active && (user.role === "customer" || active.status !== "REQUESTED")) rideHomeKey = homeOfRide(active.id);
   }
-  let matchZone: string | null = null;
-  if (!rideHomeKey && user.role === "driver") matchZone = validZone(q.zone) ?? (hasLoc ? geohashEncode(lat, lng, cfg.zonePrecision) : null);
+  if (!rideHomeKey && !matchZone && user.role === "driver" && hasLoc) matchZone = geohashEncode(lat, lng, cfg.zonePrecision);
   const zone = rideHomeKey ?? matchZone;
   if (!zone) return c.text(user.role === "driver" ? "lat & lng required" : "no active ride", 400);
 

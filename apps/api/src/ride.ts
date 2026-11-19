@@ -16,7 +16,7 @@ import {
   type TrackState,
 } from "@gojek/core";
 import { type PingDriver, PURGE_EVERY_MS, retryDelay, type SocketMeta, ZoneActor } from "./actor";
-import { homeOfRide, matchStub, zoneOfKey } from "./config";
+import { homeOfRide, matchRoute, matchStub, rideRoute, zoneOfKey } from "./config";
 import * as db from "./db";
 import type { MatchApi } from "./match";
 import { type ClientMsg, type DriverInfo, fail, type OfferPayload, type Result, type RideView, type ServerMsg } from "./protocol";
@@ -1160,7 +1160,7 @@ export class RideDO extends ZoneActor implements RideApi {
       console.error("return driver failed", driverId, zone, e);
     }
     // not closed here: the client closes and reconnects (a ride event it sends meanwhile still lands)
-    this.moveSockets(driverId, { t: "zone.moved", zone }, false);
+    this.moveSockets(driverId, matchRoute(zone), false);
   }
 
   private keepTrack(rideId: string, points: TrackPt[]) {
@@ -1227,7 +1227,7 @@ export class RideDO extends ZoneActor implements RideApi {
         if (!active) {
           // not on a ride here (it ended meanwhile): free drivers live in the match actors
           const zone = m.lat !== null && m.lng !== null ? this.zoneOf(m.lat, m.lng) : (this.zone ?? zoneOfKey(m.zone));
-          this.sendWs(server, { t: "zone.moved", zone });
+          this.sendWs(server, { t: "reconnect", route: matchRoute(zone) });
           server.close(4001, "zone moved");
           return new Response(null, { status: 101, webSocket: client });
         }
@@ -1249,7 +1249,7 @@ export class RideDO extends ZoneActor implements RideApi {
         .exec<{ id: string }>("SELECT id FROM rides WHERE customer_id = ? ORDER BY updated_at DESC LIMIT 1", m.userId)
         .toArray()[0]?.id ?? null;
     }
-    this.sendWs(server, { t: "hello", zone: m.zone, role: m.role, driverStatus, rideId });
+    this.sendWs(server, { t: "hello", route: rideRoute(m.zone), role: m.role, driverStatus, rideId });
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -1260,7 +1260,7 @@ export class RideDO extends ZoneActor implements RideApi {
     if ("rideId" in msg && msg.rideId && msg.t.startsWith("ride.")) {
       // another ride actor's ride: point the driver there
       const rz = homeOfRide(msg.rideId);
-      if (rz && rz !== this.key) return this.sendWs(ws, { t: "zone.moved", zone: rz, rideId: msg.rideId });
+      if (rz && rz !== this.key) return this.sendWs(ws, { t: "reconnect", route: rideRoute(rz) });
       const type = msg.t === "ride.arrived" ? "ARRIVE" : msg.t === "ride.start" ? "START" : "COMPLETE";
       return this.rideEventByDriver(meta.userId, msg.rideId, type);
     }
@@ -1275,7 +1275,7 @@ export class RideDO extends ZoneActor implements RideApi {
     const d = this.loadDriver(meta.userId);
     if (!d) {
       // the trip is over and the driver was handed back: redirect
-      this.sendWs(ws, { t: "zone.moved", zone: this.zone ?? "" });
+      this.sendWs(ws, { t: "reconnect", route: null });
       return;
     }
     switch (msg.t) {
@@ -1306,7 +1306,7 @@ export class RideDO extends ZoneActor implements RideApi {
     const ride = this.loadRide(rideId);
     if (!ride) {
       const rz = homeOfRide(rideId);
-      if (rz && rz !== this.key) return this.sendWs(ws, { t: "zone.moved", zone: rz, rideId });
+      if (rz && rz !== this.key) return this.sendWs(ws, { t: "reconnect", route: rideRoute(rz) });
       return this.sendWs(ws, { t: "error", code: "RIDE_NOT_FOUND", message: rideId });
     }
     if (ride.customerId !== meta.userId && ride.driverId !== meta.userId) {

@@ -222,8 +222,12 @@ export abstract class ZoneActor extends DurableObject<Env> {
     return this.ctx.getWebSockets(`user:${userId}`).length > 0;
   }
 
-  /** Tell every socket of `userId` to reconnect elsewhere; `close` also closes them (the client reconnects). */
-  protected moveSockets(userId: string, msg: Extract<ServerMsg, { t: "zone.moved" }>, close: boolean) {
+  /**
+   * Tell every socket of `userId` to reconnect with `route` (see `matchRoute` / `rideRoute`; null = let
+   * the gateway find the place again); `close` also closes them (the client reconnects).
+   */
+  protected moveSockets(userId: string, route: string | null, close: boolean) {
+    const msg: ServerMsg = { t: "reconnect", route };
     for (const ws of this.ctx.getWebSockets(`user:${userId}`)) {
       this.sendWs(ws, msg);
       if (!close) continue;

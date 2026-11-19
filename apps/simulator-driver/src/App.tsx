@@ -142,9 +142,6 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
             setLastPaid({ fare: m.fare, paidVia: m.paidVia, balance: m.balance });
             flash(`Ride selesai · ${m.paidVia === "WALLET" ? "via wallet" : "tunai"} · saldo ${fmtRp(m.balance)}`);
             break;
-          case "zone.moved":
-            flash(`Pindah zona → ${m.zone}`);
-            break;
           case "error":
             flash(`${m.code}: ${m.message}`);
             if (m.code === "DRIVER_BALANCE_TOO_LOW") setWantOnline(false);

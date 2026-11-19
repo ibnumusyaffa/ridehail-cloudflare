@@ -1,4 +1,3 @@
-import { ACTIVE_STATUSES } from "@gojek/core";
 import type { ClientMsg, ServerMsg } from "./protocol";
 
 export type SocketState = "connecting" | "open" | "closed";
@@ -18,20 +17,19 @@ export interface RideSocketOptions {
 const STORM_CODES = new Set([1001, 1006, 1012]);
 
 /**
- * WebSocket with auto-reconnect (exponential backoff + jitter), zone hand-over (`zone.moved`)
+ * WebSocket with auto-reconnect (exponential backoff + jitter), server-directed moves (`reconnect`)
  * and keepalive. Callers send `resume` from their `hello` handler.
  *
- * After the first `hello` the socket tracks the user's active ride itself and reconnects with
- * `known=1` (plus `rideId` when on a ride), so the server never has to look it up in the database.
+ * Where the socket connects is the server's business: it hands out an opaque `route` (in `hello`
+ * and `reconnect`) that is sent back on every reconnect. `reconnect` is handled here and never
+ * reaches `onMessage`.
  */
 export class RideSocket {
   private ws: WebSocket | null = null;
   private stopped = false;
   private backoff = 500;
-  private zone: string | null = null;
-  private rideId: string | null = null;
-  /** true once a hello arrived: from then on this socket knows whether it has an active ride */
-  private known = false;
+  /** opaque, from the server's last `hello` / `reconnect` */
+  private route: string | null = null;
   private keepalive: ReturnType<typeof setInterval> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -42,10 +40,7 @@ export class RideSocket {
   private url() {
     const qs = new URLSearchParams({ token: this.opts.token });
     for (const [k, v] of Object.entries(this.opts.query?.() ?? {})) if (v !== undefined) qs.set(k, String(v));
-    // on a ride → its ride actor (by rideId); otherwise the match actor (zone told by zone.moved, else location)
-    if (this.rideId && !qs.has("rideId")) qs.set("rideId", this.rideId);
-    else if (this.zone) qs.set("zone", this.zone);
-    if (this.known) qs.set("known", "1");
+    if (this.route) qs.set("route", this.route);
     return `${this.opts.baseUrl.replace(/^http/, "ws")}/ws?${qs}`;
   }
 
@@ -61,25 +56,13 @@ export class RideSocket {
     };
     ws.onmessage = (e) => {
       const msg = JSON.parse(String(e.data)) as ServerMsg;
-      if (msg.t === "hello") {
-        this.zone = null;
-        this.known = true;
-        // a driver lives in the ride's zone only while ON_RIDE; a customer always follows its ride
-        if (msg.role === "driver") this.rideId = msg.driverStatus === "ON_RIDE" ? (msg.rideId ?? null) : null;
-        else if (msg.rideId) this.rideId = msg.rideId;
-      }
-      if (msg.t === "driver.state") this.rideId = msg.status === "ON_RIDE" ? msg.rideId : null;
-      if (msg.t === "ride.status") {
-        if (ACTIVE_STATUSES.includes(msg.status)) this.rideId = msg.rideId;
-        else if (this.rideId === msg.rideId) this.rideId = null;
-      }
-      if (msg.t === "zone.moved") {
-        // on a ride: reconnect to the ride's actor; otherwise to the match actor of `zone`
-        this.zone = msg.zone || null;
-        this.rideId = msg.rideId ?? null;
+      if (msg.t === "hello") this.route = msg.route;
+      if (msg.t === "reconnect") {
+        this.route = msg.route;
         this.backoff = 100;
         // the server may leave the old socket open (so a message sent meanwhile still lands): close it here
         ws.close();
+        return;
       }
       if (msg.t === "pong") return;
       this.opts.onMessage(msg);
@@ -102,11 +85,6 @@ export class RideSocket {
       this.backoff = Math.min(this.backoff * 2, 10_000);
     };
     ws.onerror = () => {};
-  }
-
-  /** Route the next reconnect to this ride (customer). */
-  setRide(rideId: string | null) {
-    this.rideId = rideId;
   }
 
   send(msg: ClientMsg): boolean {
