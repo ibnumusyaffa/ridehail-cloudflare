@@ -1,0 +1,4 @@
+out
+public/voice
+src/voice.json
+.voice-cache

@@ -1,0 +1,25 @@
+{
+  "name": "@gojek/explainer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "voice": "tsx scripts/voice.ts",
+    "studio": "pnpm voice && remotion studio src/index.ts",
+    "render": "pnpm voice && remotion render src/index.ts Explainer out/explainer.mp4",
+    "full": "pnpm render && tsx scripts/join.ts",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.539",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "remotion": "4.0.539"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}
