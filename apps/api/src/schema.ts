@@ -13,7 +13,7 @@
 //  - Step 1 is the baseline and uses IF NOT EXISTS: it also adopts actors created before migrations
 //    existed (tables present, no version recorded).
 
-/** Tables both kinds of zone actor have: driver rows (+ snapshot of their position) and the timer queue. */
+/** Tables both kinds of zone actor have: driver rows and the timer queue. */
 const SHARED_BASELINE = `
   CREATE TABLE IF NOT EXISTS drivers (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, vehicle TEXT,
@@ -25,9 +25,19 @@ const SHARED_BASELINE = `
   CREATE TABLE IF NOT EXISTS timers (key TEXT PRIMARY KEY, at INTEGER NOT NULL);
 `;
 
+/**
+ * Every driver position of the actor as ONE row (JSON `[id, lat, lng, heading, ts][]`), rewritten at
+ * most every SNAPSHOT_MS: only read when the actor restarts. One row per actor, not one per driver,
+ * because SQLite bills per row written.
+ */
+const POS_SNAPSHOT = `
+  CREATE TABLE IF NOT EXISTS pos_snapshot (k TEXT PRIMARY KEY, v INTEGER NOT NULL, at INTEGER NOT NULL, data TEXT NOT NULL);
+`;
+
 /** Match actor (`match:<zone>`): free drivers only. */
 export const MATCH_MIGRATIONS: readonly string[] = [
   /* 1 */ SHARED_BASELINE,
+  /* 2 */ POS_SNAPSHOT,
 ];
 
 /** Ride actor (`ride:<home>`): rides, drivers on a trip, the trip routes not yet in Postgres. */
@@ -47,6 +57,7 @@ export const RIDE_MIGRATIONS: readonly string[] = [
       lat REAL NOT NULL, lng REAL NOT NULL, at INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS track_ride ON track (ride_id, seq);
   `,
+  /* 2 */ POS_SNAPSHOT,
 ];
 
 /** `meta` row holding the number of migration steps this actor's database has run. */

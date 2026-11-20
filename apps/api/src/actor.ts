@@ -20,7 +20,11 @@ export interface DriverRow {
   updatedAt: number;
 }
 
-/** Live driver position, kept in memory only (snapshotted to SQLite every SNAPSHOT_MS). */
+/**
+ * Live driver position, kept in memory only. The whole map is snapshotted to SQLite as ONE row
+ * (`pos_snapshot`) at most every SNAPSHOT_MS, only so a restarted actor can rebuild it: SQLite bills per
+ * row written, so one row per actor instead of one per driver.
+ */
 interface Pos {
   lat: number;
   lng: number;
@@ -29,8 +33,6 @@ interface Pos {
   ts: number;
   /** grid cell (geohash at the finest search precision) */
   cell: string;
-  /** when the position was last written to SQLite */
-  savedAt: number;
   /** consecutive pings outside this zone (hand-over hysteresis) */
   outside: number;
 }
@@ -46,6 +48,9 @@ export interface SocketMeta {
 
 export const PURGE_EVERY_MS = 10 * 60_000;
 export const SNAPSHOT_MS = 30_000;
+/** Format of `pos_snapshot.data`: a JSON array of `[driverId, lat, lng, heading, ts]`. */
+const SNAPSHOT_FORMAT = 1;
+type SnapshotEntry = [id: string, lat: number, lng: number, heading: number | null, ts: number];
 const ALARM_CONCURRENCY = 16;
 
 /** Backoff for retries (Postgres, RPC to another actor): 2 s, 4 s, … capped at 60 s. */
@@ -78,6 +83,9 @@ export abstract class ZoneActor extends DurableObject<Env> {
   protected pos = new Map<string, Pos>();
   protected grid = new Map<string, Set<string>>();
   protected gridPrecision: number;
+  /** when the positions were last snapshotted to SQLite, and whether they changed since */
+  private snapshotAt = 0;
+  private posDirty = false;
   /**
    * Whether this actor's drivers are on a ride (ride actor) or not (match actor): picks the ping throttle
    * interval before any storage read (see `throttled`).
@@ -135,14 +143,43 @@ export abstract class ZoneActor extends DurableObject<Env> {
     }
   }
 
-  /** Rebuild the in-memory positions from the last snapshot (after eviction / restart). */
+  /**
+   * Rebuild the in-memory positions after eviction / restart: the position each driver row was last
+   * saved with (status change), then the newer ones of the snapshot. A snapshot entry of a driver no
+   * longer in `drivers` (removed after the snapshot was taken) is ignored.
+   */
   private loadPositions() {
     const rows = this.sql
-      .exec<{ id: string; lat: number; lng: number; heading: number | null; updated_at: number }>(
-        "SELECT id, lat, lng, heading, updated_at FROM drivers WHERE lat IS NOT NULL AND lng IS NOT NULL",
+      .exec<{ id: string; lat: number | null; lng: number | null; heading: number | null; updated_at: number }>(
+        "SELECT id, lat, lng, heading, updated_at FROM drivers",
       )
       .toArray();
-    for (const r of rows) this.setPos(r.id, r.lat, r.lng, r.heading, r.updated_at, r.updated_at);
+    const saved = new Map(rows.map((r) => [r.id, r.updated_at]));
+    for (const r of rows) if (r.lat !== null && r.lng !== null) this.setPos(r.id, r.lat, r.lng, r.heading, r.updated_at);
+    const snap = this.sql
+      .exec<{ v: number; at: number; data: string }>("SELECT v, at, data FROM pos_snapshot WHERE k = 'all'")
+      .toArray()[0];
+    if (snap?.v === SNAPSHOT_FORMAT) {
+      for (const [id, lat, lng, heading, ts] of JSON.parse(snap.data) as SnapshotEntry[]) {
+        const rowAt = saved.get(id);
+        if (rowAt !== undefined && ts >= rowAt) this.setPos(id, lat, lng, heading, ts);
+      }
+      this.snapshotAt = snap.at;
+    }
+    this.posDirty = false;
+  }
+
+  /** Write every in-memory position as one row, when one changed and SNAPSHOT_MS passed since the last. */
+  protected maybeSnapshot(now: number) {
+    if (!this.posDirty || now - this.snapshotAt < SNAPSHOT_MS) return;
+    const entries: SnapshotEntry[] = [];
+    for (const [id, p] of this.pos) entries.push([id, p.lat, p.lng, p.heading, p.ts]);
+    this.sql.exec(
+      "INSERT OR REPLACE INTO pos_snapshot (k, v, at, data) VALUES ('all', ?, ?, ?)",
+      SNAPSHOT_FORMAT, now, JSON.stringify(entries),
+    );
+    this.snapshotAt = now;
+    this.posDirty = false;
   }
 
   // ============================================================ helpers
@@ -185,6 +222,8 @@ export abstract class ZoneActor extends DurableObject<Env> {
     this.registered = false;
     this.pos.clear();
     this.grid.clear();
+    this.snapshotAt = 0;
+    this.posDirty = false;
     this.nextAlarm = null;
   }
 
@@ -297,7 +336,7 @@ export abstract class ZoneActor extends DurableObject<Env> {
 
   // ------------------------------------------------------------ driver positions (memory + grid)
 
-  protected setPos(id: string, lat: number, lng: number, heading: number | null, ts: number, savedAt?: number) {
+  protected setPos(id: string, lat: number, lng: number, heading: number | null, ts: number) {
     const cell = geohashEncode(lat, lng, this.gridPrecision);
     const prev = this.pos.get(id);
     if (prev && prev.cell !== cell) this.grid.get(prev.cell)?.delete(id);
@@ -306,7 +345,8 @@ export abstract class ZoneActor extends DurableObject<Env> {
       if (!set) this.grid.set(cell, (set = new Set()));
       set.add(id);
     }
-    this.pos.set(id, { lat, lng, heading, ts, cell, savedAt: savedAt ?? prev?.savedAt ?? 0, outside: prev?.outside ?? 0 });
+    this.pos.set(id, { lat, lng, heading, ts, cell, outside: prev?.outside ?? 0 });
+    this.posDirty = true;
   }
 
   private dropPos(id: string) {
@@ -316,6 +356,7 @@ export abstract class ZoneActor extends DurableObject<Env> {
     set?.delete(id);
     if (set?.size === 0) this.grid.delete(p.cell);
     this.pos.delete(id);
+    this.posDirty = true;
   }
 
   protected removeDriver(id: string) {
@@ -370,7 +411,6 @@ export abstract class ZoneActor extends DurableObject<Env> {
   protected saveDriver(d: DriverRow) {
     // the idle ping throttle (`ridePings`) relies on it: a driver on a ride lives in the ride's actor, never in a match actor
     if (!this.ridePings && d.status === "ON_RIDE") throw new Error(`match actor cannot hold driver ${d.id} ON_RIDE`);
-    const now = Date.now();
     const cell = d.lat !== null && d.lng !== null ? geohashEncode(d.lat, d.lng, this.gridPrecision) : null;
     this.sql.exec(
       `INSERT OR REPLACE INTO drivers (id, name, vehicle, lat, lng, heading, cell, status, ride_id, reserved_until, offer, updated_at)
@@ -378,7 +418,7 @@ export abstract class ZoneActor extends DurableObject<Env> {
       d.id, d.name, d.vehicle ? JSON.stringify(d.vehicle) : null, d.lat, d.lng, d.heading, cell, d.status,
       d.rideId, d.reservedUntil, d.offer ? JSON.stringify(d.offer) : null, d.updatedAt,
     );
-    if (d.lat !== null && d.lng !== null) this.setPos(d.id, d.lat, d.lng, d.heading, d.updatedAt, now);
+    if (d.lat !== null && d.lng !== null) this.setPos(d.id, d.lat, d.lng, d.heading, d.updatedAt);
   }
 
   protected setDriverFree(d: DriverRow) {
@@ -394,7 +434,7 @@ export abstract class ZoneActor extends DurableObject<Env> {
 
   /**
    * Take a location ping into memory (throttled). Returns the driver row, updated, or null when the
-   * ping was dropped. SQLite only gets a snapshot every SNAPSHOT_MS.
+   * ping was dropped. SQLite only gets a snapshot of all positions every SNAPSHOT_MS (`maybeSnapshot`).
    */
   protected takePing<T extends PingDriver>(d: T, msg: { lat: number; lng: number; heading?: number }): T | null {
     if (!isValidLatLng(msg)) throw new DomainError("BAD_REQUEST", "invalid lat/lng");
@@ -410,15 +450,7 @@ export abstract class ZoneActor extends DurableObject<Env> {
     d.heading = typeof msg.heading === "number" ? msg.heading : d.heading;
     d.updatedAt = now;
     this.setPos(d.id, d.lat, d.lng, d.heading, now);
-    const p = this.pos.get(d.id)!;
-    if (now - p.savedAt >= SNAPSHOT_MS) {
-      // position snapshot only: the rest of the row is unchanged
-      this.sql.exec(
-        "UPDATE drivers SET lat = ?, lng = ?, heading = ?, cell = ?, updated_at = ? WHERE id = ?",
-        p.lat, p.lng, p.heading, p.cell, now, d.id,
-      );
-      p.savedAt = now;
-    }
+    this.maybeSnapshot(now);
     return d;
   }
 
