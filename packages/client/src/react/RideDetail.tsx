@@ -6,32 +6,32 @@ import { type MapMarker, MapView } from "./MapView";
 import { fmtKm, fmtRp, fmtTime, Icon, initials, Section, useRoute } from "./ui";
 
 export const RIDE_STATUS_LABEL: Record<string, string> = {
-  REQUESTED: "Mencari driver",
-  OFFERING: "Mencari driver",
-  ACCEPTED: "Driver menuju jemput",
-  ARRIVED: "Driver tiba",
-  ON_TRIP: "Dalam perjalanan",
-  COMPLETED: "Selesai",
-  CANCELLED: "Dibatalkan",
-  NO_DRIVER: "Tidak ada driver",
+  REQUESTED: "Searching for a driver",
+  OFFERING: "Searching for a driver",
+  ACCEPTED: "Driver on the way",
+  ARRIVED: "Driver arrived",
+  ON_TRIP: "On the trip",
+  COMPLETED: "Completed",
+  CANCELLED: "Cancelled",
+  NO_DRIVER: "No driver",
 };
 
 const CANCEL_REASON: Record<string, string> = {
-  driver_lost: "Driver terputus terlalu lama",
-  driver_lost_reported: "Customer melaporkan driver hilang",
-  drivers_cancelled: "Terlalu banyak driver membatalkan",
+  driver_lost: "Driver was disconnected too long",
+  driver_lost_reported: "Customer reported the driver missing",
+  drivers_cancelled: "Too many drivers cancelled",
 };
 
-const CANCELLED_BY: Record<string, string> = { customer: "Customer", driver: "Driver", system: "Sistem" };
+const CANCELLED_BY: Record<string, string> = { customer: "Customer", driver: "Driver", system: "System" };
 
-export const fmtDate = (t: number) => new Date(t).toLocaleDateString("id-ID", { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+export const fmtDate = (t: number) => new Date(t).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric" });
 
 const fmtDur = (ms: number) => {
   const min = Math.max(1, Math.round(ms / 60_000));
-  return min < 60 ? `${min} mnt` : `${Math.floor(min / 60)} j ${min % 60} mnt`;
+  return min < 60 ? `${min} min` : `${Math.floor(min / 60)} h ${min % 60} min`;
 };
 
-const payLabel = (m: string | null) => (m === "WALLET" ? "Wallet" : m === "CASH" ? "Tunai" : "—");
+const payLabel = (m: string | null) => (m === "WALLET" ? "Wallet" : m === "CASH" ? "Cash" : "—");
 
 /**
  * Full-screen detail of a past (or current) ride, over the history list.
@@ -77,13 +77,13 @@ export function RideDetail({ ride: initial, role, api, commissionRate, onClose, 
   const commission = role === "driver" && completed && rate !== undefined ? commissionOf(fare, rate) : null;
 
   const steps: { label: string; at: number | null }[] = [
-    { label: "Dipesan", at: ride.requestedAt },
-    { label: "Driver ditemukan", at: ride.acceptedAt },
-    { label: "Driver tiba di titik jemput", at: ride.arrivedAt },
-    { label: "Perjalanan dimulai", at: ride.startedAt },
-    { label: "Selesai", at: ride.completedAt },
-    { label: "Dibatalkan", at: ride.cancelledAt },
-    { label: "Dibayar", at: ride.paidAt },
+    { label: "Ordered", at: ride.requestedAt },
+    { label: "Driver found", at: ride.acceptedAt },
+    { label: "Driver arrived at pickup", at: ride.arrivedAt },
+    { label: "Trip started", at: ride.startedAt },
+    { label: "Completed", at: ride.completedAt },
+    { label: "Cancelled", at: ride.cancelledAt },
+    { label: "Paid", at: ride.paidAt },
   ];
 
   const rate1 = async (stars: number) => {
@@ -106,9 +106,9 @@ export function RideDetail({ ride: initial, role, api, commissionRate, onClose, 
       <div className="navbar">
         <button type="button" className="plain back" onClick={onClose} data-testid="ride-detail-back">
           <span className="flip"><Icon name="chevron" size={18} /></span>
-          Riwayat
+          History
         </button>
-        <div className="navbar-title">Detail perjalanan</div>
+        <div className="navbar-title">Trip details</div>
         <span />
       </div>
       <div className="detail-body">
@@ -129,22 +129,22 @@ export function RideDetail({ ride: initial, role, api, commissionRate, onClose, 
           <div className="sub">{fmtDate(ride.requestedAt)} · {fmtTime(ride.requestedAt)} · #{ride.id.slice(-6).toUpperCase()}</div>
         </div>
 
-        <Section head="Rute">
+        <Section head="Route">
           <div className="cell">
             <span className="ic green"><Icon name="pin" /></span>
-            <div className="grow"><div className="sub">Jemput</div><div>{ride.pickup.label}</div></div>
+            <div className="grow"><div className="sub">Pickup</div><div>{ride.pickup.label}</div></div>
           </div>
           <div className="cell">
             <span className="ic red"><Icon name="pin" /></span>
-            <div className="grow"><div className="sub">Tujuan</div><div>{ride.dropoff.label}</div></div>
+            <div className="grow"><div className="sub">Destination</div><div>{ride.dropoff.label}</div></div>
           </div>
           <div className="cell">
-            <span className="grow">Jarak</span>
+            <span className="grow">Distance</span>
             <span className="value tnum">{fmtKm(ride.distanceM)}</span>
           </div>
           {ride.startedAt && ride.completedAt && (
             <div className="cell">
-              <span className="grow">Lama perjalanan</span>
+              <span className="grow">Trip duration</span>
               <span className="value tnum">{fmtDur(ride.completedAt - ride.startedAt)}</span>
             </div>
           )}
@@ -163,48 +163,48 @@ export function RideDetail({ ride: initial, role, api, commissionRate, onClose, 
           </Section>
         )}
 
-        <Section head={role === "driver" ? "Pendapatan" : "Pembayaran"}>
+        <Section head={role === "driver" ? "Earnings" : "Payment"}>
           <div className="cell">
-            <span className="grow">Tarif</span>
+            <span className="grow">Fare</span>
             <span className="tnum" data-testid="ride-detail-fare">{fmtRp(fare)}</span>
           </div>
           <div className="cell">
-            <span className="grow">Metode</span>
+            <span className="grow">Method</span>
             <span className="value">
               {payLabel(ride.paymentMethod)}
-              {ride.paidVia && ride.paidVia !== ride.paymentMethod && ` → dibayar ${payLabel(ride.paidVia).toLowerCase()}`}
+              {ride.paidVia && ride.paidVia !== ride.paymentMethod && ` → paid ${payLabel(ride.paidVia).toLowerCase()}`}
             </span>
           </div>
           {commission !== null && (
             <>
               <div className="cell">
-                <span className="grow">Komisi platform ({Math.round(rate! * 100)}%)</span>
+                <span className="grow">Platform commission ({Math.round(rate! * 100)}%)</span>
                 <span className="tnum">−{fmtRp(commission)}</span>
               </div>
               <div className="cell">
-                <span className="grow" style={{ fontWeight: 600 }}>Pendapatan bersih</span>
+                <span className="grow" style={{ fontWeight: 600 }}>Net earnings</span>
                 <b className="tnum pos" data-testid="ride-detail-net">{fmtRp(fare - commission)}</b>
               </div>
             </>
           )}
           {completed && !ride.paidAt && (
-            <div className="cell"><span className="muted">Pembayaran sedang diproses…</span></div>
+            <div className="cell"><span className="muted">Payment processing…</span></div>
           )}
         </Section>
         {role === "driver" && completed && ride.paidVia === "CASH" && commission !== null && (
           <div className="section-foot" style={{ marginTop: -14 }}>
-            Tunai {fmtRp(fare)} diterima langsung dari customer; komisi {fmtRp(commission)} dipotong dari wallet.
+            Cash {fmtRp(fare)} received directly from the customer; commission {fmtRp(commission)} taken from the wallet.
           </div>
         )}
 
         {ride.status === "CANCELLED" && (
-          <Section head="Pembatalan">
+          <Section head="Cancellation">
             <div className="cell">
-              <span className="grow">Oleh</span>
+              <span className="grow">By</span>
               <span className="value">{ride.cancelledBy ? CANCELLED_BY[ride.cancelledBy] ?? ride.cancelledBy : "—"}</span>
             </div>
             <div className="cell">
-              <span className="grow">Alasan</span>
+              <span className="grow">Reason</span>
               <span className="value" style={{ textAlign: "right" }}>
                 {ride.cancelReason ? CANCEL_REASON[ride.cancelReason] ?? ride.cancelReason : "—"}
               </span>
@@ -212,7 +212,7 @@ export function RideDetail({ ride: initial, role, api, commissionRate, onClose, 
           </Section>
         )}
 
-        <Section head="Riwayat status">
+        <Section head="Status history">
           <ul className="list timeline">
             {steps.filter((s) => s.at !== null).map((s) => (
               <li key={s.label} className="cell">
@@ -227,13 +227,13 @@ export function RideDetail({ ride: initial, role, api, commissionRate, onClose, 
         {completed && (
           <Section head="Rating" foot={err ?? undefined}>
             <div className="cell" style={{ flexDirection: "column", gap: 4, paddingBlock: 14 }}>
-              {role === "customer" && !ride.rating && <span className="muted">Beri rating untuk perjalanan ini</span>}
-              {role === "driver" && !ride.rating && <span className="muted">Customer belum memberi rating</span>}
+              {role === "customer" && !ride.rating && <span className="muted">Rate this trip</span>}
+              {role === "driver" && !ride.rating && <span className="muted">Customer hasn't rated yet</span>}
               {(ride.rating || role === "customer") && (
                 <div className="stars" data-testid="ride-detail-rating" data-rating={ride.rating ?? 0}>
                   {[1, 2, 3, 4, 5].map((n) =>
                     role === "customer" && !ride.rating ? (
-                      <button key={n} data-testid={`detail-star-${n}`} aria-label={`${n} bintang`} disabled={rating} onClick={() => rate1(n)}>☆</button>
+                      <button key={n} data-testid={`detail-star-${n}`} aria-label={`${n} stars`} disabled={rating} onClick={() => rate1(n)}>☆</button>
                     ) : (
                       <span key={n}>{n <= (ride.rating ?? 0) ? "★" : "☆"}</span>
                     ),

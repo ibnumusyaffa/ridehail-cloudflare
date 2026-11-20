@@ -72,52 +72,52 @@ try {
   say("Login");
   await Promise.all([
     login(customer, URLS.customer, { phone: phone("0812"), name: "Siti (customer)" }),
-    login(driver, URLS.driver, { phone: phone("0899"), name: "Pak Budi (driver)" }),
+    login(driver, URLS.driver, { phone: phone("0899"), name: "Budi (driver)" }),
   ]);
 
   say("Customer tops up wallet");
-  await both("Customer top-up wallet Rp100.000");
+  await both("Customer tops up the wallet: Rp100,000");
   await topup(customer, 100_000);
   await pause();
 
   say("Driver goes online near the pickup");
-  await both("Driver online di dekat titik jemput");
+  await both("Driver goes online near the pickup");
   await driverOnlineNear(driver, trip);
   await pause();
 
   say("Customer orders a ride (wallet)");
-  await both("Customer pilih rute & pesan (bayar pakai wallet)");
+  await both("Customer picks a route and orders (paid by wallet)");
   await customerOrder(customer, trip, "WALLET");
   await pause(2500);
 
   say("Driver gets the offer and accepts");
-  await both("Driver dapat tawaran (15 detik) → Terima");
+  await both("Driver gets an offer (15 s) → Accept");
   await expect(driver.getByTestId("offer")).toBeVisible({ timeout: 15_000 });
   await pause(3000);
   await driverAcceptOffer(driver);
 
   say("Driver drives to pickup (autopilot) — watch the marker on the customer map");
-  await both("Driver menuju titik jemput — lihat 🛵 bergerak di peta customer");
+  await both("Driver heads to the pickup: watch 🛵 move on the customer's map");
   await driverReachTarget(driver, 15 * 60_000);
   await driver.getByTestId("ride-arrived").click();
   await expect(rideStatus(customer)).toHaveAttribute("data-status", "ARRIVED");
-  await both("Driver tiba → mulai perjalanan");
+  await both("Driver arrives → starts the trip");
   await pause(2500);
   await driver.getByTestId("ride-start").click();
 
   say("On trip");
-  await both("Dalam perjalanan ke tujuan");
+  await both("On the way to the destination");
   await driverReachTarget(driver, 15 * 60_000);
   await driver.getByTestId("ride-complete").click();
   await expect(customer.getByTestId("paid-summary")).toHaveAttribute("data-paid-via", "WALLET");
 
   say("Completed & paid — customer rates 5 stars");
-  await both("Selesai: saldo customer terpotong, driver dapat pendapatan − komisi");
+  await both("Done: customer charged, driver earns the fare minus commission");
   await pause(2500);
   await customer.getByTestId("star-5").click();
   await customer.getByTestId("tab-wallet").click();
   await driver.getByTestId("tab-wallet").click();
-  await both("Wallet kedua sisi");
+  await both("Both wallets");
   await pause(4000);
   say("Done.");
 } catch (e) {

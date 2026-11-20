@@ -40,18 +40,18 @@ export function App() {
 
 type Tab = "drive" | "earnings" | "wallet" | "account";
 const TABS: TabSpec<Tab>[] = [
-  { id: "drive", label: "Kemudi", icon: "wheel" },
-  { id: "earnings", label: "Pendapatan", icon: "chart" },
+  { id: "drive", label: "Drive", icon: "wheel" },
+  { id: "earnings", label: "Earnings", icon: "chart" },
   { id: "wallet", label: "Wallet", icon: "wallet" },
-  { id: "account", label: "Akun", icon: "person" },
+  { id: "account", label: "Account", icon: "person" },
 ];
 const ARRIVE_M = 25;
 
 const STATUS_TEXT: Record<DriverStatus, string> = {
   OFFLINE: "Offline",
-  AVAILABLE: "Online · menunggu order",
-  RESERVED: "Ada tawaran!",
-  ON_RIDE: "Sedang mengantar",
+  AVAILABLE: "Online · waiting for orders",
+  RESERVED: "New offer!",
+  ON_RIDE: "On a ride",
 };
 
 function Driver({ session, onLogout }: { session: Session; onLogout: () => void }) {
@@ -66,7 +66,7 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
   const [pos, setPosStored] = useStored<LatLng>("pos", nearPickup(PRESET_TRIPS[0]!));
   const [wantOnline, setWantOnline] = useStored<boolean>("wantOnline", false);
   const [autopilot, setAutopilot] = useStored<boolean>("autopilot", true);
-  const [speed, setSpeed] = useStored<number>("speed", 25);
+  const [speed, setSpeed] = useStored<number>("speed", 150);
   const [status, setStatus] = useState<DriverStatus>("OFFLINE");
   const [offer, setOffer] = useState<OfferPayload | null>(null);
   const [ride, setRide] = useState<RideView | null>(null);
@@ -132,16 +132,16 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
             break;
           case "offer.cancelled":
             setOffer(null);
-            flash(m.reason === "TIMEOUT" ? "Tawaran kedaluwarsa" : "Order dibatalkan customer");
+            flash(m.reason === "TIMEOUT" ? "Offer expired" : "Order cancelled by the customer");
             break;
           case "ride.status":
             setOffer((o) => (o?.rideId === m.rideId ? null : o));
             setRide(m.ride);
-            if (m.status === "CANCELLED") flash("Ride dibatalkan");
+            if (m.status === "CANCELLED") flash("Ride cancelled");
             break;
           case "ride.paid":
             setLastPaid({ fare: m.fare, paidVia: m.paidVia, balance: m.balance });
-            flash(`Ride selesai · ${m.paidVia === "WALLET" ? "via wallet" : "tunai"} · saldo ${fmtRp(m.balance)}`);
+            flash(`Ride completed · ${m.paidVia === "WALLET" ? "via wallet" : "cash"} · balance ${fmtRp(m.balance)}`);
             break;
           case "error":
             flash(`${m.code}: ${m.message}`);
@@ -221,7 +221,7 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
       kind: "me",
       ...pos,
       draggable: !onRide || !autopilot,
-      title: "Posisi saya (geser)",
+      title: "My position (drag)",
       onDragEnd: (p) => {
         setPos(p);
         sendLoc();
@@ -282,10 +282,10 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
                   <button className={`big ${wantOnline ? "danger" : "primary"}`} onClick={toggleOnline} data-testid="online-toggle" data-online={wantOnline}>
                     {wantOnline ? "Go offline" : "Go online"}
                   </button>
-                  <Section foot="Atau klik peta / geser 🛵 untuk pindah posisi.">
+                  <Section foot="Or tap the map / drag 🛵 to move.">
                     <label className="cell inset">
                       <span className="ic blue"><Icon name="pin" /></span>
-                      <span>Pindah ke dekat</span>
+                      <span>Move near</span>
                       <select
                         data-testid="spawn"
                         value=""
@@ -294,14 +294,14 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
                           if (t) (setPos(nearPickup(t)), sendLoc());
                         }}
                       >
-                        <option value="">Pilih…</option>
+                        <option value="">Choose…</option>
                         {PRESET_TRIPS.map((t) => <option key={t.id} value={t.id}>{t.pickup.label}</option>)}
                       </select>
                       <span className="chev"><Icon name="chevron" size={14} /></span>
                     </label>
                     <div className="cell inset">
                       <span className="ic gray"><Icon name="bolt" /></span>
-                      <span className="grow">Koordinat</span>
+                      <span className="grow">Coordinates</span>
                       <span className="value tnum small">{pos.lat.toFixed(5)}, {pos.lng.toFixed(5)}</span>
                     </div>
                   </Section>
@@ -310,8 +310,8 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
                       <div className="cell" data-testid="last-paid">
                         <span className="ic green">✓</span>
                         <div className="grow">
-                          <div>Ride terakhir {fmtRp(lastPaid.fare)} ({lastPaid.paidVia === "WALLET" ? "wallet" : "tunai"})</div>
-                          <div className="sub">Saldo <b className={lastPaid.balance < 0 ? "neg" : ""}>{fmtRp(lastPaid.balance)}</b></div>
+                          <div>Last ride {fmtRp(lastPaid.fare)} ({lastPaid.paidVia === "WALLET" ? "wallet" : "cash"})</div>
+                          <div className="sub">Balance <b className={lastPaid.balance < 0 ? "neg" : ""}>{fmtRp(lastPaid.balance)}</b></div>
                         </div>
                       </div>
                     </div>
@@ -324,15 +324,15 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
                   <div className="row between" style={{ gap: 12 }}>
                     <div>
                       <span className="status" data-testid="driver-ride-status" data-status={ride.status}>
-                        {ride.status === "ACCEPTED" ? "Menuju jemput" : ride.status === "ARRIVED" ? "Menunggu customer" : "Antar ke tujuan"}
+                        {ride.status === "ACCEPTED" ? "Heading to pickup" : ride.status === "ARRIVED" ? "Waiting for customer" : "Heading to destination"}
                       </span>
                       {remaining !== null && (
                         <p className="muted" data-testid="nav" data-remaining={Math.round(remaining)} data-at-target={atTarget}>
-                          {atTarget ? "✅ Sudah sampai" : `Sisa ${fmtKm(remaining)}${path.length > 1 ? " via jalan" : ""}`}
+                          {atTarget ? "✅ You've arrived" : `${fmtKm(remaining)} left${path.length > 1 ? " by road" : ""}`}
                         </p>
                       )}
                     </div>
-                    <span className="pill tnum">{fmtRp(ride.fare)} · {ride.paymentMethod === "CASH" ? "Tunai" : "Wallet"}</span>
+                    <span className="pill tnum">{fmtRp(ride.fare)} · {ride.paymentMethod === "CASH" ? "Cash" : "Wallet"}</span>
                   </div>
                   <div className="group">
                     <div className="cell inset">
@@ -352,37 +352,37 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
                     </label>
                     <div className="cell inset">
                       <span className="ic orange"><Icon name="bolt" /></span>
-                      <input type="range" min={5} max={150} value={speed} onChange={(e) => setSpeed(Number(e.target.value))} data-testid="speed" aria-label="Kecepatan" />
+                      <input type="range" min={5} max={150} value={speed} onChange={(e) => setSpeed(Number(e.target.value))} data-testid="speed" aria-label="Speed" />
                       <span className="value tnum small" style={{ width: 56, textAlign: "right" }}>{speed} m/s</span>
                     </div>
                   </div>
                   {ride.status === "ACCEPTED" && (
-                    <button className="primary big" onClick={() => rideAction("ride.arrived")} data-testid="ride-arrived">Sudah tiba</button>
+                    <button className="primary big" onClick={() => rideAction("ride.arrived")} data-testid="ride-arrived">Arrived</button>
                   )}
                   {ride.status === "ARRIVED" && (
-                    <button className="primary big" onClick={() => rideAction("ride.start")} data-testid="ride-start">Mulai perjalanan</button>
+                    <button className="primary big" onClick={() => rideAction("ride.start")} data-testid="ride-start">Start trip</button>
                   )}
                   {ride.status === "ON_TRIP" && (
-                    <button className="primary big" onClick={() => rideAction("ride.complete")} data-testid="ride-complete">Selesaikan</button>
+                    <button className="primary big" onClick={() => rideAction("ride.complete")} data-testid="ride-complete">Complete trip</button>
                   )}
                   {(ride.status === "ACCEPTED" || ride.status === "ARRIVED") && (
                     <button
                       className="danger big"
                       data-testid="ride-cancel"
                       onClick={async () => {
-                        const reason = prompt("Alasan batal?", "Kendaraan bermasalah");
+                        const reason = prompt("Reason for cancelling?", "Vehicle trouble");
                         if (!reason) return;
                         try {
                           // the ride is not ours anymore: it goes back to the search for another driver
                           await api.cancel(ride.id, reason);
                           setRide(null);
-                          flash("Ride dilepas, dicarikan driver lain");
+                          flash("Ride released, finding another driver");
                         } catch (e) {
                           flash((e as Error).message);
                         }
                       }}
                     >
-                      Batalkan (dengan alasan)
+                      Cancel ride (with reason)
                     </button>
                   )}
                 </div>
@@ -393,8 +393,8 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
               <div className="offer">
                 <div className="card" data-testid="offer" data-ride-id={offer.rideId}>
                   <div className="row between">
-                    <h3 className="title2">Order baru</h3>
-                    <span className="pill tnum" data-testid="offer-countdown">{Math.max(0, Math.ceil((offer.expiresAt - now) / 1000))} dtk</span>
+                    <h3 className="title2">New order</h3>
+                    <span className="pill tnum" data-testid="offer-countdown">{Math.max(0, Math.ceil((offer.expiresAt - now) / 1000))} s</span>
                   </div>
                   <div className="countdown">
                     <div style={{ width: `${Math.max(0, Math.min(100, ((offer.expiresAt - now) / 15_000) * 100))}%` }} />
@@ -404,28 +404,28 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
                       <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin pick" /></span>
                       <div className="grow">
                         <div>{offer.pickup.label}</div>
-                        <div className="sub">{fmtKm(haversineM(pos, offer.pickup))} dari kamu</div>
+                        <div className="sub">{fmtKm(haversineM(pos, offer.pickup))} away</div>
                       </div>
                     </div>
                     <div className="cell inset">
                       <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin drop" /></span>
                       <div className="grow">
                         <div>{offer.dropoff.label}</div>
-                        <div className="sub">Perjalanan {fmtKm(offer.distanceM)}</div>
+                        <div className="sub">Trip {fmtKm(offer.distanceM)}</div>
                       </div>
                     </div>
                     <div className="cell inset">
                       <span className="ic green"><Icon name="wallet" /></span>
-                      <span className="grow">{offer.paymentMethod === "CASH" ? "Tunai" : "Wallet"}</span>
+                      <span className="grow">{offer.paymentMethod === "CASH" ? "Cash" : "Wallet"}</span>
                       <strong className="title3 tnum">{fmtRp(offer.fare)}</strong>
                     </div>
                   </div>
                   <div className="grid2">
                     <button className="big" data-testid="offer-reject" onClick={() => (sockRef.current?.send({ t: "offer.reject", rideId: offer.rideId }), setOffer(null))}>
-                      Tolak
+                      Decline
                     </button>
                     <button className="primary big" data-testid="offer-accept" onClick={() => sockRef.current?.send({ t: "offer.accept", rideId: offer.rideId })}>
-                      Terima
+                      Accept
                     </button>
                   </div>
                 </div>
@@ -444,7 +444,7 @@ function Driver({ session, onLogout }: { session: Session; onLogout: () => void 
   );
 }
 
-const HIST_STATUS: Record<string, string> = { COMPLETED: "Selesai", CANCELLED: "Dibatalkan", NO_DRIVER: "Tidak ada driver" };
+const HIST_STATUS: Record<string, string> = { COMPLETED: "Completed", CANCELLED: "Cancelled", NO_DRIVER: "No driver" };
 
 function Earnings({ api, refreshKey }: { api: ApiClient; refreshKey: unknown }) {
   const [data, setData] = useState<Awaited<ReturnType<ApiClient["rides"]>> | null>(null);
@@ -453,17 +453,17 @@ function Earnings({ api, refreshKey }: { api: ApiClient; refreshKey: unknown }) 
     api.rides().then(setData).catch(() => {});
   }, [api, refreshKey]);
   return (
-    <Page title="Pendapatan">
+    <Page title="Earnings">
       <section className="section">
-        <div className="section-head">Hari ini</div>
+        <div className="section-head">Today</div>
         <div className="grid2">
           <div className="stat"><span className="muted small">Ride</span><b className="tnum" data-testid="today-count">{data?.today?.count ?? 0}</b></div>
-          <div className="stat"><span className="muted small">Bersih</span><b className="tnum">{fmtRp(data?.today?.net ?? 0)}</b></div>
+          <div className="stat"><span className="muted small">Net</span><b className="tnum">{fmtRp(data?.today?.net ?? 0)}</b></div>
         </div>
       </section>
-      <Section head="Riwayat">
+      <Section head="History">
         <ul className="list" data-testid="history">
-          {data?.rides.length === 0 && <li className="cell muted">Belum ada ride</li>}
+          {data?.rides.length === 0 && <li className="cell muted">No rides yet</li>}
           {data?.rides.map((r) => (
             <li key={r.id}>
               <button className="cell inset" onClick={() => setOpen(r)} data-testid={`history-item-${r.id}`}>

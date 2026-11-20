@@ -15,7 +15,7 @@ const BBOX = env.VITE_GEOCODER_BBOX;
 
 /** Named places the simulator already knows (preset pickups and dropoffs), deduped by label. */
 const KNOWN: PlaceHit[] = [
-  ...new Map(PRESET_TRIPS.flatMap((t) => [t.pickup, t.dropoff]).map((p) => [p.label, { ...p, sub: "Tempat populer", source: "preset" as const }])).values(),
+  ...new Map(PRESET_TRIPS.flatMap((t) => [t.pickup, t.dropoff]).map((p) => [p.label, { ...p, sub: "Popular place", source: "preset" as const }])).values(),
 ];
 
 const norm = (s: string) => s.toLowerCase().normalize("NFKD").replace(/[^\p{L}\p{N} ]/gu, "");
@@ -34,7 +34,7 @@ function toHit(f: PhotonFeature): PlaceHit {
   const p = f.properties;
   const [lng, lat] = f.geometry.coordinates;
   const street = [p.street, p.housenumber].filter(Boolean).join(" ");
-  const label = p.name ?? (street || p.district || p.city || "Lokasi");
+  const label = p.name ?? (street || p.district || p.city || "Location");
   const sub = [...new Set([p.name ? street : "", p.district, p.city ?? p.county].filter((s): s is string => !!s && s !== label))].join(", ");
   return { lat, lng, label, sub: sub || undefined, source: "photon" };
 }

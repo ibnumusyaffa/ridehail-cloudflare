@@ -60,7 +60,7 @@ test("customer cancels while driver is being offered", async ({ browser }) => {
   await customer.getByTestId("cancel-button").click();
   await expect(rideStatus(customer)).toHaveAttribute("data-status", "CANCELLED");
   await expect(driver.getByTestId("offer")).toBeHidden();
-  await expect(driver.getByTestId("toast")).toContainText("dibatalkan");
+  await expect(driver.getByTestId("toast")).toContainText("cancelled");
 });
 
 test("driver reloads mid-ride and resumes", async ({ browser }) => {
@@ -123,7 +123,7 @@ test.describe("lost replies (outage on the way back)", () => {
     // a different trip gets a new key: the server refuses it (one active ride), the app shows the first one
     await customerOrder(customer, "gbk-blokm", "CASH");
     await expect(rideStatus(customer)).toHaveAttribute("data-status", /REQUESTED|OFFERING|NO_DRIVER/);
-    await expect(customer.getByTestId("toast")).toContainText("sudah masuk");
+    await expect(customer.getByTestId("toast")).toContainText("already went through");
     expect(await myRides(customer)).toBe(1);
   });
 

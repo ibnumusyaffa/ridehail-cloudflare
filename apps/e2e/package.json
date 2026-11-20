@@ -8,6 +8,7 @@
     "e2e:headed": "playwright test --headed",
     "demo:live": "tsx src/live.ts",
     "demo:record": "tsx src/live.ts --record",
+    "demo:video": "tsx src/video.ts",
     "typecheck": "tsc -p ."
   },
   "devDependencies": {

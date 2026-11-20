@@ -7,7 +7,7 @@ import { getRoute, type Route } from "../route";
 
 export const fmtRp = (n: number) => `Rp${Math.round(n).toLocaleString("id-ID")}`;
 export const fmtKm = (m: number) => (m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`);
-export const fmtTime = (t: number) => new Date(t).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" });
+export const fmtTime = (t: number) => new Date(t).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
 
 export function useStored<T>(key: string, init: T): [T, (v: T) => void] {
   const [v, setV] = useState<T>(() => {
@@ -70,7 +70,7 @@ function StatusBar() {
   }, []);
   return (
     <div className="statusbar">
-      <span className="tnum">{now.toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" }).replace(".", ":")}</span>
+      <span className="tnum">{now.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }).replace(".", ":")}</span>
       <span className="sb-icons">
         <svg width="18" height="12" viewBox="0 0 18 12" fill="currentColor" aria-hidden>
           <rect x="0" y="8" width="3" height="4" rx="1" /><rect x="5" y="5.5" width="3" height="6.5" rx="1" /><rect x="10" y="3" width="3" height="9" rx="1" /><rect x="15" y="0" width="3" height="12" rx="1" />
@@ -170,32 +170,32 @@ export function LoginForm({ role, onLogin, defaultPhone }: { role: Role; default
       }}
     >
       <div className="app-icon"><Icon name={role === "driver" ? "wheel" : "car"} /></div>
-      <h2>Masuk sebagai {role === "driver" ? "Driver" : "Customer"}</h2>
+      <h2>Sign in as {role === "driver" ? "Driver" : "Customer"}</h2>
       <p className="lead">RideSim — simulator ride-hailing</p>
-      <Section foot="POC: tanpa OTP. Nomor baru otomatis terdaftar.">
+      <Section foot="POC: no OTP. New numbers sign up automatically.">
         <label className="cell">
-          <span>Nomor HP</span>
+          <span>Phone number</span>
           <input data-testid="login-phone" value={phone} onChange={(e) => setPhone(e.target.value)} inputMode="tel" required />
         </label>
         <label className="cell">
-          <span>Nama</span>
-          <input data-testid="login-name" value={name} onChange={(e) => setName(e.target.value)} placeholder={role === "driver" ? "Pak Budi (opsional)" : "Siti (opsional)"} />
+          <span>Name</span>
+          <input data-testid="login-name" value={name} onChange={(e) => setName(e.target.value)} placeholder={role === "driver" ? "Budi (optional)" : "Siti (optional)"} />
         </label>
       </Section>
       {err && <p className="err" style={{ textAlign: "center" }}>{err}</p>}
       <button className="primary big" data-testid="login-submit" disabled={busy}>
-        {busy ? "Masuk…" : "Lanjut"}
+        {busy ? "Signing in…" : "Continue"}
       </button>
     </form>
   );
 }
 
 const TX_LABEL: Record<string, string> = {
-  TOPUP: "Top-up",
-  RIDE_PAYMENT: "Bayar ride",
-  RIDE_EARNING: "Pendapatan ride",
-  COMMISSION: "Komisi platform",
-  ADJUSTMENT: "Penyesuaian",
+  TOPUP: "Top up",
+  RIDE_PAYMENT: "Ride payment",
+  RIDE_EARNING: "Ride earnings",
+  COMMISSION: "Platform commission",
+  ADJUSTMENT: "Adjustment",
 };
 
 export function WalletPanel({ api, refreshKey }: { api: ApiClient; refreshKey?: unknown }) {
@@ -223,7 +223,7 @@ export function WalletPanel({ api, refreshKey }: { api: ApiClient; refreshKey?: 
     <>
       <div className="balance-card">
         <div>
-          <div className="small" style={{ opacity: 0.85 }}>Saldo</div>
+          <div className="small" style={{ opacity: 0.85 }}>Balance</div>
           <div data-testid="wallet-balance" className={`amount tnum${balance !== null && balance < 0 ? " neg" : ""}`}>
             {balance === null ? "…" : fmtRp(balance)}
           </div>
@@ -236,9 +236,9 @@ export function WalletPanel({ api, refreshKey }: { api: ApiClient; refreshKey?: 
           ))}
         </div>
       </div>
-      <Section head="Transaksi">
+      <Section head="Transactions">
         <ul className="list">
-          {txs.length === 0 && <li className="cell muted">Belum ada transaksi</li>}
+          {txs.length === 0 && <li className="cell muted">No transactions yet</li>}
           {txs.map((t) => (
             <li key={t.id} className="cell">
               <div className="grow">
@@ -264,30 +264,30 @@ export function ResetButton({ api, onDone, className = "cell destructive" }: { a
     <button
       className={className}
       data-testid="reset-sim"
-      title="Hapus semua data simulator (user, ride, wallet)"
+      title="Delete all simulator data (users, rides, wallets)"
       disabled={busy}
       onClick={async () => {
-        if (!confirm("Reset simulator? Semua user, ride, dan wallet dihapus.")) return;
+        if (!confirm("Reset the simulator? All users, rides and wallets will be deleted.")) return;
         setBusy(true);
         try {
           await api.devReset();
           onDone();
         } catch (e) {
-          alert(`Reset gagal: ${(e as Error).message}\nPastikan API jalan dengan DEV_RESET=1 (.dev.vars).`);
+          alert(`Reset failed: ${(e as Error).message}\nMake sure the API runs with DEV_RESET=1 (.dev.vars).`);
         } finally {
           setBusy(false);
         }
       }}
     >
-      {busy ? "Mereset…" : "Reset simulator"}
+      {busy ? "Resetting…" : "Reset simulator"}
     </button>
   );
 }
 
-/** "Akun" tab: who is signed in, dev reset, sign out. */
+/** "Account" tab: who is signed in, dev reset, sign out. */
 export function AccountPage({ user, role, api, onLogout, extra }: { user: { name: string; phone: string }; role: Role; api: ApiClient; onLogout: () => void; extra?: React.ReactNode }) {
   return (
-    <Page title="Akun">
+    <Page title="Account">
       <Section>
         <div className="cell" style={{ padding: "14px 16px" }}>
           <div className="avatar lg">{initials(user.name)}</div>
@@ -298,11 +298,11 @@ export function AccountPage({ user, role, api, onLogout, extra }: { user: { name
         </div>
       </Section>
       {extra}
-      <Section head="Developer" foot="Menghapus semua user, ride, dan wallet. Kedua simulator otomatis keluar.">
+      <Section head="Developer" foot="Deletes all users, rides and wallets. Both simulators sign out automatically.">
         <ResetButton api={api} onDone={wipeLocalAndReload} />
       </Section>
       <Section>
-        <button className="cell destructive" onClick={onLogout} data-testid="logout">Keluar</button>
+        <button className="cell destructive" onClick={onLogout} data-testid="logout">Sign out</button>
       </Section>
     </Page>
   );
@@ -393,7 +393,7 @@ export function Sheet({ children, expandKey }: { children: React.ReactNode; expa
       <button
         type="button"
         className="sheet-grabber"
-        aria-label={collapsed ? "Perbesar panel" : "Perkecil panel"}
+        aria-label={collapsed ? "Expand panel" : "Collapse panel"}
         aria-expanded={!collapsed}
         data-testid="sheet-grabber"
         onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setCollapsed(!collapsed))}
@@ -444,29 +444,29 @@ export function PlaceSearch({ title, near, onPick, onMap, onClose }: {
             value={q}
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && hits[0] && onPick(hits[0])}
-            placeholder="Cari alamat atau tempat"
+            placeholder="Search for an address or place"
             enterKeyHint="search"
             autoComplete="off"
           />
           {q && (
-            <button type="button" className="search-clear" aria-label="Hapus" onClick={() => (setQ(""), input.current?.focus())}>
+            <button type="button" className="search-clear" aria-label="Clear" onClick={() => (setQ(""), input.current?.focus())}>
               <Icon name="xmark" size={12} />
             </button>
           )}
         </label>
-        <button type="button" className="plain" onClick={onClose}>Batal</button>
+        <button type="button" className="plain" onClick={onClose}>Cancel</button>
       </div>
       <div className="search-results">
         <Section>
           <button className="cell inset" onClick={onMap} data-testid="place-search-map">
             <span className="ic blue"><Icon name="map" /></span>
-            <span className="grow">Pilih di peta</span>
+            <span className="grow">Choose on map</span>
             <span className="chev"><Icon name="chevron" size={14} /></span>
           </button>
         </Section>
-        <Section head={q.trim() ? (loading ? "Mencari…" : "Hasil") : "Tempat populer"}>
+        <Section head={q.trim() ? (loading ? "Searching…" : "Results") : "Popular places"}>
           <ul className="list" data-testid="place-search-results">
-            {!loading && hits.length === 0 && <li className="cell muted">Tidak ditemukan. Coba kata lain atau pilih di peta.</li>}
+            {!loading && hits.length === 0 && <li className="cell muted">Nothing found. Try other words or choose on the map.</li>}
             {hits.map((h, i) => (
               <li key={`${h.lat},${h.lng},${i}`}>
                 <button className="cell inset" onClick={() => onPick(h)}>

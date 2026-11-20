@@ -42,20 +42,20 @@ export function App() {
 type Tab = "ride" | "history" | "wallet" | "account";
 const TABS: TabSpec<Tab>[] = [
   { id: "ride", label: "Ride", icon: "car" },
-  { id: "history", label: "Riwayat", icon: "clock" },
+  { id: "history", label: "History", icon: "clock" },
   { id: "wallet", label: "Wallet", icon: "wallet" },
-  { id: "account", label: "Akun", icon: "person" },
+  { id: "account", label: "Account", icon: "person" },
 ];
 
 const STATUS_TEXT: Record<string, string> = {
-  REQUESTED: "Mencari driver…",
-  OFFERING: "Mencari driver…",
-  ACCEPTED: "Driver menuju lokasi jemput",
-  ARRIVED: "Driver sudah tiba",
-  ON_TRIP: "Dalam perjalanan",
-  COMPLETED: "Perjalanan selesai",
-  CANCELLED: "Pesanan dibatalkan",
-  NO_DRIVER: "Driver tidak ditemukan",
+  REQUESTED: "Searching for a driver…",
+  OFFERING: "Searching for a driver…",
+  ACCEPTED: "Driver is on the way",
+  ARRIVED: "Driver has arrived",
+  ON_TRIP: "On the trip",
+  COMPLETED: "Trip completed",
+  CANCELLED: "Order cancelled",
+  NO_DRIVER: "No driver found",
 };
 
 function Customer({ session, onLogout }: { session: Session; onLogout: () => void }) {
@@ -88,7 +88,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
   const [busy, setBusy] = useState(false);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   /**
-   * Idempotency-Key of the order being placed: kept across presses of "Pesan" until one succeeds, so a
+   * Idempotency-Key of the order being placed: kept across presses of "Order" until one succeeds, so a
    * press after a lost reply gets that ride back instead of ordering again. A new trip gets a new key.
    */
   const orderKey = useRef<string | null>(null);
@@ -131,7 +131,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
             if (m.rideId !== rideId) break;
             setRide(m.ride);
             if (m.status !== "ON_TRIP") setLost(null);
-            if (m.status === "ACCEPTED") flash(`Driver ditemukan: ${m.driver?.name}`);
+            if (m.status === "ACCEPTED") flash(`Driver found: ${m.driver?.name}`);
             break;
           case "driver.loc":
             if (m.rideId === rideId) setDriverPos({ lat: m.lat, lng: m.lng });
@@ -142,13 +142,13 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
           case "ride.requeued":
             if (m.rideId === rideId) {
               setDriverPos(null);
-              flash("Driver membatalkan, mencari driver lain…");
+              flash("Driver cancelled, searching for another driver…");
             }
             break;
           case "ride.driver_back":
             if (m.rideId === rideId) {
               setLost(null);
-              flash("Driver terhubung kembali");
+              flash("Driver reconnected");
             }
             break;
           case "ride.paid":
@@ -182,8 +182,8 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
   // map focus per phase: before order = whole trip; pickup phase = driver → pickup only; on trip = → destination only
   const phase = ride?.status === "ACCEPTED" || ride?.status === "ARRIVED" ? "pickup" : ride?.status === "ON_TRIP" ? "trip" : "plan";
   const markers: MapMarker[] = [];
-  if (P && phase !== "trip") markers.push({ id: "pickup", kind: "pickup", ...P, title: "Jemput" });
-  if (D && phase !== "pickup") markers.push({ id: "dropoff", kind: "dropoff", ...D, title: "Tujuan" });
+  if (P && phase !== "trip") markers.push({ id: "pickup", kind: "pickup", ...P, title: "Pickup" });
+  if (D && phase !== "pickup") markers.push({ id: "dropoff", kind: "dropoff", ...D, title: "Destination" });
   if (driverPos && ride && ["ACCEPTED", "ARRIVED", "ON_TRIP"].includes(ride.status))
     markers.push({ id: "driver", kind: "driver", ...driverPos, title: ride.driver?.name });
 
@@ -239,7 +239,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
       const active = e instanceof ApiError && e.code === "ACTIVE_RIDE_EXISTS" ? await api.activeRide().catch(() => null) : null;
       if (active?.ride) {
         show(active.ride);
-        flash("Pesanan sebelumnya ternyata sudah masuk");
+        flash("Your earlier order already went through");
       } else flash((e as Error).message);
     } finally {
       setBusy(false);
@@ -289,15 +289,15 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
               fitPoints={fitPoints}
               onClick={active ? undefined : (p) => {
                 if (pickMode === "pickup") {
-                  setPoint("pickup", { ...p, label: "Titik jemput" }, false);
+                  setPoint("pickup", { ...p, label: "Pickup point" }, false);
                   setPickMode("dropoff");
-                } else setPoint("dropoff", { ...p, label: "Tujuan" }, false);
+                } else setPoint("dropoff", { ...p, label: "Destination" }, false);
               }}
             />
             <div className="float-top">
               <span className="chip">
                 {rideId ? <ConnDot state={sock} /> : <Icon name="pin" size={16} />}
-                {ride ? STATUS_TEXT[ride.status] : `Klik peta: ${pickMode === "pickup" ? "jemput" : "tujuan"}`}
+                {ride ? STATUS_TEXT[ride.status] : `Tap the map: ${pickMode === "pickup" ? "pickup" : "destination"}`}
               </span>
             </div>
             <Sheet expandKey={ride ? `${ride.id}:${ride.status}` : "plan"}>
@@ -305,8 +305,8 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                 <div className="card" data-testid="order-card">
                   <div className="row between order-head">
                     <div className="grow">
-                      <p className="hello">Halo, {session.user.name.split(" ")[0]}</p>
-                      <h2 className="title2">Mau ke mana?</h2>
+                      <p className="hello">Hi, {session.user.name.split(" ")[0]}</p>
+                      <h2 className="title2">Where to?</h2>
                     </div>
                     <span className="pill tnum"><Icon name="wallet" size={14} /><b data-testid="balance">{balance === null ? "…" : fmtRp(balance)}</b></span>
                   </div>
@@ -314,22 +314,22 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                     <button className="cell inset" aria-pressed={pickMode === "pickup"} onClick={() => (setPickMode("pickup"), setSearchFor("pickup"))} data-testid="pick-pickup">
                       <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin pick" /></span>
                       <span className="grow">
-                        <span className="sub" style={{ display: "block" }}>Jemput</span>
-                        {pickup ? pickup.label ?? "Titik jemput" : <span className="muted">Cari titik jemput</span>}
+                        <span className="sub" style={{ display: "block" }}>Pickup</span>
+                        {pickup ? pickup.label ?? "Pickup point" : <span className="muted">Search pickup point</span>}
                       </span>
                     </button>
                     <button className="cell inset" aria-pressed={pickMode === "dropoff"} onClick={() => (setPickMode("dropoff"), setSearchFor("dropoff"))} data-testid="pick-dropoff">
                       <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin drop" /></span>
                       <span className="grow">
-                        <span className="sub" style={{ display: "block" }}>Tujuan</span>
-                        {dropoff ? dropoff.label ?? "Tujuan" : <span className="muted">Cari tujuan</span>}
+                        <span className="sub" style={{ display: "block" }}>Destination</span>
+                        {dropoff ? dropoff.label ?? "Destination" : <span className="muted">Search destination</span>}
                       </span>
                     </button>
                     <label className="cell inset">
                       <span className="ic indigo"><Icon name="bolt" /></span>
-                      <span>Rute cepat</span>
+                      <span>Quick route</span>
                       <select data-testid="preset" value="" onChange={(e) => choosePreset(e.target.value)}>
-                        <option value="">Pilih…</option>
+                        <option value="">Choose…</option>
                         {PRESET_TRIPS.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
                       </select>
                       <span className="chev"><Icon name="chevron" size={14} /></span>
@@ -344,7 +344,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                             <div style={{ fontWeight: 600 }}>RideSim Motor</div>
                             <div className="sub">
                               {fmtKm(trip?.source === "osrm" ? trip.distanceM : est.distanceM)}
-                              {trip && <> · ~{Math.max(1, Math.round(trip.durationS / 60))} mnt{trip.source === "osrm" ? " via jalan" : ""}</>}
+                              {trip && <> · ~{Math.max(1, Math.round(trip.durationS / 60))} min{trip.source === "osrm" ? " by road" : ""}</>}
                             </div>
                           </div>
                           <strong className="tnum" data-testid="fare">{fmtRp(est.fare)}</strong>
@@ -353,17 +353,17 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                       <div className="seg">
                         {(["CASH", "WALLET"] as PaymentMethod[]).map((m) => (
                           <button key={m} aria-pressed={pay === m} onClick={() => setPay(m)} data-testid={`pay-${m}`}>
-                            {m === "CASH" ? "Tunai" : "Wallet"}
+                            {m === "CASH" ? "Cash" : "Wallet"}
                           </button>
                         ))}
                       </div>
                       {pay === "WALLET" && balance !== null && balance < est.fare && (
-                        <p className="err">Saldo kurang. Top-up di tab Wallet.</p>
+                        <p className="err">Not enough balance. Top up in the Wallet tab.</p>
                       )}
                     </>
                   )}
                   <button className="primary big" disabled={!est || busy} onClick={order} data-testid="order-button">
-                    {busy ? "Memesan…" : est ? `Pesan · ${fmtRp(est.fare)}` : "Pesan sekarang"}
+                    {busy ? "Ordering…" : est ? `Order · ${fmtRp(est.fare)}` : "Order now"}
                   </button>
                 </div>
               )}
@@ -374,17 +374,17 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                     <div>
                       <span className="status" data-testid="ride-status" data-status={ride.status}>{STATUS_TEXT[ride.status]}</span>
                       {remainingM !== null && ride.status === "ACCEPTED" && (
-                        <p className="muted">Driver {fmtKm(remainingM)} dari titik jemput</p>
+                        <p className="muted">Driver is {fmtKm(remainingM)} from pickup</p>
                       )}
                       {remainingM !== null && ride.status === "ON_TRIP" && (
-                        <p className="muted">Sisa {fmtKm(remainingM)} ke tujuan</p>
+                        <p className="muted">{fmtKm(remainingM)} to destination</p>
                       )}
-                      {searching && <p className="muted">Menghubungi driver terdekat</p>}
+                      {searching && <p className="muted">Contacting nearby drivers</p>}
                     </div>
                     {searching && <div className="spinner" />}
                   </div>
                   {ride.driver && <DriverCard d={ride.driver} />}
-                  {/* once completed, the paid summary says what matters: keep the sheet short so the rating and "Pesan lagi" fit */}
+                  {/* once completed, the paid summary says what matters: keep the sheet short so the rating and "Order again" fit */}
                   {ride.status !== "COMPLETED" && <div className="group">
                     <div className="cell inset">
                       <span style={{ width: 30, display: "grid", placeItems: "center" }}><span className="dotpin pick" /></span>
@@ -396,20 +396,20 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                     </div>
                     <div className="cell inset">
                       <span className="ic gray"><Icon name="wallet" /></span>
-                      <span className="grow">{ride.paymentMethod === "CASH" ? "Tunai" : "Wallet"}</span>
+                      <span className="grow">{ride.paymentMethod === "CASH" ? "Cash" : "Wallet"}</span>
                       <strong className="tnum">{fmtRp(ride.fare)}</strong>
                     </div>
                   </div>}
                   {lost && ride.status === "ON_TRIP" && (
                     <div className="stack" data-testid="driver-lost">
-                      <Section foot={`Dibatalkan otomatis pukul ${fmtTime(lost.autoCancelAt)} kalau tidak dijawab.`}>
+                      <Section foot={`Cancels automatically at ${fmtTime(lost.autoCancelAt)} if you don't answer.`}>
                         <div className="cell">
                           <span className="ic orange">!</span>
-                          <span className="grow">HP driver tidak aktif sejak {fmtTime(lost.lastSeenAt)}. Perjalanan bagaimana?</span>
+                          <span className="grow">Driver's phone offline since {fmtTime(lost.lastSeenAt)}. How's the trip?</span>
                         </div>
-                        <button className="cell accent" data-testid="lost-arrived" onClick={() => answerLost("arrived")}>Sudah sampai</button>
-                        <button className="cell accent" data-testid="lost-ongoing" onClick={() => setLost(null)}>Masih jalan</button>
-                        <button className="cell destructive" style={{ justifyContent: "flex-start" }} data-testid="lost-cancel" onClick={() => answerLost("cancel")}>Ada masalah</button>
+                        <button className="cell accent" data-testid="lost-arrived" onClick={() => answerLost("arrived")}>Arrived</button>
+                        <button className="cell accent" data-testid="lost-ongoing" onClick={() => setLost(null)}>Still riding</button>
+                        <button className="cell destructive" style={{ justifyContent: "flex-start" }} data-testid="lost-cancel" onClick={() => answerLost("cancel")}>Something's wrong</button>
                       </Section>
                     </div>
                   )}
@@ -419,13 +419,13 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                       data-testid="cancel-button"
                       onClick={async () => {
                         try {
-                          setRide((await api.cancel(ride.id, "Berubah pikiran")).ride);
+                          setRide((await api.cancel(ride.id, "Changed my mind")).ride);
                         } catch (e) {
                           flash((e as Error).message);
                         }
                       }}
                     >
-                      Batalkan pesanan
+                      Cancel order
                     </button></div>
                   )}
                   {ride.status === "COMPLETED" && (
@@ -435,26 +435,26 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                         <div className="grow">
                           {paid ? (
                             <>
-                              <div>Dibayar <b className="tnum">{fmtRp(paid.fare)}</b> via {paid.paidVia === "WALLET" ? "Wallet" : "Tunai"}</div>
-                              {paid.paidVia === "WALLET" && <div className="sub">Saldo {fmtRp(paid.balance)}</div>}
+                              <div>Paid <b className="tnum">{fmtRp(paid.fare)}</b> via {paid.paidVia === "WALLET" ? "Wallet" : "Cash"}</div>
+                              {paid.paidVia === "WALLET" && <div className="sub">Balance {fmtRp(paid.balance)}</div>}
                               {ride.paymentMethod === "WALLET" && paid.paidVia === "CASH" && (
-                                <div className="err">Saldo tidak cukup, bayar tunai ke driver.</div>
+                                <div className="err">Not enough balance, pay the driver in cash.</div>
                               )}
                             </>
                           ) : (
-                            <span className="muted">Memproses pembayaran…</span>
+                            <span className="muted">Processing payment…</span>
                           )}
                         </div>
                       </div>
                       <div className="cell" style={{ flexDirection: "column", gap: 4, paddingBlock: 14 }}>
-                        <span className="muted">{rated ? "Terima kasih!" : `Bagaimana perjalanan dengan ${ride.driver?.name ?? "driver"}?`}</span>
+                        <span className="muted">{rated ? "Thank you!" : `How was your trip with ${ride.driver?.name ?? "the driver"}?`}</span>
                         <div className="stars">
                           {[1, 2, 3, 4, 5].map((n) => (
                             <button
                               key={n}
                               data-testid={`star-${n}`}
                               disabled={rated > 0}
-                              aria-label={`${n} bintang`}
+                              aria-label={`${n} stars`}
                               onClick={async () => {
                                 await api.rate(ride.id, n).catch((e) => flash(e.message));
                                 setRated(n);
@@ -468,7 +468,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
                     </div>
                   )}
                   {!active && (
-                    <div className="sheet-cta"><button className="primary big" onClick={reset} data-testid="new-ride">Pesan lagi</button></div>
+                    <div className="sheet-cta"><button className="primary big" onClick={reset} data-testid="new-ride">Order again</button></div>
                   )}
                 </div>
               )}
@@ -479,7 +479,7 @@ function Customer({ session, onLogout }: { session: Session; onLogout: () => voi
         {tab === "ride" && searchFor && (
           <PlaceSearch
             key={searchFor}
-            title={searchFor === "pickup" ? "Titik jemput" : "Tujuan"}
+            title={searchFor === "pickup" ? "Pickup point" : "Destination"}
             near={pickup ?? JAKARTA}
             onClose={() => setSearchFor(null)}
             onMap={() => (setPickMode(searchFor), setSearchFor(null))}
@@ -518,7 +518,7 @@ function DriverCard({ d }: { d: DriverInfo }) {
   );
 }
 
-const HIST_STATUS: Record<string, string> = { COMPLETED: "Selesai", CANCELLED: "Dibatalkan", NO_DRIVER: "Tidak ada driver" };
+const HIST_STATUS: Record<string, string> = { COMPLETED: "Completed", CANCELLED: "Cancelled", NO_DRIVER: "No driver" };
 
 function History({ api }: { api: ApiClient }) {
   const [rides, setRides] = useState<RideView[] | null>(null);
@@ -527,11 +527,11 @@ function History({ api }: { api: ApiClient }) {
     api.rides().then((r) => setRides(r.rides)).catch(() => setRides([]));
   }, [api]);
   return (
-    <Page title="Riwayat">
+    <Page title="History">
       <Section>
         <ul className="list" data-testid="history">
-          {rides === null && <li className="cell muted">Memuat…</li>}
-          {rides?.length === 0 && <li className="cell muted">Belum ada ride</li>}
+          {rides === null && <li className="cell muted">Loading…</li>}
+          {rides?.length === 0 && <li className="cell muted">No rides yet</li>}
           {rides?.map((r) => (
             <li key={r.id}>
               <button className="cell inset" onClick={() => setOpen(r)} data-testid={`history-item-${r.id}`}>
