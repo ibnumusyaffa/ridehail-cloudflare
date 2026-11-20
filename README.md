@@ -1,5 +1,7 @@
 # Ride-Hailing Backend on Cloudflare
 
+▶️ **[Video: architecture + demo (4 min)](https://youtu.be/jj9xCq7G1L0)**
+
 Backend for a ride-hailing app (think Uber or Gojek): customers book rides, nearby drivers get offers, and the
 trip is tracked and paid for. Cloudflare Workers and Durable Objects, with Postgres as the source of truth.
 Monorepo with Turborepo and pnpm. Open work: [TODO.md](TODO.md).

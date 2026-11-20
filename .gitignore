@@ -11,3 +11,4 @@ playwright-report
 
 # personal notes (job application), not part of the project
 docs/private/
+.DS_Store
