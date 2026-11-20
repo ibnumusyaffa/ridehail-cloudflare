@@ -262,10 +262,13 @@ export class RideDO extends ZoneActor implements RideApi {
     this.sql.exec(
       "DELETE FROM ride_idem WHERE ride_id NOT IN (SELECT id FROM rides)",
     );
-    // drivers stay here only while on one of this actor's active rides
-    this.sql.exec(
-      "DELETE FROM drivers WHERE ride_id IS NULL OR ride_id NOT IN (SELECT id FROM rides WHERE status IN ('ACCEPTED','ARRIVED','ON_TRIP'))",
-    );
+    // drivers stay here only while on one of this actor's active rides (their position goes too)
+    const gone = this.sql
+      .exec<{ id: string }>(
+        "SELECT id FROM drivers WHERE ride_id IS NULL OR ride_id NOT IN (SELECT id FROM rides WHERE status IN ('ACCEPTED','ARRIVED','ON_TRIP'))",
+      )
+      .toArray();
+    for (const { id } of gone) this.removeDriver(id);
     this.heads.clear(); // rides were deleted: refilled on the next ping
     const left = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM rides").one().n;
     if (left > 0) void this.schedule("purge:all", now + PURGE_EVERY_MS);
